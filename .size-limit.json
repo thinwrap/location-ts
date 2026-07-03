@@ -1,0 +1,31 @@
+[
+  { "name": "esri-geocoding",   "path": "test/bundle-size-entries/esri-geocoding.ts",   "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "esri-isochrone",   "path": "test/bundle-size-entries/esri-isochrone.ts",   "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "esri-matrix",      "path": "test/bundle-size-entries/esri-matrix.ts",      "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "esri-routing",     "path": "test/bundle-size-entries/esri-routing.ts",     "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+
+  { "name": "google-geocoding", "path": "test/bundle-size-entries/google-geocoding.ts", "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "google-matrix",    "path": "test/bundle-size-entries/google-matrix.ts",    "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "google-routing",   "path": "test/bundle-size-entries/google-routing.ts",   "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+
+  { "name": "here-geocoding",   "path": "test/bundle-size-entries/here-geocoding.ts",   "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "here-isochrone",   "path": "test/bundle-size-entries/here-isochrone.ts",   "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "here-matrix",      "path": "test/bundle-size-entries/here-matrix.ts",      "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "here-routing",     "path": "test/bundle-size-entries/here-routing.ts",     "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+
+  { "name": "mapbox-geocoding", "path": "test/bundle-size-entries/mapbox-geocoding.ts", "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "mapbox-isochrone", "path": "test/bundle-size-entries/mapbox-isochrone.ts", "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "mapbox-matrix",    "path": "test/bundle-size-entries/mapbox-matrix.ts",    "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "mapbox-routing",   "path": "test/bundle-size-entries/mapbox-routing.ts",   "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+
+  { "name": "osrm-matrix",      "path": "test/bundle-size-entries/osrm-matrix.ts",      "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "osrm-routing",     "path": "test/bundle-size-entries/osrm-routing.ts",     "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+
+  { "name": "tomtom-geocoding", "path": "test/bundle-size-entries/tomtom-geocoding.ts", "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "tomtom-isochrone", "path": "test/bundle-size-entries/tomtom-isochrone.ts", "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "tomtom-matrix",    "path": "test/bundle-size-entries/tomtom-matrix.ts",    "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "tomtom-routing",   "path": "test/bundle-size-entries/tomtom-routing.ts",   "limit": "12 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+
+  { "name": "all-providers",    "path": "test/bundle-size-entries/all.ts",              "limit": "40 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "polyline-only",    "path": "test/bundle-size-entries/polyline-only.ts",    "limit": "5 KB",  "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] }
+]

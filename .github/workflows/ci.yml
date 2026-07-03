@@ -1,0 +1,204 @@
+name: CI
+
+# TS CI matrix (Linux × macOS × Windows × Node 18/20/22) + lint gates.
+# Covers the cross-OS/Node test matrix, network-disabled smoke, and build
+# reproducibility. The `lint-gates` job consumes `scripts/validate-frontmatter.mjs`
+# and runs in lockstep with the `test` matrix.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # --- Cross-OS × Node test matrix ---
+  test:
+    name: test (${{ matrix.os }} · node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      # --no-audit/--no-fund skip the extra registry calls; the fetch flags
+      # cap npm's very patient defaults so a stalled registry connection
+      # fails the step in minutes, not hours.
+      - run: npm ci --no-audit --no-fund --fetch-timeout=60000 --fetch-retries=3 --fetch-retry-maxtimeout=15000
+        timeout-minutes: 8
+      - run: npm run typecheck
+      - name: Tests (with coverage on canonical cell)
+        run: |
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ] && [ "${{ matrix.node }}" = "22" ]; then
+            npm run test:coverage
+          else
+            npm test
+          fi
+        shell: bash
+      - run: npm run lint
+      - run: npm run build
+      # Import-smoke the built output with plain Node (CJS require + ESM
+      # import). Bundler-based steps tolerate extensionless specifiers that
+      # Node's ESM loader rejects — this gate catches a broken dist/esm emit
+      # (the @thinwrap/notifications v1.0.0 packaging bug class).
+      - run: npm run check:dist
+
+      - name: Upload coverage
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '22' && always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: ignore
+
+  # --- Lint gates job ---
+  # Frontmatter validation + no-lifecycle-scripts + MIT license check.
+  # Runs once (Ubuntu / Node 22) — these gates are OS-independent.
+  lint-gates:
+    name: lint gates (frontmatter · lifecycle · license)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install
+        run: npm ci --no-audit --no-fund --fetch-timeout=60000 --fetch-retries=3 --fetch-retry-maxtimeout=15000
+        timeout-minutes: 8
+
+      - name: Validate per-connector README frontmatter
+        run: npm run lint:frontmatter -- --expected-blocks 21 --expected-providers 6
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Verify no lifecycle scripts in dependencies
+        run: |
+          set -e
+          if node -e "const p = require('./package.json'); const bad = ['preinstall','install','postinstall']; const found = Object.keys(p.scripts||{}).filter(k => bad.includes(k)); if (found.length) { console.error('Forbidden lifecycle scripts:', found); process.exit(1); }"; then
+            echo "OK — no package-level lifecycle scripts."
+          else
+            exit 1
+          fi
+
+      - name: Verify MIT license
+        run: |
+          node -e "const p = require('./package.json'); if (p.license !== 'MIT') { console.error('package.json license must be MIT, got:', p.license); process.exit(1); }"
+
+  # --- Network-disabled smoke ---
+  # Confirms that importing the package and constructing a facade makes ZERO
+  # network calls at import time. The import + construction runs inside a
+  # network NAMESPACE (`unshare -n`): the namespace has no interface except
+  # an isolated loopback, so no egress is possible at any privilege level —
+  # a hard guarantee on top of the blocked-fetch guard (which only catches
+  # fetch-based calls). The Actions runner agent lives OUTSIDE the namespace
+  # and keeps streaming logs. Do NOT swap this for host-wide firewall rules
+  # (iptables): they also kill the runner agent itself (same non-root
+  # `runner` user) and the job hangs until GitHub declares the runner lost.
+  network-disabled-smoke:
+    name: import-time smoke (no network)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund --fetch-timeout=60000 --fetch-retries=3 --fetch-retry-maxtimeout=15000
+        timeout-minutes: 8
+      - run: npm run build
+      - name: Plain-Node dist import smoke (CJS + ESM, no network)
+        run: |
+          sudo env "PATH=$PATH" "HOME=$HOME" unshare -n bash -e -c '
+            ip link set lo up
+            npm run check:dist
+          '
+      - name: Import + construct without network
+        run: |
+          sudo env "PATH=$PATH" "HOME=$HOME" unshare -n node -e "
+            const orig = globalThis.fetch;
+            globalThis.fetch = () => { throw new Error('Unexpected import-time fetch'); };
+            const lib = require('./dist/cjs/index.js');
+            const r = new lib.Routing('google', { apiKey: 'k' });
+            if (r.providerId !== 'google') { console.error('expected providerId google'); process.exit(1); }
+            globalThis.fetch = orig;
+            console.log('OK — import + construction made zero network calls.');
+          "
+
+      - name: Prove the namespace actually blocks egress
+        run: |
+          if sudo unshare -n curl -s --max-time 5 https://registry.npmjs.org/ > /dev/null 2>&1; then
+            echo "::error::Network namespace did not block egress — smoke gate is not actually offline."
+            exit 1
+          fi
+          echo "OK — egress blocked inside the namespace."
+
+  # --- Build artifact upload ---
+  build-artifact:
+    name: build artifact (dist/)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [test, lint-gates]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund --fetch-timeout=60000 --fetch-retries=3 --fetch-retry-maxtimeout=15000
+        timeout-minutes: 8
+      - run: npm run build
+      - run: npm run check:dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # --- Bundle-size release gate ---
+  # Repo-encapsulated: `npm run size` (size-limit) measures each tree-shaken
+  # entry in `test/bundle-size-entries/` against the per-tier thresholds in
+  # `.size-limit.json`:
+  #   - 21 single-provider × operation imports: < 12 KB each
+  #   - 1 all-provider import (`all.ts`):       < 40 KB
+  #   - 1 polyline-utilities-only import:       <  5 KB
+  # size-limit bundles each entry with esbuild (tree-shaking + minify) and gzips;
+  # node built-ins (crypto/url/querystring) are ignored since they're runtime-
+  # provided, not shipped. No external reusable workflow, no NPM_TOKEN.
+  bundle-size:
+    name: bundle-size gate (single < 12 KB · all < 40 KB · polyline < 5 KB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [build-artifact]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund --fetch-timeout=60000 --fetch-retries=3 --fetch-retry-maxtimeout=15000
+        timeout-minutes: 8
+      # check:tree-shaking bundles the built dist/esm entry, so build first.
+      - run: npm run build
+
+      - name: Bundle-size tier gate
+        run: npm run size
+
+      - name: Tree-shaking spot-check
+        run: npm run check:tree-shaking

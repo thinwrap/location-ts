@@ -1,0 +1,80 @@
+# Per-connector README frontmatter schema — location scope
+# Authoritative source for the YAML frontmatter required at the top of every
+# section in `src/providers/<id>/README.md`. See .ai/CONVENTIONS.md for the
+# AI-agent cheatsheet; this file is the canonical schema enforced by
+# `scripts/validate-frontmatter.mjs`.
+#
+# Location scope uses `operation` (not `channel` like
+# notifications) and adds `selfHostable` + `rateLimitDocsUrl`. Each provider
+# README may contain multiple frontmatter blocks — one per operation, delimited
+# by `---` section markers.
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+required:
+  - providerId
+  - operation
+  - auth
+  - endpoint
+  - versioning
+  - selfHostable
+  - notes_passthrough
+properties:
+  providerId:
+    type: string
+    pattern: '^[a-z][a-z0-9-]*$'
+  operation:
+    type: string
+    enum: [routing, matrix, geocoding, isochrone]
+  auth:
+    type: object
+    required: [method, tokenLifecycle]
+    properties:
+      method:
+        type: string
+        enum:
+          - api-key-header
+          - api-key-query
+          - api-key-form
+          - bearer
+          - arcgis-token
+          - oauth2-client-credentials
+          - none
+      tokenLifecycle:
+        type: string
+        enum: [static, rotating, refreshable, none]
+      regionalEndpoints:
+        type: array
+        items:
+          type: string
+    additionalProperties: false
+  endpoint:
+    type: object
+    required: [default]
+    properties:
+      default:
+        type: string
+        format: uri
+      regional:
+        type: array
+        items:
+          type: string
+    additionalProperties: false
+  versioning:
+    type: object
+    required: [vendorApiVersion, lastVerified]
+    properties:
+      vendorApiVersion:
+        type: string
+      lastVerified:
+        type: string
+        format: date
+    additionalProperties: false
+  selfHostable:
+    type: boolean
+  rateLimitDocsUrl:
+    type: [string, "null"]
+  retryAfterSurfaced:
+    type: boolean
+  notes_passthrough:
+    type: string
+additionalProperties: false

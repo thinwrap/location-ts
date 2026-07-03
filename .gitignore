@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Internal docs — release checklist etc. (Dima-only; not tracked, not shipped, removable after release)
+docs/
+
+# Test coverage
+coverage/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Environment
+.env
+.env.*
+
+# Debug logs
+*.log
+npm-debug.log*

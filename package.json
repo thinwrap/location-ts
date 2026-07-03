@@ -1,0 +1,99 @@
+{
+  "name": "@thinwrap/location",
+  "version": "1.0.0",
+  "description": "Lightweight, SDK-free location API wrapper for routing, distance matrix, geocoding, and isochrone across Google, Mapbox, HERE, ESRI, TomTom, and OSRM.",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/cjs/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "src/providers/*/README.md",
+    "CHANGELOG.md"
+  ],
+  "sideEffects": false,
+  "publishConfig": {
+    "provenance": true,
+    "access": "public"
+  },
+  "scripts": {
+    "build": "npm run build:cjs && npm run build:esm && node scripts/fix-esm-imports.mjs",
+    "build:cjs": "tsc -p tsconfig.build.json",
+    "build:esm": "tsc -p tsconfig.esm.json",
+    "check:dist": "node scripts/check-dist.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix",
+    "lint:frontmatter": "node scripts/validate-frontmatter.mjs",
+    "size": "size-limit",
+    "size:why": "size-limit --why",
+    "check:tree-shaking": "node scripts/check-tree-shaking.mjs"
+  },
+  "keywords": [
+    "location",
+    "routing",
+    "directions",
+    "distance-matrix",
+    "geocoding",
+    "reverse-geocoding",
+    "autocomplete",
+    "isochrone",
+    "polyline",
+    "google-maps",
+    "google-routes",
+    "mapbox",
+    "here",
+    "esri",
+    "arcgis",
+    "tomtom",
+    "osrm",
+    "wrapper",
+    "facade",
+    "sdk-free",
+    "zero-dependencies",
+    "lightweight",
+    "typescript"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thinwrap/location-ts"
+  },
+  "homepage": "https://github.com/thinwrap/location-ts#readme",
+  "bugs": {
+    "url": "https://github.com/thinwrap/location-ts/issues"
+  },
+  "author": "Dmitry Polyanovsky",
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "@size-limit/preset-small-lib": "^11.2.0",
+    "@types/geojson": "^7946.0.16",
+    "@types/node": "^20.19.41",
+    "@vitest/coverage-v8": "^3.2.4",
+    "esbuild": "^0.25.0",
+    "eslint": "^9.39.4",
+    "size-limit": "^11.2.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.59.3",
+    "vite": "^6.4.3",
+    "vitest": "^3.2.4"
+  }
+}
