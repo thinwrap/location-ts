@@ -1,6 +1,49 @@
+---
+providerId: osrm
+operations:
+  routing:
+    auth:
+      method: none
+      tokenLifecycle: none
+    endpoint:
+      default: http://localhost:5000/route/v1
+    versioning:
+      vendorApiVersion: v1
+      lastVerified: 2026-05-17
+    selfHostable: true
+    rateLimitDocsUrl: null
+    retryAfterSurfaced: false
+    notes_passthrough: |
+      Coordinates are `lng,lat` (semicolon-separated). Travel mode is part of
+      the profile name — `driving`, `walking`, `cycling` — and must match the
+      profile compiled on the OSRM server. Optimization routes via the Trip
+      service. Forward `annotations`, `overview`, `geometries`, `steps`,
+      `alternatives` via `_passthrough.query`.
+  matrix:
+    auth:
+      method: none
+      tokenLifecycle: none
+    endpoint:
+      default: http://localhost:5000/table/v1
+    versioning:
+      vendorApiVersion: v1
+      lastVerified: 2026-05-17
+    selfHostable: true
+    rateLimitDocsUrl: null
+    retryAfterSurfaced: false
+    notes_passthrough: |
+      The connector forces `annotations=duration,distance` after the
+      `_passthrough` merge — overriding via `_passthrough.query.annotations` is
+      silently overwritten. To add extra annotations include both built-ins
+      explicitly: `'duration,distance,nodes'`. OSRM Table may return HTTP 200
+      with `code !== 'Ok'` (`NoTable`, `InvalidQuery`, `InvalidOptions`); the
+      connector raises these as `ConnectorError` with
+      `providerCode: 'invalid_request'`.
+---
+
 # OSRM Connectors
 
-[OSRM](https://project-osrm.org/) (Open Source Routing Machine) connectors for routing and distance matrix. **Self-hosted** — no API key, no managed service. Each operation has its own YAML frontmatter block below.
+[OSRM](https://project-osrm.org/) (Open Source Routing Machine) connectors for routing and distance matrix. **Self-hosted** — no API key, no managed service.
 
 ## Quick install
 
@@ -34,28 +77,6 @@ The connector pre-flight-validates `baseUrl` (must be `http(s)://…`, no traili
 
 ## Routing
 
----
-providerId: osrm
-operation: routing
-auth:
-  method: none
-  tokenLifecycle: none
-endpoint:
-  default: http://localhost:5000/route/v1
-versioning:
-  vendorApiVersion: v1
-  lastVerified: 2026-05-17
-selfHostable: true
-rateLimitDocsUrl: null
-retryAfterSurfaced: false
-notes_passthrough: |
-  Coordinates are `lng,lat` (semicolon-separated). Travel mode is part of
-  the profile name — `driving`, `walking`, `cycling` — and must match the
-  profile compiled on the OSRM server. Optimization routes via the Trip
-  service. Forward `annotations`, `overview`, `geometries`, `steps`,
-  `alternatives` via `_passthrough.query`.
----
-
 ### Endpoints
 
 - Routing: `GET {baseUrl}/route/v1/{profile}/{coordinates}`
@@ -79,30 +100,6 @@ If the requested `travelMode` doesn't have a compiled profile on the server, OSR
 **Not surfaced.** OSRM has no documented rate-limit; any 429 surfaces from your reverse-proxy layer, and `Retry-After` (if set by the proxy) is forwarded as `cause.retryAfter` in best-effort mode.
 
 ## Matrix
-
----
-providerId: osrm
-operation: matrix
-auth:
-  method: none
-  tokenLifecycle: none
-endpoint:
-  default: http://localhost:5000/table/v1
-versioning:
-  vendorApiVersion: v1
-  lastVerified: 2026-05-17
-selfHostable: true
-rateLimitDocsUrl: null
-retryAfterSurfaced: false
-notes_passthrough: |
-  The connector forces `annotations=duration,distance` after the
-  `_passthrough` merge — overriding via `_passthrough.query.annotations` is
-  silently overwritten. To add extra annotations include both built-ins
-  explicitly: `'duration,distance,nodes'`. OSRM Table may return HTTP 200
-  with `code !== 'Ok'` (`NoTable`, `InvalidQuery`, `InvalidOptions`); the
-  connector raises these as `ConnectorError` with
-  `providerCode: 'invalid_request'`.
----
 
 ### Endpoint
 

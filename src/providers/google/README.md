@@ -1,6 +1,60 @@
+---
+providerId: google
+operations:
+  routing:
+    auth:
+      method: api-key-header
+      tokenLifecycle: static
+    endpoint:
+      default: https://routes.googleapis.com/directions/v2:computeRoutes
+    versioning:
+      vendorApiVersion: v2
+      lastVerified: 2026-05-17
+    selfHostable: false
+    rateLimitDocsUrl: https://developers.google.com/maps/documentation/routes/usage-and-billing
+    retryAfterSurfaced: true
+    notes_passthrough: |
+      Forward Routes v2 fields the facade doesn't surface (e.g. `languageCode`,
+      `extraComputations`, `routingPreference` overrides) via `_passthrough.body`.
+      No casing transformation. The `X-Goog-FieldMask` header is set by the
+      connector; override via `_passthrough.headers` if you need additional fields.
+  matrix:
+    auth:
+      method: api-key-header
+      tokenLifecycle: static
+    endpoint:
+      default: https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix
+    versioning:
+      vendorApiVersion: v2
+      lastVerified: 2026-05-17
+    selfHostable: false
+    rateLimitDocsUrl: https://developers.google.com/maps/documentation/routes/usage-and-billing
+    retryAfterSurfaced: true
+    notes_passthrough: |
+      Route Matrix v2 returns a flat element list keyed by `originIndex` +
+      `destinationIndex`. Forward extra request fields (e.g. `routingPreference`,
+      `extraComputations`) via `_passthrough.body`.
+  geocoding:
+    auth:
+      method: api-key-query
+      tokenLifecycle: static
+    endpoint:
+      default: https://maps.googleapis.com/maps/api/geocode/json
+    versioning:
+      vendorApiVersion: v1
+      lastVerified: 2026-05-17
+    selfHostable: false
+    rateLimitDocsUrl: https://developers.google.com/maps/documentation/geocoding/usage-and-billing
+    retryAfterSurfaced: true
+    notes_passthrough: |
+      Forward Geocoding v1 / Places Autocomplete v1 fields (e.g. `region`,
+      `components`, `language`, `bounds`, `sessiontoken`) via
+      `_passthrough.query`. Vendor uses `key=` query param for auth.
+---
+
 # Google Maps Platform Connectors
 
-Google Maps Platform connectors for routing, distance matrix, and geocoding via direct HTTP calls (no `googleapis` SDK). Each operation has its own YAML frontmatter block below.
+Google Maps Platform connectors for routing, distance matrix, and geocoding via direct HTTP calls (no `googleapis` SDK).
 
 ## Quick install
 
@@ -35,27 +89,6 @@ Generate a key at https://console.cloud.google.com/google/maps-apis/credentials 
 ---
 
 ## Routing
-
----
-providerId: google
-operation: routing
-auth:
-  method: api-key-header
-  tokenLifecycle: static
-endpoint:
-  default: https://routes.googleapis.com/directions/v2:computeRoutes
-versioning:
-  vendorApiVersion: v2
-  lastVerified: 2026-05-17
-selfHostable: false
-rateLimitDocsUrl: https://developers.google.com/maps/documentation/routes/usage-and-billing
-retryAfterSurfaced: true
-notes_passthrough: |
-  Forward Routes v2 fields the facade doesn't surface (e.g. `languageCode`,
-  `extraComputations`, `routingPreference` overrides) via `_passthrough.body`.
-  No casing transformation. The `X-Goog-FieldMask` header is set by the
-  connector; override via `_passthrough.headers` if you need additional fields.
----
 
 ### Endpoint
 
@@ -97,26 +130,6 @@ await routing.route({
 
 ## Matrix
 
----
-providerId: google
-operation: matrix
-auth:
-  method: api-key-header
-  tokenLifecycle: static
-endpoint:
-  default: https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix
-versioning:
-  vendorApiVersion: v2
-  lastVerified: 2026-05-17
-selfHostable: false
-rateLimitDocsUrl: https://developers.google.com/maps/documentation/routes/usage-and-billing
-retryAfterSurfaced: true
-notes_passthrough: |
-  Route Matrix v2 returns a flat element list keyed by `originIndex` +
-  `destinationIndex`. Forward extra request fields (e.g. `routingPreference`,
-  `extraComputations`) via `_passthrough.body`.
----
-
 ### Endpoint
 
 `POST https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix`
@@ -141,26 +154,6 @@ await matrix.matrix({
 ---
 
 ## Geocoding
-
----
-providerId: google
-operation: geocoding
-auth:
-  method: api-key-query
-  tokenLifecycle: static
-endpoint:
-  default: https://maps.googleapis.com/maps/api/geocode/json
-versioning:
-  vendorApiVersion: v1
-  lastVerified: 2026-05-17
-selfHostable: false
-rateLimitDocsUrl: https://developers.google.com/maps/documentation/geocoding/usage-and-billing
-retryAfterSurfaced: true
-notes_passthrough: |
-  Forward Geocoding v1 / Places Autocomplete v1 fields (e.g. `region`,
-  `components`, `language`, `bounds`, `sessiontoken`) via
-  `_passthrough.query`. Vendor uses `key=` query param for auth.
----
 
 ### Endpoint
 

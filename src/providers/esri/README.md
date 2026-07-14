@@ -1,6 +1,79 @@
+---
+providerId: esri
+operations:
+  routing:
+    auth:
+      method: arcgis-token
+      tokenLifecycle: refreshable
+    endpoint:
+      default: https://route-api.arcgis.com/arcgis/rest/services/World/Route/NAServer/Route_World/solve
+    versioning:
+      vendorApiVersion: NAServer-2024
+      lastVerified: 2026-05-17
+    selfHostable: true
+    rateLimitDocsUrl: https://developers.arcgis.com/documentation/mapping-and-location-services/security-and-authentication/
+    retryAfterSurfaced: false
+    notes_passthrough: |
+      Form-encoded POST (not JSON). ESRI returns kilometers and minutes which
+      the connector normalizes to meters/seconds. ESRI may respond HTTP 200
+      with an `error` field on validation failure — the connector inspects this.
+      Forward `directionsLanguage`, `directionsStyleName`, `findBestSequence`,
+      `preserveTerminalStops` via `_passthrough.body`.
+  matrix:
+    auth:
+      method: arcgis-token
+      tokenLifecycle: refreshable
+    endpoint:
+      default: https://logistics.arcgis.com/arcgis/rest/services/World/OriginDestinationCostMatrix/GPServer/GenerateOriginDestinationCostMatrix/submitJob
+    versioning:
+      vendorApiVersion: GPServer-2024
+      lastVerified: 2026-05-17
+    selfHostable: true
+    rateLimitDocsUrl: https://developers.arcgis.com/documentation/mapping-and-location-services/security-and-authentication/
+    retryAfterSurfaced: false
+    notes_passthrough: |
+      Form-encoded POST. ESRI OD Cost Matrix returns miles + minutes; connector
+      normalizes to meters + seconds. OIDs are 1-based. Forward
+      `outputType`, `cutoff`, `targetDestinationCount` via `_passthrough.body`.
+  geocoding:
+    auth:
+      method: arcgis-token
+      tokenLifecycle: refreshable
+    endpoint:
+      default: https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates
+    versioning:
+      vendorApiVersion: GeocodeServer-2024
+      lastVerified: 2026-05-17
+    selfHostable: true
+    rateLimitDocsUrl: https://developers.arcgis.com/documentation/mapping-and-location-services/security-and-authentication/
+    retryAfterSurfaced: false
+    notes_passthrough: |
+      Three endpoints: findAddressCandidates / reverseGeocode / suggest.
+      Forward `category`, `countryCode`, `location`, `magicKey`, `outFields`
+      via `_passthrough.query`.
+  isochrone:
+    auth:
+      method: arcgis-token
+      tokenLifecycle: refreshable
+    endpoint:
+      default: https://route-api.arcgis.com/arcgis/rest/services/World/ServiceAreas/NAServer/ServiceArea_World/solveServiceArea
+    versioning:
+      vendorApiVersion: NAServer-2024
+      lastVerified: 2026-05-17
+    selfHostable: true
+    rateLimitDocsUrl: https://developers.arcgis.com/documentation/mapping-and-location-services/security-and-authentication/
+    retryAfterSurfaced: false
+    notes_passthrough: |
+      Form-encoded POST. Service Area expects minutes / miles; connector
+      converts seconds → minutes and meters → miles on the wire. Returns
+      ESRI geometry which the connector emits as GeoJSON Polygons. Forward
+      `travelDirection`, `overlapPolicy`, `splitPolygonsAtBreaks` via
+      `_passthrough.body`.
+---
+
 # ESRI ArcGIS Connectors
 
-ESRI ArcGIS Location Services connectors for routing, distance matrix, geocoding, and isochrone (service areas) via direct HTTP calls. Each operation has its own YAML frontmatter block below.
+ESRI ArcGIS Location Services connectors for routing, distance matrix, geocoding, and isochrone (service areas) via direct HTTP calls.
 
 ## Quick install
 
@@ -37,28 +110,6 @@ ArcGIS Enterprise on-prem deployments are supported by overriding endpoints in `
 
 ## Routing
 
----
-providerId: esri
-operation: routing
-auth:
-  method: arcgis-token
-  tokenLifecycle: refreshable
-endpoint:
-  default: https://route-api.arcgis.com/arcgis/rest/services/World/Route/NAServer/Route_World/solve
-versioning:
-  vendorApiVersion: NAServer-2024
-  lastVerified: 2026-05-17
-selfHostable: true
-rateLimitDocsUrl: https://developers.arcgis.com/documentation/mapping-and-location-services/security-and-authentication/
-retryAfterSurfaced: false
-notes_passthrough: |
-  Form-encoded POST (not JSON). ESRI returns kilometers and minutes which
-  the connector normalizes to meters/seconds. ESRI may respond HTTP 200
-  with an `error` field on validation failure — the connector inspects this.
-  Forward `directionsLanguage`, `directionsStyleName`, `findBestSequence`,
-  `preserveTerminalStops` via `_passthrough.body`.
----
-
 ### Endpoint
 
 `POST https://route-api.arcgis.com/arcgis/rest/services/World/Route/NAServer/Route_World/solve` — `application/x-www-form-urlencoded`.
@@ -83,26 +134,6 @@ ESRI's API tier may or may not document `Retry-After` (depends on subscription).
 
 ## Matrix
 
----
-providerId: esri
-operation: matrix
-auth:
-  method: arcgis-token
-  tokenLifecycle: refreshable
-endpoint:
-  default: https://logistics.arcgis.com/arcgis/rest/services/World/OriginDestinationCostMatrix/GPServer/GenerateOriginDestinationCostMatrix/submitJob
-versioning:
-  vendorApiVersion: GPServer-2024
-  lastVerified: 2026-05-17
-selfHostable: true
-rateLimitDocsUrl: https://developers.arcgis.com/documentation/mapping-and-location-services/security-and-authentication/
-retryAfterSurfaced: false
-notes_passthrough: |
-  Form-encoded POST. ESRI OD Cost Matrix returns miles + minutes; connector
-  normalizes to meters + seconds. OIDs are 1-based. Forward
-  `outputType`, `cutoff`, `targetDestinationCount` via `_passthrough.body`.
----
-
 ### Endpoint
 
 `POST .../GenerateOriginDestinationCostMatrix/submitJob`
@@ -113,26 +144,6 @@ Standard `IMatrixOptions`. `travelMode` cycling raises `ConnectorError` with `pr
 
 ## Geocoding
 
----
-providerId: esri
-operation: geocoding
-auth:
-  method: arcgis-token
-  tokenLifecycle: refreshable
-endpoint:
-  default: https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates
-versioning:
-  vendorApiVersion: GeocodeServer-2024
-  lastVerified: 2026-05-17
-selfHostable: true
-rateLimitDocsUrl: https://developers.arcgis.com/documentation/mapping-and-location-services/security-and-authentication/
-retryAfterSurfaced: false
-notes_passthrough: |
-  Three endpoints: findAddressCandidates / reverseGeocode / suggest.
-  Forward `category`, `countryCode`, `location`, `magicKey`, `outFields`
-  via `_passthrough.query`.
----
-
 ### Endpoints
 
 - Forward: `GET .../GeocodeServer/findAddressCandidates`
@@ -140,28 +151,6 @@ notes_passthrough: |
 - Suggest: `GET .../GeocodeServer/suggest`
 
 ## Isochrone
-
----
-providerId: esri
-operation: isochrone
-auth:
-  method: arcgis-token
-  tokenLifecycle: refreshable
-endpoint:
-  default: https://route-api.arcgis.com/arcgis/rest/services/World/ServiceAreas/NAServer/ServiceArea_World/solveServiceArea
-versioning:
-  vendorApiVersion: NAServer-2024
-  lastVerified: 2026-05-17
-selfHostable: true
-rateLimitDocsUrl: https://developers.arcgis.com/documentation/mapping-and-location-services/security-and-authentication/
-retryAfterSurfaced: false
-notes_passthrough: |
-  Form-encoded POST. Service Area expects minutes / miles; connector
-  converts seconds → minutes and meters → miles on the wire. Returns
-  ESRI geometry which the connector emits as GeoJSON Polygons. Forward
-  `travelDirection`, `overlapPolicy`, `splitPolygonsAtBreaks` via
-  `_passthrough.body`.
----
 
 ### Endpoint
 

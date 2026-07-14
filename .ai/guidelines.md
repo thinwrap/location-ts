@@ -44,7 +44,7 @@ as your template (it implements routing + matrix + geocoding). Touch-points, in 
    - `<id>.<operation>.connector.spec.ts` — vitest; inject a `vi.fn()` fetch mock (see CONVENTIONS).
    - `<id>.types.ts` — vendor response shapes + any narrowed input augmentations.
    - `index.ts` — barrel re-export.
-   - `README.md` — one YAML frontmatter block per operation (schema: [`../schemas/connector-readme-schema.yaml`](../schemas/connector-readme-schema.yaml)) + body. **This** is the connector's consumer doc.
+   - `README.md` — a single top-of-file YAML frontmatter block (opening `---` on line 1) with each operation keyed under `operations:` (schema: [`../schemas/connector-readme-schema.yaml`](../schemas/connector-readme-schema.yaml)) + body. Keep the block at the very top or GitHub leaks the raw YAML into the page. **This** is the connector's consumer doc.
 4. **Dispatch** — add the case to each relevant facade in [`src/facades/`](../src/facades) (`routing.facade.ts`, `matrix.facade.ts`, …).
 5. **Export** — re-export the connectors + config from [`src/index.ts`](../src/index.ts), the only public surface.
 6. **Bundle-size** — add the per-provider × per-operation entry points the bundle-size CI gate measures.

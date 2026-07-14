@@ -2,12 +2,13 @@
 /**
  * Per-connector README frontmatter validator — location scope.
  *
- * Reads every `src/providers/<id>/README.md`, parses ALL leading YAML
- * frontmatter blocks (each delimited by `---` markers; location scope uses
- * one block per operation within a single per-provider file), and validates
+ * Reads every `src/providers/<id>/README.md`, parses the single leading YAML
+ * frontmatter block at the top of the file (`providerId` plus an `operations:` map
+ * keyed by operation — one entry per operation the provider supports), and validates
  * required keys and value shapes against the schema documented in
  * `schemas/connector-readme-schema.yaml`. Exits 0 on success, 1 with
- * line-prefixed errors on any failure.
+ * line-prefixed errors on any failure. `--expected-blocks` counts total operations
+ * across all READMEs.
  *
  * Wired into the CI lint-gates job. Standalone (no runtime deps) so it can
  * run pre-commit too.
@@ -163,59 +164,28 @@ function parseFrontmatter(text) {
 }
 
 /**
- * Extract every YAML frontmatter block in a markdown file. Each block is
- * delimited by `---` on its own line at the start, with a closing `---`
- * sometime later. We scan the entire file (location scope uses multiple
- * blocks per file, one per operation section).
+ * Location READMEs carry ONE leading YAML frontmatter block at the very top of
+ * the file (opening `---` on line 1, so GitHub renders it as real frontmatter),
+ * with every operation keyed under `operations:`. Extract that single block:
+ * scan to the first `---`, parse through the matching close. A leading `# title`
+ * before the block (if any) is skipped; markdown thematic-break `---` separators
+ * later in the body are not part of the block.
  */
-/**
- * A "frontmatter block" is an opening `---` line followed (after optional
- * blank lines) by at least one YAML mapping key (`<word>:`) and closed by
- * another `---` line. `---` lines that are NOT followed by a YAML mapping
- * (e.g. markdown thematic-break separators between sections) are skipped.
- */
-function looksLikeYamlMappingStart(line) {
-  // A non-indented `key:` line, optionally followed by a value. Reject
-  // markdown headings, list items, code fences, and table dividers.
-  if (line.length === 0) return false;
-  if (/^[-*#`>|]/.test(line)) return false;
-  return /^[A-Za-z_][A-Za-z0-9_-]*\s*:(\s.*)?$/.test(line);
-}
-
-function extractFrontmatterBlocks(content, file) {
-  const blocks = [];
+function extractLeadingFrontmatter(content, file) {
   const lines = content.split('\n');
   let i = 0;
-  while (i < lines.length) {
-    if (lines[i].trim() === '---') {
-      // Peek the next non-blank line. If it looks like a YAML mapping start,
-      // we have a frontmatter block; otherwise this is a markdown separator.
-      let p = i + 1;
-      while (p < lines.length && lines[p].trim() === '') p += 1;
-      if (p >= lines.length || !looksLikeYamlMappingStart(lines[p])) {
-        i += 1;
-        continue;
-      }
-      // Find closing delimiter — a `---` line.
-      let j = i + 1;
-      while (j < lines.length && lines[j].trim() !== '---') j += 1;
-      if (j >= lines.length) {
-        throw new Error(
-          `${file}: unterminated frontmatter block starting at line ${i + 1}`,
-        );
-      }
-      const yamlText = lines.slice(i + 1, j).join('\n');
-      blocks.push({
-        startLine: i + 1,
-        endLine: j + 1,
-        meta: parseFrontmatter(yamlText),
-      });
-      i = j + 1;
-    } else {
-      i += 1;
-    }
+  while (i < lines.length && lines[i].trim() !== '---') i += 1;
+  if (i >= lines.length) return null;
+  const startLine = i + 1;
+  let j = i + 1;
+  while (j < lines.length && lines[j].trim() !== '---') j += 1;
+  if (j >= lines.length) {
+    throw new Error(
+      `${file}: unterminated frontmatter block starting at line ${startLine}`,
+    );
   }
-  return blocks;
+  const yamlText = lines.slice(i + 1, j).join('\n');
+  return { startLine, meta: parseFrontmatter(yamlText) };
 }
 
 // --- schema validation ---
@@ -230,9 +200,10 @@ const AUTH_METHODS = new Set([
 ]);
 const TOKEN_LIFECYCLES = new Set(['static', 'rotating', 'refreshable', 'none']);
 const OPERATIONS = new Set(['routing', 'matrix', 'geocoding', 'isochrone']);
-const REQUIRED_TOP = [
-  'providerId',
-  'operation',
+// Required at the top level of the single leading frontmatter block.
+const REQUIRED_TOP = ['providerId', 'operations'];
+// Required inside each operation object (the value under operations.<op>).
+const REQUIRED_OP = [
   'auth',
   'endpoint',
   'versioning',
@@ -240,23 +211,14 @@ const REQUIRED_TOP = [
   'notes_passthrough',
 ];
 
-function validate(meta, file, blockLine) {
+/** Validate one operation's metadata — the object under `operations.<op>`. */
+function validateOperation(meta, file, blockLine, op) {
   const errors = [];
-  const prefix = `${file}:${blockLine}`;
-  for (const key of REQUIRED_TOP) {
+  const prefix = `${file}:${blockLine} (operation '${op}')`;
+  for (const key of REQUIRED_OP) {
     if (!(key in meta) || meta[key] === null || meta[key] === undefined) {
       errors.push(`${prefix}: missing required key '${key}'`);
     }
-  }
-  if (meta.providerId && !/^[a-z][a-z0-9-]*$/.test(meta.providerId)) {
-    errors.push(
-      `${prefix}: providerId '${meta.providerId}' must match /^[a-z][a-z0-9-]*$/`,
-    );
-  }
-  if (meta.operation && !OPERATIONS.has(meta.operation)) {
-    errors.push(
-      `${prefix}: operation '${meta.operation}' must be one of ${[...OPERATIONS].join(', ')}`,
-    );
   }
   if (meta.auth && typeof meta.auth === 'object') {
     for (const k of ['method', 'tokenLifecycle']) {
@@ -350,29 +312,50 @@ function main() {
   for (const r of present) {
     const content = readFileSync(r.path, 'utf8');
     try {
-      const blocks = extractFrontmatterBlocks(content, r.path);
-      if (blocks.length === 0) {
-        errors.push(`${r.path}: contains no YAML frontmatter blocks`);
+      const block = extractLeadingFrontmatter(content, r.path);
+      if (block === null) {
+        errors.push(`${r.path}: contains no YAML frontmatter block`);
         continue;
       }
-      totalBlocks += blocks.length;
-      const seenOps = new Set();
-      for (const block of blocks) {
-        const errs = validate(block.meta, r.path, block.startLine);
-        errors.push(...errs);
-        if (block.meta.providerId && block.meta.providerId !== r.id) {
+      const { startLine: line, meta } = block;
+      const prefix = `${r.path}:${line}`;
+
+      for (const key of REQUIRED_TOP) {
+        if (!(key in meta) || meta[key] === null || meta[key] === undefined) {
+          errors.push(`${prefix}: missing required key '${key}'`);
+        }
+      }
+      if (meta.providerId) {
+        if (!/^[a-z][a-z0-9-]*$/.test(meta.providerId)) {
           errors.push(
-            `${r.path}:${block.startLine}: providerId '${block.meta.providerId}' does not match directory name '${r.id}'`,
+            `${prefix}: providerId '${meta.providerId}' must match /^[a-z][a-z0-9-]*$/`,
           );
         }
-        if (block.meta.operation) {
-          if (seenOps.has(block.meta.operation)) {
+        if (meta.providerId !== r.id) {
+          errors.push(
+            `${prefix}: providerId '${meta.providerId}' does not match directory name '${r.id}'`,
+          );
+        }
+      }
+      const ops = meta.operations;
+      if (ops && typeof ops === 'object' && Object.keys(ops).length > 0) {
+        for (const [op, opMeta] of Object.entries(ops)) {
+          if (!OPERATIONS.has(op)) {
             errors.push(
-              `${r.path}:${block.startLine}: duplicate operation '${block.meta.operation}' in same file`,
+              `${prefix}: operation '${op}' must be one of ${[...OPERATIONS].join(', ')}`,
             );
           }
-          seenOps.add(block.meta.operation);
+          if (!opMeta || typeof opMeta !== 'object') {
+            errors.push(`${prefix}: operations.${op} must be a mapping`);
+            continue;
+          }
+          totalBlocks += 1;
+          errors.push(...validateOperation(opMeta, r.path, line, op));
         }
+      } else if ('operations' in meta) {
+        errors.push(
+          `${prefix}: operations must be a non-empty mapping of operation → metadata`,
+        );
       }
     } catch (e) {
       errors.push(`${r.path}: ${e.message}`);

@@ -4,6 +4,13 @@ Naming, file layout, and test patterns for AI agents adding or refactoring a con
 The per-connector README frontmatter schema authoritative source is
 [`../schemas/connector-readme-schema.yaml`](../schemas/connector-readme-schema.yaml).
 
+The frontmatter is a **single block at the very top of the file** (opening `---` on
+line 1), with every operation keyed under `operations:`; the `# Title` follows the
+closing `---`. GitHub only renders a `---…---` block as (hidden) frontmatter when it
+leads the file — a block placed lower leaks its raw YAML into the page body. The
+validator scans to the first `---`, so it will **not** catch a misplaced block; keep
+it on top.
+
 ## Where files live in this repo
 
 ```
@@ -17,7 +24,7 @@ src/
     <provider>.types.ts                 # narrowed input/result types + vendor response shapes
     <provider>.<op>.connector.ts        # one connector class per operation
     <provider>.<op>.connector.spec.ts   # vitest spec — co-located, never in top-level tests/
-    README.md                           # per-operation YAML frontmatter blocks + body
+    README.md                           # top-of-file YAML frontmatter (operations map) + body
   types/                                # cross-operation interfaces, ProviderCode, LatLng, ConnectorError
   utils/                                # mergePassthrough, polyline utilities, coordinate helpers
 schemas/
@@ -58,7 +65,7 @@ export type IsochroneProvider = 'mapbox' | 'here' | 'esri' | 'tomtom';
 | `<provider>.config.ts` | yes | Exported `<Provider>Config` interface (shared across ops) |
 | `<provider>.types.ts` | yes | Vendor response shapes + per-op narrowed input types |
 | `index.ts` | yes | Barrel re-export for the provider directory |
-| `README.md` | yes | Per-operation YAML frontmatter blocks + body |
+| `README.md` | yes | Top-of-file YAML frontmatter (operations map) + body |
 
 ## `mapVendorError(status, body)` pattern
 

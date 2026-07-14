@@ -1,6 +1,78 @@
+---
+providerId: tomtom
+operations:
+  routing:
+    auth:
+      method: api-key-query
+      tokenLifecycle: static
+    endpoint:
+      default: https://api.tomtom.com/routing/1/calculateRoute
+    versioning:
+      vendorApiVersion: v1
+      lastVerified: 2026-05-17
+    selfHostable: false
+    rateLimitDocsUrl: https://developer.tomtom.com/store/maps-api
+    retryAfterSurfaced: true
+    notes_passthrough: |
+      Waypoints colon-separated in URL path: `lat1,lng1:lat2,lng2:lat3,lng3`.
+      Travel modes map: `driving` → `car`, `walking` → `pedestrian`,
+      `cycling` → `bicycle`. Optimization via `computeBestOrder=true`. Forward
+      `routeType`, `traffic`, `avoid` (array) via `_passthrough.query`.
+  matrix:
+    auth:
+      method: api-key-query
+      tokenLifecycle: static
+    endpoint:
+      default: https://api.tomtom.com/routing/matrix/2
+    versioning:
+      vendorApiVersion: v2
+      lastVerified: 2026-05-17
+    selfHostable: false
+    rateLimitDocsUrl: https://developer.tomtom.com/store/maps-api
+    retryAfterSurfaced: true
+    notes_passthrough: |
+      Synchronous POST. Matrix v2 takes JSON body with origins/destinations
+      arrays. Forward `routeType`, `traffic`, `departAt`, `arriveAt` via
+      `_passthrough.body`.
+  geocoding:
+    auth:
+      method: api-key-query
+      tokenLifecycle: static
+    endpoint:
+      default: https://api.tomtom.com/search/2/geocode
+    versioning:
+      vendorApiVersion: v2
+      lastVerified: 2026-05-17
+    selfHostable: false
+    rateLimitDocsUrl: https://developer.tomtom.com/store/maps-api
+    retryAfterSurfaced: true
+    notes_passthrough: |
+      Three endpoints: geocode / reverseGeocode / search (fuzzy, used for
+      autocomplete). Reverse returns position as a string `"lat,lon"` which
+      the connector parses. Forward `countrySet`, `language`, `limit`,
+      `typeahead` via `_passthrough.query`.
+  isochrone:
+    auth:
+      method: api-key-query
+      tokenLifecycle: static
+    endpoint:
+      default: https://api.tomtom.com/routing/1/calculateReachableRange
+    versioning:
+      vendorApiVersion: v1
+      lastVerified: 2026-05-17
+    selfHostable: false
+    rateLimitDocsUrl: https://developer.tomtom.com/store/maps-api
+    retryAfterSurfaced: true
+    notes_passthrough: |
+      TomTom Reachable Range supports only ONE budget per call. Multi-value
+      isochrone requests are split into parallel `Promise.all` calls — one
+      per value. Forward `routeType`, `traffic`, `vehicleEngineType` via
+      `_passthrough.query`.
+---
+
 # TomTom Connectors
 
-TomTom Maps connectors for routing, distance matrix, geocoding, and isochrone (reachable range) via direct HTTP calls. Each operation has its own YAML frontmatter block below.
+TomTom Maps connectors for routing, distance matrix, geocoding, and isochrone (reachable range) via direct HTTP calls.
 
 ## Quick install
 
@@ -36,27 +108,6 @@ Create a key at https://developer.tomtom.com/user/me/apps. Sent as `key=` query 
 
 ## Routing
 
----
-providerId: tomtom
-operation: routing
-auth:
-  method: api-key-query
-  tokenLifecycle: static
-endpoint:
-  default: https://api.tomtom.com/routing/1/calculateRoute
-versioning:
-  vendorApiVersion: v1
-  lastVerified: 2026-05-17
-selfHostable: false
-rateLimitDocsUrl: https://developer.tomtom.com/store/maps-api
-retryAfterSurfaced: true
-notes_passthrough: |
-  Waypoints colon-separated in URL path: `lat1,lng1:lat2,lng2:lat3,lng3`.
-  Travel modes map: `driving` → `car`, `walking` → `pedestrian`,
-  `cycling` → `bicycle`. Optimization via `computeBestOrder=true`. Forward
-  `routeType`, `traffic`, `avoid` (array) via `_passthrough.query`.
----
-
 ### Endpoint
 
 `GET https://api.tomtom.com/routing/1/calculateRoute/{locations}/json`
@@ -80,26 +131,6 @@ On HTTP 429, `ConnectorError.cause.retryAfter` carries the raw header; parsed se
 
 ## Matrix
 
----
-providerId: tomtom
-operation: matrix
-auth:
-  method: api-key-query
-  tokenLifecycle: static
-endpoint:
-  default: https://api.tomtom.com/routing/matrix/2
-versioning:
-  vendorApiVersion: v2
-  lastVerified: 2026-05-17
-selfHostable: false
-rateLimitDocsUrl: https://developer.tomtom.com/store/maps-api
-retryAfterSurfaced: true
-notes_passthrough: |
-  Synchronous POST. Matrix v2 takes JSON body with origins/destinations
-  arrays. Forward `routeType`, `traffic`, `departAt`, `arriveAt` via
-  `_passthrough.body`.
----
-
 ### Endpoint
 
 `POST https://api.tomtom.com/routing/matrix/2`
@@ -110,27 +141,6 @@ Standard `IMatrixOptions`. Cycling travel mode raises `ConnectorError` with `pro
 
 ## Geocoding
 
----
-providerId: tomtom
-operation: geocoding
-auth:
-  method: api-key-query
-  tokenLifecycle: static
-endpoint:
-  default: https://api.tomtom.com/search/2/geocode
-versioning:
-  vendorApiVersion: v2
-  lastVerified: 2026-05-17
-selfHostable: false
-rateLimitDocsUrl: https://developer.tomtom.com/store/maps-api
-retryAfterSurfaced: true
-notes_passthrough: |
-  Three endpoints: geocode / reverseGeocode / search (fuzzy, used for
-  autocomplete). Reverse returns position as a string `"lat,lon"` which
-  the connector parses. Forward `countrySet`, `language`, `limit`,
-  `typeahead` via `_passthrough.query`.
----
-
 ### Endpoints
 
 - Forward: `GET https://api.tomtom.com/search/2/geocode/{query}.json`
@@ -138,27 +148,6 @@ notes_passthrough: |
 - Autocomplete (Fuzzy Search): `GET https://api.tomtom.com/search/2/search/{query}.json`
 
 ## Isochrone
-
----
-providerId: tomtom
-operation: isochrone
-auth:
-  method: api-key-query
-  tokenLifecycle: static
-endpoint:
-  default: https://api.tomtom.com/routing/1/calculateReachableRange
-versioning:
-  vendorApiVersion: v1
-  lastVerified: 2026-05-17
-selfHostable: false
-rateLimitDocsUrl: https://developer.tomtom.com/store/maps-api
-retryAfterSurfaced: true
-notes_passthrough: |
-  TomTom Reachable Range supports only ONE budget per call. Multi-value
-  isochrone requests are split into parallel `Promise.all` calls — one
-  per value. Forward `routeType`, `traffic`, `vehicleEngineType` via
-  `_passthrough.query`.
----
 
 ### Endpoint
 
