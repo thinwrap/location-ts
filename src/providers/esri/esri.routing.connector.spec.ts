@@ -701,4 +701,21 @@ describe('EsriRoutingConnector', () => {
       expect(url as string).toContain('trace=on');
     });
   });
+
+  describe('non-finite coordinate guard (stops FeatureSet)', () => {
+    it('rejects a NaN waypoint with ConnectorError invalid_request (no fetch)', async () => {
+      await expect(
+        connector.route({
+          waypoints: [
+            { lat: Number.NaN, lng: -74.006 },
+            { lat: 40.758, lng: -73.9855 },
+          ],
+        }),
+      ).rejects.toMatchObject({
+        name: 'ConnectorError',
+        providerCode: 'invalid_request',
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
 });

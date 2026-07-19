@@ -9,6 +9,7 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import { encodePolyline, mergePassthrough } from '../../utils';
+import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { EsriConfig } from './esri.config';
 import { resolveEsriBearerToken } from './esri.config';
 import type {
@@ -333,13 +334,19 @@ function buildStopsFeatureSet(waypoints: LatLng[]): {
   }>;
 } {
   return {
-    features: waypoints.map((wp) => ({
-      geometry: {
-        x: wp.lng,
-        y: wp.lat,
-        spatialReference: { wkid: 4326 },
-      },
-    })),
+    features: waypoints.map((wp) => {
+      // Reject NaN/non-finite coordinates before they serialize into the
+      // FeatureSet (JSON.stringify(NaN) === "null" would silently corrupt
+      // the geometry). Out-of-range but finite lat/lng pass through verbatim.
+      assertFiniteCoordinate(wp, 'ESRI routing stop');
+      return {
+        geometry: {
+          x: wp.lng,
+          y: wp.lat,
+          spatialReference: { wkid: 4326 },
+        },
+      };
+    }),
   };
 }
 

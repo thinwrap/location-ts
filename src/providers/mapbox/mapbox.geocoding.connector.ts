@@ -13,6 +13,7 @@ import type {
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
 import { mergePassthrough } from '../../utils';
+import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { MapboxConfig } from './mapbox.config';
 import type {
   MapboxGeocodingV6Feature,
@@ -127,6 +128,10 @@ export class MapboxGeocodingConnector
   async reverseGeocode(
     options: IReverseGeocodeOptions,
   ): Promise<IReverseGeocodeResult> {
+    // Fail fast on NaN/non-finite coordinates before a network round-trip.
+    // Out-of-range lat/lng passes through verbatim (thin-wrapper philosophy).
+    assertFiniteCoordinate(options.location, 'Mapbox reverseGeocode');
+
     const baseQuery: Record<string, string> = {
       longitude: String(options.location.lng),
       latitude: String(options.location.lat),

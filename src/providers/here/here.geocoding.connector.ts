@@ -165,6 +165,10 @@ export class HereGeocodingConnector
   async reverseGeocode(
     options: IReverseGeocodeOptions,
   ): Promise<IReverseGeocodeResult> {
+    // Fail fast on NaN/non-finite coordinates before a network round-trip.
+    // Out-of-range lat/lng passes through verbatim (thin-wrapper philosophy).
+    assertFiniteCoordinate(options.location, 'HERE reverseGeocode');
+
     const baseQuery: Record<string, string> = {
       at: `${options.location.lat},${options.location.lng}`,
       apiKey: this.config.apiKey,

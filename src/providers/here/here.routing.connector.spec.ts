@@ -597,4 +597,30 @@ describe('HereRoutingConnector', () => {
       expect(thrown!.message).toBe('HERE findsequence2 returned a malformed response body');
     });
   });
+
+  describe('malformed 200 body normalization', () => {
+    // A contract-violating 200 body (section missing `summary`) must normalize
+    // to safe defaults, not escape as an unwrapped TypeError.
+    it('normalizes a 200 body with a section missing summary to defaults', async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ routes: [{ sections: [{ polyline: '' }] }] }),
+          { status: 200 },
+        ),
+      );
+
+      const result = await connector.route({
+        waypoints: [
+          { lat: 52.5, lng: 13.4 },
+          { lat: 52.6, lng: 13.5 },
+        ],
+      });
+
+      expect(result.legs).toEqual([
+        { distanceMeters: 0, durationSeconds: 0 },
+      ]);
+      expect(result.totalDistanceMeters).toBe(0);
+      expect(result.totalDurationSeconds).toBe(0);
+    });
+  });
 });

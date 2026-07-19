@@ -8,6 +8,7 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import { mergePassthrough, validateIsochroneCap } from '../../utils';
+import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { EsriConfig } from './esri.config';
 import { resolveEsriBearerToken } from './esri.config';
 import type { EsriServiceAreaResponse } from './esri.types';
@@ -262,6 +263,10 @@ function buildFacilitiesFeatureSet(center: {
     };
   }>;
 } {
+  // Reject NaN/non-finite coordinates before they serialize into the
+  // FeatureSet (JSON.stringify(NaN) === "null" would silently corrupt the
+  // geometry). Out-of-range but finite lat/lng pass through verbatim.
+  assertFiniteCoordinate(center, 'ESRI isochrone center');
   return {
     features: [
       {

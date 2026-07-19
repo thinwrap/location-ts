@@ -332,4 +332,16 @@ describe('HereGeocodingConnector', () => {
       );
     });
   });
+
+  describe('reverseGeocode non-finite coordinate guard', () => {
+    it('rejects a NaN location with ConnectorError invalid_request (no fetch)', async () => {
+      await expect(
+        connector.reverseGeocode({ location: { lat: Number.NaN, lng: 13.405 } }),
+      ).rejects.toMatchObject({
+        name: 'ConnectorError',
+        providerCode: 'invalid_request',
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
 });

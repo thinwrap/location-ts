@@ -341,4 +341,52 @@ describe('GoogleRoutingConnector', () => {
     expect(caught?.providerCode).toBe('unknown');
     expect(caught?.message).toBe('Google Routing returned a malformed response body');
   });
+
+  it('rejects a non-finite waypoint with ConnectorError invalid_request (no fetch)', async () => {
+    await expect(
+      connector.route({
+        waypoints: [
+          { lat: Number.NaN, lng: -74.006 },
+          { lat: 40.758, lng: -73.9855 },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      name: 'ConnectorError',
+      providerCode: 'invalid_request',
+    });
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects an Infinity waypoint with ConnectorError invalid_request (no fetch)', async () => {
+    await expect(
+      connector.route({
+        waypoints: [
+          { lat: 40.7128, lng: -74.006 },
+          { lat: 40.758, lng: Number.POSITIVE_INFINITY },
+        ],
+      }),
+    ).rejects.toBeInstanceOf(ConnectorError);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  // A contract-violating 200 body (route present but missing nested
+  // polyline/duration/legs) must normalize to safe defaults, not escape as an
+  // unwrapped TypeError.
+  it('normalizes a 200 body with a route missing nested fields to defaults', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ routes: [{}] }), { status: 200 }),
+    );
+
+    const result = await connector.route({
+      waypoints: [
+        { lat: 0, lng: 0 },
+        { lat: 1, lng: 1 },
+      ],
+    });
+
+    expect(result.legs).toEqual([]);
+    expect(result.totalDistanceMeters).toBe(0);
+    expect(result.totalDurationSeconds).toBe(0);
+    expect(result.polyline).toBe('');
+  });
 });

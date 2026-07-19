@@ -9,6 +9,7 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import { mergePassthrough } from '../../utils';
+import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { EsriConfig } from './esri.config';
 import { resolveEsriBearerToken } from './esri.config';
 import type { EsriODMatrixResponse } from './esri.types';
@@ -384,13 +385,19 @@ function buildPointFeatureSet(points: LatLng[]): {
   }>;
 } {
   return {
-    features: points.map((p) => ({
-      geometry: {
-        x: p.lng,
-        y: p.lat,
-        spatialReference: { wkid: 4326 },
-      },
-    })),
+    features: points.map((p) => {
+      // Reject NaN/non-finite coordinates before they serialize into the
+      // FeatureSet (JSON.stringify(NaN) === "null" would silently corrupt
+      // the geometry). Out-of-range but finite lat/lng pass through verbatim.
+      assertFiniteCoordinate(p, 'ESRI Matrix point');
+      return {
+        geometry: {
+          x: p.lng,
+          y: p.lat,
+          spatialReference: { wkid: 4326 },
+        },
+      };
+    }),
   };
 }
 

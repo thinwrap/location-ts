@@ -12,6 +12,7 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import { mergePassthrough } from '../../utils';
+import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { EsriConfig } from './esri.config';
 import { resolveEsriBearerToken } from './esri.config';
 import type {
@@ -107,6 +108,10 @@ export class EsriGeocodingConnector
   async reverseGeocode(
     options: IReverseGeocodeOptions,
   ): Promise<IReverseGeocodeResult> {
+    // Fail fast on NaN/non-finite coordinates before a network round-trip.
+    // Out-of-range lat/lng passes through verbatim (thin-wrapper philosophy).
+    assertFiniteCoordinate(options.location, 'ESRI reverseGeocode');
+
     // reverse geocode → single result wrapped in candidates[].
     const baseQuery: Record<string, string> = {
       f: 'json',

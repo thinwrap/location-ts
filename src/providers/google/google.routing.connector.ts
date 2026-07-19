@@ -3,6 +3,7 @@ import type { IRoutingConnector, IRoutingOptions, IRoutingResult } from '../../t
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
 import { mergePassthrough } from '../../utils';
+import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { GoogleConfig } from './google.config';
 import type { GoogleRoutesResponse } from './google.types';
 
@@ -44,6 +45,12 @@ export class GoogleRoutingConnector
         providerMessage: 'Google Routing requires at least two waypoints',
       });
     }
+    // Reject NaN/non-finite coordinates before they serialize into the request
+    // body (out-of-range but finite lat/lng pass through verbatim — thin-wrapper).
+    for (const wp of waypoints) {
+      assertFiniteCoordinate(wp, 'Google routing waypoint');
+    }
+
     const first = waypoints[0]!;
     const last = waypoints[waypoints.length - 1]!;
 
@@ -165,8 +172,8 @@ export class GoogleRoutingConnector
     }
 
     const legs = (route.legs ?? []).map((leg) => ({
-      distanceMeters: leg.distanceMeters,
-      durationSeconds: parseDuration(leg.duration),
+      distanceMeters: leg.distanceMeters ?? 0,
+      durationSeconds: parseDuration(leg.duration ?? '0s'),
     }));
 
     // Canonical `waypointOrder` = full visiting sequence of INPUT indices.
@@ -188,9 +195,9 @@ export class GoogleRoutingConnector
 
     return {
       legs,
-      totalDistanceMeters: route.distanceMeters,
-      totalDurationSeconds: parseDuration(route.duration),
-      polyline: route.polyline.encodedPolyline,
+      totalDistanceMeters: route.distanceMeters ?? 0,
+      totalDurationSeconds: parseDuration(route.duration ?? '0s'),
+      polyline: route.polyline?.encodedPolyline ?? '',
       ...(waypointOrder !== undefined ? { waypointOrder } : {}),
       raw: data,
     };

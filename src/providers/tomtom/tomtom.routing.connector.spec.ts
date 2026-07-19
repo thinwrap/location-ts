@@ -593,4 +593,25 @@ describe('TomTomRoutingConnector', () => {
       expect(thrown?.message).toBe('TomTom Routing returned a malformed response body');
     });
   });
+
+  describe('malformed 200 body normalization', () => {
+    // A contract-violating 200 body (route missing legs/summary) must normalize
+    // to safe defaults, not escape as an unwrapped TypeError.
+    it('normalizes a 200 body with a route missing legs/summary to defaults', async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({ routes: [{}] }), { status: 200 }),
+      );
+
+      const result = await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+        ],
+      });
+
+      expect(result.legs).toEqual([]);
+      expect(result.totalDistanceMeters).toBe(0);
+      expect(result.totalDurationSeconds).toBe(0);
+    });
+  });
 });

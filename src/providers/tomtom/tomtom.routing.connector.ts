@@ -127,15 +127,15 @@ export class TomTomRoutingConnector
       });
     }
 
-    const legs = route.legs.map((leg) => ({
-      distanceMeters: leg.summary.lengthInMeters,
-      durationSeconds: leg.summary.travelTimeInSeconds,
+    const legs = (route.legs ?? []).map((leg) => ({
+      distanceMeters: leg.summary?.lengthInMeters ?? 0,
+      durationSeconds: leg.summary?.travelTimeInSeconds ?? 0,
     }));
 
     // Flatten all leg points (TomTom uses { latitude, longitude } full-word
     // keys) into LatLng[] and re-encode to precision-5.
-    const allPoints: LatLng[] = route.legs.flatMap((leg) =>
-      leg.points.map((p) => ({ lat: p.latitude, lng: p.longitude })),
+    const allPoints: LatLng[] = (route.legs ?? []).flatMap((leg) =>
+      (leg.points ?? []).map((p) => ({ lat: p.latitude, lng: p.longitude })),
     );
     const polyline = encodePolyline(allPoints);
 
@@ -152,8 +152,8 @@ export class TomTomRoutingConnector
 
     return {
       legs,
-      totalDistanceMeters: route.summary.lengthInMeters,
-      totalDurationSeconds: route.summary.travelTimeInSeconds,
+      totalDistanceMeters: route.summary?.lengthInMeters ?? 0,
+      totalDurationSeconds: route.summary?.travelTimeInSeconds ?? 0,
       polyline,
       ...(waypointOrder !== undefined ? { waypointOrder } : {}),
       raw: data,

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-07-20
+
 ### Changed
 
 - **Google routing & matrix** now classify an invalid or restricted API key as
@@ -21,6 +23,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   links it held now live in the README prose; the frontmatter validator
   (`scripts/validate-frontmatter.mjs`), its schema, and the CI gate that ran it
   have been removed.
+
+### Fixed
+
+- **Mapbox routing** now rejects a call with fewer than two waypoints up front
+  with a clean `invalid_request` `ConnectorError`, matching every other routing
+  connector (previously it built a malformed request and surfaced an opaque
+  vendor error).
+- **Non-finite coordinates** (`NaN` / `Infinity`) are now rejected with
+  `invalid_request` across every coordinate path — reverse geocoding, routing
+  waypoints (including Mapbox optimized trips), isochrone centers, and the ESRI
+  FeatureSet builders — instead of reaching the wire (where `NaN` serialized as
+  JSON `null` or the literal `"NaN"`).
+- **Routing result normalizers** (Google, HERE, TomTom) no longer throw a raw
+  `TypeError` when a `200` response omits an expected nested field; malformed
+  bodies degrade to safe defaults, preserving the "every failure surfaces as a
+  `ConnectorError`" contract.
 
 ## [1.0.0] — 2026-06-04
 

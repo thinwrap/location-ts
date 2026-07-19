@@ -226,4 +226,18 @@ describe('MapboxIsochroneConnector', () => {
       providerCode: 'invalid_request',
     });
   });
+
+  it('rejects a non-finite center with ConnectorError invalid_request (no fetch)', async () => {
+    await expect(
+      connector.isochrone({
+        center: { lat: Number.NaN, lng: -74.006 },
+        type: 'time',
+        values: [600],
+      }),
+    ).rejects.toMatchObject({
+      name: 'ConnectorError',
+      providerCode: 'invalid_request',
+    });
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
 });

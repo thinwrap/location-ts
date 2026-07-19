@@ -8,6 +8,7 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import { mergePassthrough, validateIsochroneCap } from '../../utils';
+import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { MapboxConfig } from './mapbox.config';
 import type { MapboxIsochroneResponse } from './mapbox.types';
 
@@ -50,6 +51,7 @@ export class MapboxIsochroneConnector
 
   async isochrone(options: IIsochroneOptions): Promise<IIsochroneResult> {
     validateIsochroneCap(options);
+    assertFiniteCoordinate(options.center, 'Mapbox isochrone center');
 
     const profile = this.mapProfile(
       options.travelMode as 'driving' | 'walking' | 'cycling' | undefined,

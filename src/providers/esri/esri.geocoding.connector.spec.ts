@@ -637,4 +637,18 @@ describe('EsriGeocodingConnector', () => {
       expect(u).toContain('category=Address');
     });
   });
+
+  describe('reverseGeocode non-finite coordinate guard', () => {
+    it('rejects a NaN location with ConnectorError invalid_request (no fetch)', async () => {
+      await expect(
+        connector.reverseGeocode({
+          location: { lat: Number.NaN, lng: -117.1956 },
+        }),
+      ).rejects.toMatchObject({
+        name: 'ConnectorError',
+        providerCode: 'invalid_request',
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
 });

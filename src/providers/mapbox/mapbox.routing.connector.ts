@@ -8,6 +8,7 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import { encodePolyline, joinCoords, mergePassthrough } from '../../utils';
+import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { MapboxConfig } from './mapbox.config';
 
 const DIRECTIONS_URL = 'https://api.mapbox.com/directions/v5/mapbox';
@@ -43,6 +44,15 @@ export class MapboxRoutingConnector
   }
 
   async route(options: IRoutingOptions): Promise<IRoutingResult> {
+    if (options.waypoints.length < 2) {
+      throw new ConnectorError({
+        message: 'Mapbox Routing requires at least two waypoints',
+        statusCode: null,
+        providerCode: 'invalid_request',
+        providerMessage: 'Mapbox Routing requires at least two waypoints',
+      });
+    }
+
     const useOptimized =
       options.optimize === true ||
       options.optimizeFixedOrigin === true ||
@@ -194,6 +204,13 @@ export class MapboxRoutingConnector
     options: IRoutingOptions,
     profile: string,
   ): Promise<Response> {
+    // Reject NaN/non-finite coordinates before they serialize into the request
+    // body (JSON.stringify(NaN) === "null" would silently corrupt the geometry).
+    // Mirrors the plain `/directions` path, where `joinCoords` guards the same.
+    // Out-of-range but finite lat/lng pass through verbatim (thin-wrapper).
+    for (const coord of options.waypoints) {
+      assertFiniteCoordinate(coord, 'Mapbox routing waypoint');
+    }
     const coordinates = options.waypoints.map((c) => [c.lng, c.lat]);
 
     const body: Record<string, unknown> = {

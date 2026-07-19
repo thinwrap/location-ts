@@ -625,4 +625,74 @@ describe('MapboxRoutingConnector', () => {
       expect(thrown?.message).toBe('Mapbox returned a malformed response body');
     });
   });
+
+  describe('waypoint guard', () => {
+    it('rejects fewer than two waypoints with ConnectorError invalid_request (no fetch)', async () => {
+      await expect(
+        connector.route({ waypoints: [{ lat: 38.5, lng: -120.2 }] }),
+      ).rejects.toMatchObject({
+        name: 'ConnectorError',
+        providerCode: 'invalid_request',
+        message: 'Mapbox Routing requires at least two waypoints',
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('rejects an empty waypoints array without a network call', async () => {
+      await expect(connector.route({ waypoints: [] })).rejects.toBeInstanceOf(
+        ConnectorError,
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('non-finite coordinate guard', () => {
+    it('rejects a NaN waypoint on the plain /directions path (no fetch)', async () => {
+      await expect(
+        connector.route({
+          waypoints: [
+            { lat: Number.NaN, lng: -120.2 },
+            { lat: 40.7, lng: -120.95 },
+          ],
+        }),
+      ).rejects.toMatchObject({
+        name: 'ConnectorError',
+        providerCode: 'invalid_request',
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('rejects a NaN waypoint on the optimized /optimized-trips path (optimize=true, no fetch)', async () => {
+      await expect(
+        connector.route({
+          optimize: true,
+          waypoints: [
+            { lat: 38.5, lng: -120.2 },
+            { lat: Number.NaN, lng: -120.95 },
+            { lat: 43.252, lng: -126.453 },
+          ],
+        }),
+      ).rejects.toMatchObject({
+        name: 'ConnectorError',
+        providerCode: 'invalid_request',
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('rejects an Infinity waypoint on the optimized path via isRoundTrip (no fetch)', async () => {
+      await expect(
+        connector.route({
+          isRoundTrip: true,
+          waypoints: [
+            { lat: 38.5, lng: -120.2 },
+            { lat: 40.7, lng: Number.POSITIVE_INFINITY },
+          ],
+        }),
+      ).rejects.toMatchObject({
+        name: 'ConnectorError',
+        providerCode: 'invalid_request',
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
 });

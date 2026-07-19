@@ -186,8 +186,8 @@ export class HereRoutingConnector
         allCoords.push(...decodeFlexPolyline(section.polyline));
       }
       return {
-        distanceMeters: section.summary.length,
-        durationSeconds: section.summary.duration,
+        distanceMeters: section.summary?.length ?? 0,
+        durationSeconds: section.summary?.duration ?? 0,
       };
     });
 

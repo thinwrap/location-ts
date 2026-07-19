@@ -769,4 +769,32 @@ describe('EsriMatrixConnector', () => {
       ).rejects.toMatchObject({ name: 'ConnectorError', providerCode: 'unknown' });
     });
   });
+
+  describe('non-finite coordinate guard (point FeatureSet)', () => {
+    it('rejects a NaN origin with ConnectorError invalid_request (no fetch)', async () => {
+      await expect(
+        connector.matrix({
+          origins: [{ lat: Number.NaN, lng: 0 }],
+          destinations: [{ lat: 1, lng: 1 }],
+        }),
+      ).rejects.toMatchObject({
+        name: 'ConnectorError',
+        providerCode: 'invalid_request',
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('rejects a NaN destination with ConnectorError invalid_request (no fetch)', async () => {
+      await expect(
+        connector.matrix({
+          origins: [{ lat: 0, lng: 0 }],
+          destinations: [{ lat: 1, lng: Number.POSITIVE_INFINITY }],
+        }),
+      ).rejects.toMatchObject({
+        name: 'ConnectorError',
+        providerCode: 'invalid_request',
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
 });

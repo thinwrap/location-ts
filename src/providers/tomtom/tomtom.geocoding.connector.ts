@@ -118,6 +118,10 @@ export class TomTomGeocodingConnector
   async reverseGeocode(
     options: IReverseGeocodeOptions,
   ): Promise<IReverseGeocodeResult> {
+    // Fail fast on NaN/non-finite coordinates before a network round-trip.
+    // Out-of-range lat/lng passes through verbatim (thin-wrapper philosophy).
+    assertFiniteCoordinate(options.location, 'TomTom reverseGeocode');
+
     const url = `${REVERSE_GEOCODE_URL}/${options.location.lat},${options.location.lng}.json`;
 
     const baseQuery: Record<string, string> = {
