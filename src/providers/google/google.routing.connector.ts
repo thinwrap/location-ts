@@ -200,6 +200,12 @@ export class GoogleRoutingConnector
    * Map (HTTP status, decoded body) → canonical {@link ProviderCode}. Per
    * (per-connector locality). */
   private mapVendorError(httpStatus: number, body: unknown): ProviderCode {
+    // Prefer the structured google.rpc.ErrorInfo reason (robust) over the HTTP
+    // status: Google returns 400 INVALID_ARGUMENT for an invalid key, which the
+    // status-only mapping below would misread as invalid_request.
+    const reasonCode = mapGoogleReason(readGoogleErrorReason(body));
+    if (reasonCode !== null) return reasonCode;
+
     const googleStatus = readGoogleErrorStatus(body);
 
     if (httpStatus === 401) return 'auth_failed';
@@ -252,6 +258,51 @@ export class GoogleRoutingConnector
 /** Parse Google duration string "123s" → number of seconds. */
 function parseDuration(duration: string): number {
   return parseInt(duration.replace('s', ''), 10) || 0;
+}
+
+/**
+ * Read the machine-readable reason from a `google.rpc.ErrorInfo` entry in
+ * `error.details[]` (domain `googleapis.com`). This is a stable enum from
+ * `google/api/error_reason.proto`, unlike the human `message`.
+ */
+function readGoogleErrorReason(body: unknown): string | null {
+  if (body === null || typeof body !== 'object' || !('error' in body)) return null;
+  const err = (body as { error?: unknown }).error;
+  if (err === null || typeof err !== 'object' || !('details' in err)) return null;
+  const details = (err as { details?: unknown }).details;
+  if (!Array.isArray(details)) return null;
+  for (const d of details) {
+    if (d === null || typeof d !== 'object') continue;
+    const domain = (d as { domain?: unknown }).domain;
+    const type = (d as { '@type'?: unknown })['@type'];
+    const isErrorInfo =
+      domain === 'googleapis.com' ||
+      (typeof type === 'string' && type.endsWith('google.rpc.ErrorInfo'));
+    if (!isErrorInfo) continue;
+    const reason = (d as { reason?: unknown }).reason;
+    if (typeof reason === 'string' && reason !== '') return reason;
+  }
+  return null;
+}
+
+const GOOGLE_AUTH_REASONS = new Set<string>([
+  'API_KEY_INVALID', 'API_KEY_SERVICE_BLOCKED', 'API_KEY_HTTP_REFERRER_BLOCKED',
+  'API_KEY_IP_ADDRESS_BLOCKED', 'API_KEY_ANDROID_APP_BLOCKED', 'API_KEY_IOS_APP_BLOCKED',
+  'CREDENTIALS_MISSING', 'ACCESS_TOKEN_EXPIRED', 'ACCESS_TOKEN_SCOPE_INSUFFICIENT',
+  'ACCESS_TOKEN_TYPE_UNSUPPORTED', 'ACCOUNT_STATE_INVALID', 'CONSUMER_INVALID',
+  'CONSUMER_SUSPENDED', 'USER_PROJECT_DENIED', 'SERVICE_DISABLED', 'BILLING_DISABLED',
+]);
+const GOOGLE_RATE_REASONS = new Set<string>(['RATE_LIMIT_EXCEEDED', 'RESOURCE_QUOTA_EXCEEDED']);
+
+/**
+ * Map a `google.rpc.ErrorInfo` reason to a canonical {@link ProviderCode}, or
+ * `null` to fall back to the HTTP-status mapping.
+ */
+function mapGoogleReason(reason: string | null): ProviderCode | null {
+  if (reason === null) return null;
+  if (GOOGLE_AUTH_REASONS.has(reason)) return 'auth_failed';
+  if (GOOGLE_RATE_REASONS.has(reason)) return 'rate_limited';
+  return null;
 }
 
 function readGoogleErrorStatus(body: unknown): string | null {

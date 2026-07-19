@@ -119,4 +119,3 @@ There is **no** `retryAfterSeconds` field on `ConnectorError`. Retry-After surfa
 - Naming, file layout, test patterns: [`./CONVENTIONS.md`](./CONVENTIONS.md)
 - Adding a connector / contributor entry point: [`./guidelines.md`](./guidelines.md)
 - Consumer usage (install, calling the facades, error handling): [`../README.md`](../README.md)
-- Per-connector frontmatter schema: [`../schemas/connector-readme-schema.yaml`](../schemas/connector-readme-schema.yaml)

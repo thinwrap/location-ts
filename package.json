@@ -39,7 +39,6 @@
     "test:coverage": "vitest run --coverage",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
-    "lint:frontmatter": "node scripts/validate-frontmatter.mjs",
     "size": "size-limit",
     "size:why": "size-limit --why",
     "check:tree-shaking": "node scripts/check-tree-shaking.mjs"
@@ -73,7 +72,7 @@
     "type": "git",
     "url": "https://github.com/thinwrap/location-ts"
   },
-  "homepage": "https://github.com/thinwrap/location-ts#readme",
+  "homepage": "https://thinwrap.dev",
   "bugs": {
     "url": "https://github.com/thinwrap/location-ts/issues"
   },

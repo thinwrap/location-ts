@@ -5,6 +5,23 @@ All notable changes to `@thinwrap/location` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Google routing & matrix** now classify an invalid or restricted API key as
+  `auth_failed` (previously `invalid_request`). Google's Routes/RouteMatrix APIs
+  return HTTP `400 INVALID_ARGUMENT` for a bad key, so the connectors now read
+  the structured `google.rpc.ErrorInfo` `reason` from `error.details[]` (e.g.
+  `API_KEY_INVALID`, `API_KEY_*_BLOCKED`, `SERVICE_DISABLED`) and map auth/quota
+  reasons before falling back to the HTTP-status mapping. Absent an `ErrorInfo`,
+  behaviour is unchanged.
+- **Per-connector READMEs** no longer carry a YAML frontmatter block — the
+  metadata GitHub rendered as a table but nothing consumed. The rate-limit-docs
+  links it held now live in the README prose; the frontmatter validator
+  (`scripts/validate-frontmatter.mjs`), its schema, and the CI gate that ran it
+  have been removed.
+
 ## [1.0.0] — 2026-06-04
 
 First public release of `@thinwrap/location` — the lightweight, SDK-free

@@ -1,15 +1,10 @@
 # `@thinwrap/location` — Conventions
 
 Naming, file layout, and test patterns for AI agents adding or refactoring a connector.
-The per-connector README frontmatter schema authoritative source is
-[`../schemas/connector-readme-schema.yaml`](../schemas/connector-readme-schema.yaml).
 
-The frontmatter is a **single block at the very top of the file** (opening `---` on
-line 1), with every operation keyed under `operations:`; the `# Title` follows the
-closing `---`. GitHub only renders a `---…---` block as (hidden) frontmatter when it
-leads the file — a block placed lower leaks its raw YAML into the page body. The
-validator scans to the first `---`, so it will **not** catch a misplaced block; keep
-it on top.
+Each provider's per-connector `README.md` is plain Markdown — it opens directly with its
+`# Title` (no YAML metadata block). It is the connector's consumer-facing doc; keep it
+complete and at parity with the sibling-language libraries.
 
 ## Where files live in this repo
 
@@ -24,19 +19,17 @@ src/
     <provider>.types.ts                 # narrowed input/result types + vendor response shapes
     <provider>.<op>.connector.ts        # one connector class per operation
     <provider>.<op>.connector.spec.ts   # vitest spec — co-located, never in top-level tests/
-    README.md                           # top-of-file YAML frontmatter (operations map) + body
+    README.md                           # per-connector consumer doc (plain Markdown)
   types/                                # cross-operation interfaces, ProviderCode, LatLng, ConnectorError
   utils/                                # mergePassthrough, polyline utilities, coordinate helpers
-schemas/
-  connector-readme-schema.yaml          # per-connector README frontmatter schema
 scripts/
-  validate-frontmatter.mjs              # no-deps validator, CI-wired
+  # build/packaging + lint helpers
 .ai/
   guidelines.md                         # contributor entry point + add-a-connector recipe
   ARCHITECTURE.md                       # 6 location-distinctive invariants
   CONVENTIONS.md                        # this file
 .github/workflows/
-  ci.yml                                # OS × Node matrix + tests + lint + frontmatter + bundle-size
+  ci.yml                                # OS × Node matrix + tests + lint + bundle-size
   release.yml                           # OIDC publish on v* tag
 ```
 
@@ -65,7 +58,7 @@ export type IsochroneProvider = 'mapbox' | 'here' | 'esri' | 'tomtom';
 | `<provider>.config.ts` | yes | Exported `<Provider>Config` interface (shared across ops) |
 | `<provider>.types.ts` | yes | Vendor response shapes + per-op narrowed input types |
 | `index.ts` | yes | Barrel re-export for the provider directory |
-| `README.md` | yes | Top-of-file YAML frontmatter (operations map) + body |
+| `README.md` | yes | Per-connector consumer doc (plain Markdown) |
 
 ## `mapVendorError(status, body)` pattern
 
@@ -173,7 +166,5 @@ augmentations add per-provider narrowed types via a `<provider>.types.ts` declar
 - ESLint flat config (`eslint.config.mjs`) with `typescript-eslint`. Key rules:
   `consistent-type-imports: error`, `no-explicit-any: warn`.
 - `npm run typecheck` (`tsc --noEmit`) clean is the canary AC for any provider rewrite.
-- `npm run lint:frontmatter` validates every `src/providers/<id>/README.md`
-  against `schemas/connector-readme-schema.yaml`.
 - Dual build emits to `dist/cjs/` and `dist/esm/`. Public API surface comes only from
   `src/index.ts`.

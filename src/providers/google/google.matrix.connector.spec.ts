@@ -326,6 +326,9 @@ describe('GoogleMatrixConnector', () => {
       [403, null, 'auth_failed'],
       [429, null, 'rate_limited'],
       [400, { error: { message: 'bad request' } }, 'invalid_request'],
+      // google.rpc.ErrorInfo reason wins over the 400 status:
+      [400, { error: { status: 'INVALID_ARGUMENT', details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'API_KEY_INVALID', domain: 'googleapis.com' }] } }, 'auth_failed'],
+      [400, { error: { details: [{ reason: 'RATE_LIMIT_EXCEEDED', domain: 'googleapis.com' }] } }, 'rate_limited'],
       [500, null, 'provider_unavailable'],
       [503, null, 'provider_unavailable'],
       [418, null, 'unknown'],

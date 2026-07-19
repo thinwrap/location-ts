@@ -1,75 +1,3 @@
----
-providerId: mapbox
-operations:
-  routing:
-    auth:
-      method: api-key-query
-      tokenLifecycle: static
-    endpoint:
-      default: https://api.mapbox.com/directions/v5/mapbox
-    versioning:
-      vendorApiVersion: v5
-      lastVerified: 2026-05-17
-    selfHostable: false
-    rateLimitDocsUrl: https://docs.mapbox.com/api/overview/#rate-limits
-    retryAfterSurfaced: true
-    notes_passthrough: |
-      Mapbox uses URL-path travel modes (`driving`/`walking`/`cycling`) and
-      `lng,lat` coordinate order. Forward `annotations`, `overview`, `geometries`,
-      `language` etc. via `_passthrough.query`. Optimized waypoints route via
-      the separate Optimization API endpoint behind the same facade method.
-  matrix:
-    auth:
-      method: api-key-query
-      tokenLifecycle: static
-    endpoint:
-      default: https://api.mapbox.com/directions-matrix/v1/mapbox
-    versioning:
-      vendorApiVersion: v1
-      lastVerified: 2026-05-17
-    selfHostable: false
-    rateLimitDocsUrl: https://docs.mapbox.com/api/overview/#rate-limits
-    retryAfterSurfaced: true
-    notes_passthrough: |
-      Matrix returns 2D arrays which the connector flattens to `IMatrixCell[]`.
-      Forward `annotations`, `sources`, `destinations` index overrides via
-      `_passthrough.query`.
-  geocoding:
-    auth:
-      method: api-key-query
-      tokenLifecycle: static
-    endpoint:
-      default: https://api.mapbox.com/search/geocode/v6/forward
-    versioning:
-      vendorApiVersion: v6
-      lastVerified: 2026-05-17
-    selfHostable: false
-    rateLimitDocsUrl: https://docs.mapbox.com/api/overview/#rate-limits
-    retryAfterSurfaced: true
-    notes_passthrough: |
-      Geocoding v6 + Searchbox v1 (for autocomplete). `countryFilter` translates
-      to `country=` lowercased CSV. Autocomplete generates a per-call
-      `session_token` UUID; pass `_passthrough.query.session_token` to override.
-      `radius` is a documented no-op on autocomplete — use
-      `_passthrough.query.proximity` for proximity biasing.
-  isochrone:
-    auth:
-      method: api-key-query
-      tokenLifecycle: static
-    endpoint:
-      default: https://api.mapbox.com/isochrone/v1/mapbox
-    versioning:
-      vendorApiVersion: v1
-      lastVerified: 2026-05-17
-    selfHostable: false
-    rateLimitDocsUrl: https://docs.mapbox.com/api/overview/#rate-limits
-    retryAfterSurfaced: true
-    notes_passthrough: |
-      Returns a GeoJSON `FeatureCollection`. The facade surfaces the contours
-      array directly. Forward `denoise`, `generalize`, `polygons` via
-      `_passthrough.query`.
----
-
 # Mapbox Connectors
 
 Mapbox connectors for routing, distance matrix, geocoding, and isochrone via direct HTTP calls (no `@mapbox/mapbox-sdk` SDK).
@@ -111,7 +39,7 @@ Create a token at https://account.mapbox.com/access-tokens/. Sent as `access_tok
 ### Endpoint
 
 - Directions: `GET https://api.mapbox.com/directions/v5/mapbox/{profile}/{coordinates}`
-- Optimized trips: `GET https://api.mapbox.com/optimized-trips/v1/mapbox/{profile}/{coordinates}`
+- Optimized trips: `POST https://api.mapbox.com/optimized-trips/v2` (coordinates in the JSON body)
 
 ### Narrowed input augmentations
 

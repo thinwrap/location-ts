@@ -1,46 +1,3 @@
----
-providerId: osrm
-operations:
-  routing:
-    auth:
-      method: none
-      tokenLifecycle: none
-    endpoint:
-      default: http://localhost:5000/route/v1
-    versioning:
-      vendorApiVersion: v1
-      lastVerified: 2026-05-17
-    selfHostable: true
-    rateLimitDocsUrl: null
-    retryAfterSurfaced: false
-    notes_passthrough: |
-      Coordinates are `lng,lat` (semicolon-separated). Travel mode is part of
-      the profile name — `driving`, `walking`, `cycling` — and must match the
-      profile compiled on the OSRM server. Optimization routes via the Trip
-      service. Forward `annotations`, `overview`, `geometries`, `steps`,
-      `alternatives` via `_passthrough.query`.
-  matrix:
-    auth:
-      method: none
-      tokenLifecycle: none
-    endpoint:
-      default: http://localhost:5000/table/v1
-    versioning:
-      vendorApiVersion: v1
-      lastVerified: 2026-05-17
-    selfHostable: true
-    rateLimitDocsUrl: null
-    retryAfterSurfaced: false
-    notes_passthrough: |
-      The connector forces `annotations=duration,distance` after the
-      `_passthrough` merge — overriding via `_passthrough.query.annotations` is
-      silently overwritten. To add extra annotations include both built-ins
-      explicitly: `'duration,distance,nodes'`. OSRM Table may return HTTP 200
-      with `code !== 'Ok'` (`NoTable`, `InvalidQuery`, `InvalidOptions`); the
-      connector raises these as `ConnectorError` with
-      `providerCode: 'invalid_request'`.
----
-
 # OSRM Connectors
 
 [OSRM](https://project-osrm.org/) (Open Source Routing Machine) connectors for routing and distance matrix. **Self-hosted** — no API key, no managed service.
@@ -63,7 +20,7 @@ const matrix  = new Matrix('osrm',  { baseUrl: 'http://localhost:5000' });
 | `baseUrl` | `string` | yes | OSRM server URL (e.g. `http://localhost:5000` or your hosted instance) |
 | `fetch` | `typeof fetch` | no | BYO fetch (defaults to `globalThis.fetch`) |
 
-The connector pre-flight-validates `baseUrl` (must be `http(s)://…`, no trailing path) and throws `ConnectorError` with `providerCode: 'invalid_request'` before any HTTP call when malformed.
+The connector requires an explicit non-empty `baseUrl` and throws `ConnectorError` with `providerCode: 'invalid_request'` before any HTTP call when it's missing.
 
 ## Auth setup
 

@@ -1,76 +1,3 @@
----
-providerId: esri
-operations:
-  routing:
-    auth:
-      method: arcgis-token
-      tokenLifecycle: refreshable
-    endpoint:
-      default: https://route-api.arcgis.com/arcgis/rest/services/World/Route/NAServer/Route_World/solve
-    versioning:
-      vendorApiVersion: NAServer-2024
-      lastVerified: 2026-05-17
-    selfHostable: true
-    rateLimitDocsUrl: https://developers.arcgis.com/documentation/mapping-and-location-services/security-and-authentication/
-    retryAfterSurfaced: false
-    notes_passthrough: |
-      Form-encoded POST (not JSON). ESRI returns kilometers and minutes which
-      the connector normalizes to meters/seconds. ESRI may respond HTTP 200
-      with an `error` field on validation failure — the connector inspects this.
-      Forward `directionsLanguage`, `directionsStyleName`, `findBestSequence`,
-      `preserveTerminalStops` via `_passthrough.body`.
-  matrix:
-    auth:
-      method: arcgis-token
-      tokenLifecycle: refreshable
-    endpoint:
-      default: https://logistics.arcgis.com/arcgis/rest/services/World/OriginDestinationCostMatrix/GPServer/GenerateOriginDestinationCostMatrix/submitJob
-    versioning:
-      vendorApiVersion: GPServer-2024
-      lastVerified: 2026-05-17
-    selfHostable: true
-    rateLimitDocsUrl: https://developers.arcgis.com/documentation/mapping-and-location-services/security-and-authentication/
-    retryAfterSurfaced: false
-    notes_passthrough: |
-      Form-encoded POST. ESRI OD Cost Matrix returns miles + minutes; connector
-      normalizes to meters + seconds. OIDs are 1-based. Forward
-      `outputType`, `cutoff`, `targetDestinationCount` via `_passthrough.body`.
-  geocoding:
-    auth:
-      method: arcgis-token
-      tokenLifecycle: refreshable
-    endpoint:
-      default: https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates
-    versioning:
-      vendorApiVersion: GeocodeServer-2024
-      lastVerified: 2026-05-17
-    selfHostable: true
-    rateLimitDocsUrl: https://developers.arcgis.com/documentation/mapping-and-location-services/security-and-authentication/
-    retryAfterSurfaced: false
-    notes_passthrough: |
-      Three endpoints: findAddressCandidates / reverseGeocode / suggest.
-      Forward `category`, `countryCode`, `location`, `magicKey`, `outFields`
-      via `_passthrough.query`.
-  isochrone:
-    auth:
-      method: arcgis-token
-      tokenLifecycle: refreshable
-    endpoint:
-      default: https://route-api.arcgis.com/arcgis/rest/services/World/ServiceAreas/NAServer/ServiceArea_World/solveServiceArea
-    versioning:
-      vendorApiVersion: NAServer-2024
-      lastVerified: 2026-05-17
-    selfHostable: true
-    rateLimitDocsUrl: https://developers.arcgis.com/documentation/mapping-and-location-services/security-and-authentication/
-    retryAfterSurfaced: false
-    notes_passthrough: |
-      Form-encoded POST. Service Area expects minutes / miles; connector
-      converts seconds → minutes and meters → miles on the wire. Returns
-      ESRI geometry which the connector emits as GeoJSON Polygons. Forward
-      `travelDirection`, `overlapPolicy`, `splitPolygonsAtBreaks` via
-      `_passthrough.body`.
----
-
 # ESRI ArcGIS Connectors
 
 ESRI ArcGIS Location Services connectors for routing, distance matrix, geocoding, and isochrone (service areas) via direct HTTP calls.
@@ -136,7 +63,7 @@ ESRI's API tier may or may not document `Retry-After` (depends on subscription).
 
 ### Endpoint
 
-`POST .../GenerateOriginDestinationCostMatrix/submitJob`
+`POST .../OriginDestinationCostMatrix_World/solveODCostMatrix`
 
 ### Narrowed input augmentations
 
@@ -158,4 +85,4 @@ Standard `IMatrixOptions`. `travelMode` cycling raises `ConnectorError` with `pr
 
 ### Narrowed input augmentations
 
-Standard `IIsochroneOptions`. `type: 'time'` ⇒ `defaultBreaks` in minutes; `type: 'distance'` ⇒ `defaultBreaks` in miles. Connector handles the unit conversion both directions.
+Standard `IIsochroneOptions`. `type: 'time'` ⇒ `defaultBreaks` in minutes (`esriDriveTimeUnitsMinutes`; input seconds ÷ 60); `type: 'distance'` ⇒ `defaultBreaks` in meters (`esriDriveDistanceUnitsMeters`, passed through).

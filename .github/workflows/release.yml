@@ -59,8 +59,6 @@ jobs:
 
       - run: npm run lint
 
-      - run: npm run lint:frontmatter -- --expected-blocks 21 --expected-providers 6
-
       - run: npm run build
 
       # Plain-Node import smoke of dist (CJS + ESM) — catches broken emits

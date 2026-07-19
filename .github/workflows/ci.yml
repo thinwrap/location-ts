@@ -2,8 +2,7 @@ name: CI
 
 # TS CI matrix (Linux × macOS × Windows × Node 18/20/22) + lint gates.
 # Covers the cross-OS/Node test matrix, network-disabled smoke, and build
-# reproducibility. The `lint-gates` job consumes `scripts/validate-frontmatter.mjs`
-# and runs in lockstep with the `test` matrix.
+# reproducibility. The `lint-gates` job runs in lockstep with the `test` matrix.
 
 on:
   push:
@@ -62,10 +61,10 @@ jobs:
           if-no-files-found: ignore
 
   # --- Lint gates job ---
-  # Frontmatter validation + no-lifecycle-scripts + MIT license check.
+  # No-lifecycle-scripts + MIT license check.
   # Runs once (Ubuntu / Node 22) — these gates are OS-independent.
   lint-gates:
-    name: lint gates (frontmatter · lifecycle · license)
+    name: lint gates (lifecycle · license)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -77,9 +76,6 @@ jobs:
       - name: Install
         run: npm ci --no-audit --no-fund --fetch-timeout=60000 --fetch-retries=3 --fetch-retry-maxtimeout=15000
         timeout-minutes: 8
-
-      - name: Validate per-connector README frontmatter
-        run: npm run lint:frontmatter -- --expected-blocks 21 --expected-providers 6
 
       - name: Lint
         run: npm run lint
