@@ -73,6 +73,19 @@ export class TomTomRoutingConnector
       routeRepresentation: 'polyline',
     };
 
+    // TomTom computeBestOrder reorders the intermediate waypoints while keeping the
+    // first/last fixed (an OPEN route); it has no closed round-trip mode. Surface
+    // the unsupported flag instead of silently returning an open route.
+    if (options.isRoundTrip === true) {
+      throw new ConnectorError({
+        message: 'TomTom route optimization does not support round trips (isRoundTrip)',
+        statusCode: null,
+        providerCode: 'unsupported_option',
+        providerMessage:
+          'TomTom computeBestOrder optimizes an open route (fixed first/last waypoint) and cannot return a closed round trip; remove isRoundTrip or use a provider that supports it (e.g. Mapbox/OSRM).',
+      });
+    }
+
     if (options.optimize === true && waypoints.length > 2) {
       baseQuery.computeBestOrder = 'true';
     }
@@ -144,10 +157,17 @@ export class TomTomRoutingConnector
       options.optimize === true &&
       Array.isArray(data.optimizedWaypoints)
     ) {
-      waypointOrder = data.optimizedWaypoints
+      // TomTom `optimizedWaypoints` covers only the INTERMEDIATE waypoints;
+      // `providedIndex` is 0-based over those intermediates (origin and
+      // destination excluded). The canonical `waypointOrder` is the full
+      // visiting sequence of INPUT indices, so project each intermediate to its
+      // input index (+1) and bracket with the fixed origin (0) and
+      // destination (waypoints.length - 1).
+      const intermediates = data.optimizedWaypoints
         .slice()
         .sort((a, b) => a.optimizedIndex - b.optimizedIndex)
-        .map((wp) => wp.providedIndex);
+        .map((wp) => wp.providedIndex + 1);
+      waypointOrder = [0, ...intermediates, waypoints.length - 1];
     }
 
     return {

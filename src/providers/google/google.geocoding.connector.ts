@@ -12,7 +12,7 @@ import type {
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
 import { mergePassthrough } from '../../utils';
-import { assertFiniteCoordinate } from '../../utils/coordinate';
+import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
 import type { GoogleConfig } from './google.config';
 import type {
   GoogleGeocodeResponse,
@@ -116,7 +116,7 @@ export class GoogleGeocodingConnector
     assertFiniteCoordinate(options.location, 'Google reverseGeocode');
 
     const query: Record<string, string> = {
-      latlng: `${options.location.lat},${options.location.lng}`,
+      latlng: `${formatCoord(options.location.lat)},${formatCoord(options.location.lng)}`,
       key: this.config.apiKey,
     };
     if (options.language !== undefined) {

@@ -65,6 +65,11 @@ export interface HereMatrixResponse {
     numDestinations: number;
     travelTimes: number[];
     distances: number[];
+    // Per-cell status parallel to travelTimes/distances (present when any cell
+    // failed). 0 = OK, 3 = "matrix cell computed with a violated constraint"
+    // (still a usable value); any other non-zero code marks the cell's
+    // travelTimes/distances value as unspecified.
+    errorCodes?: number[];
   };
 }
 

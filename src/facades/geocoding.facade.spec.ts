@@ -178,8 +178,8 @@ describe('Geocoding facade — type-level narrowing tests', () => {
 
   it('rejects unknown provider id at compile time', () => {
     const _factory = () =>
-      // @ts-expect-error 'novu' is not a GeocodingProvider.
-      new Geocoding('novu', { apiKey: 'k' });
+      // @ts-expect-error 'not-a-provider' is not a GeocodingProvider.
+      new Geocoding('not-a-provider', { apiKey: 'k' });
     void _factory;
     expect(true).toBe(true);
   });

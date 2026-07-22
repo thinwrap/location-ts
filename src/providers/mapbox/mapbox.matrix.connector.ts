@@ -170,11 +170,17 @@ export class MapboxMatrixConnector
     const cells: IMatrixCell[] = [];
     for (let i = 0; i < options.origins.length; i++) {
       for (let j = 0; j < options.destinations.length; j++) {
+        const distanceMeters = distances[i]?.[j];
+        const durationSeconds = durations[i]?.[j];
+        // Mapbox returns `null` for an unroutable pair. Omit the cell rather
+        // than coercing to 0 (which reads as "same location"). Contract:
+        // missing/failed entries are omitted from `cells[]`.
+        if (distanceMeters == null || durationSeconds == null) continue;
         cells.push({
           originIndex: i,
           destinationIndex: j,
-          distanceMeters: distances[i]?.[j] ?? 0,
-          durationSeconds: durations[i]?.[j] ?? 0,
+          distanceMeters,
+          durationSeconds,
         });
       }
     }

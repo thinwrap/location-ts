@@ -156,7 +156,7 @@ describe('MapboxRoutingConnector', () => {
       expect(result.totalDurationSeconds).toBe(300);
     });
 
-    it('uses POST /optimized-trips/v2 when optimize=true', async () => {
+    it('uses GET /optimized-trips/v1 when optimize=true', async () => {
       mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
 
       await connector.route({
@@ -169,20 +169,15 @@ describe('MapboxRoutingConnector', () => {
       });
 
       const [url, init] = mockFetch.mock.calls[0]!;
-      expect(url).toMatch(
-        /^https:\/\/api\.mapbox\.com\/optimized-trips\/v2(\?|$)/,
+      expect(url).toContain(
+        'https://api.mapbox.com/optimized-trips/v1/mapbox/driving/',
       );
-      expect(init?.method).toBe('POST');
-      const body = JSON.parse(init!.body as string) as Record<string, unknown>;
-      expect(body.profile).toBe('driving');
-      expect(body.coordinates).toEqual([
-        [-74.006, 40.7128],
-        [-73.9855, 40.758],
-        [-73.9856, 40.7484],
-      ]);
+      // Coordinates ride in the path (lng,lat;…), not a POST body.
+      expect(url).toContain('-74.006,40.7128;-73.9855,40.758;-73.9856,40.7484');
+      expect(init?.method).toBe('GET');
     });
 
-    it('dispatches to /optimized-trips/v2 when only optimizeFixedOrigin is set', async () => {
+    it('dispatches to /optimized-trips/v1 when only optimizeFixedOrigin is set', async () => {
       mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
       await connector.route({
         waypoints: [
@@ -192,10 +187,10 @@ describe('MapboxRoutingConnector', () => {
         optimizeFixedOrigin: true,
       });
       const [url] = mockFetch.mock.calls[0]!;
-      expect(url).toContain('/optimized-trips/v2');
+      expect(url).toContain('/optimized-trips/v1/mapbox');
     });
 
-    it('dispatches to /optimized-trips/v2 when only optimizeFixedDestination is set', async () => {
+    it('dispatches to /optimized-trips/v1 when only optimizeFixedDestination is set', async () => {
       mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
       await connector.route({
         waypoints: [
@@ -205,10 +200,10 @@ describe('MapboxRoutingConnector', () => {
         optimizeFixedDestination: true,
       });
       const [url] = mockFetch.mock.calls[0]!;
-      expect(url).toContain('/optimized-trips/v2');
+      expect(url).toContain('/optimized-trips/v1/mapbox');
     });
 
-    it('dispatches to /optimized-trips/v2 when only isRoundTrip is set', async () => {
+    it('dispatches to /optimized-trips/v1 when only isRoundTrip is set', async () => {
       mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
       await connector.route({
         waypoints: [
@@ -218,12 +213,15 @@ describe('MapboxRoutingConnector', () => {
         isRoundTrip: true,
       });
       const [url] = mockFetch.mock.calls[0]!;
-      expect(url).toContain('/optimized-trips/v2');
+      expect(url).toContain('/optimized-trips/v1/mapbox');
     });
   });
 
   describe('optimization flag mapping', () => {
-    it('plain optimize=true sets source=any & destination=any', async () => {
+    // v1 (OSRM-trip-based) rejects source=any + destination=any + roundtrip=false,
+    // so plain optimize keeps BOTH endpoints and reorders the middle — matching
+    // Google/TomTom/HERE/Esri.
+    it('plain optimize=true keeps endpoints (source=first, destination=last)', async () => {
       mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
       await connector.route({
         waypoints: [
@@ -233,14 +231,14 @@ describe('MapboxRoutingConnector', () => {
         ],
         optimize: true,
       });
-      const [, init] = mockFetch.mock.calls[0]!;
-      const body = JSON.parse(init!.body as string) as Record<string, unknown>;
-      expect(body.source).toBe('any');
-      expect(body.destination).toBe('any');
-      expect(body.roundtrip).toBe(false);
+      const [url] = mockFetch.mock.calls[0]!;
+      const params = parseUrlParams(url as string);
+      expect(params.get('source')).toBe('first');
+      expect(params.get('destination')).toBe('last');
+      expect(params.get('roundtrip')).toBe('false');
     });
 
-    it('optimizeFixedOrigin pins source to "first"', async () => {
+    it('optimizeFixedOrigin pins source to "first" and frees the destination', async () => {
       mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
       await connector.route({
         waypoints: [
@@ -248,16 +246,15 @@ describe('MapboxRoutingConnector', () => {
           { lat: 1, lng: 1 },
           { lat: 2, lng: 2 },
         ],
-        optimize: true,
         optimizeFixedOrigin: true,
       });
-      const [, init] = mockFetch.mock.calls[0]!;
-      const body = JSON.parse(init!.body as string) as Record<string, unknown>;
-      expect(body.source).toBe('first');
-      expect(body.destination).toBe('any');
+      const [url] = mockFetch.mock.calls[0]!;
+      const params = parseUrlParams(url as string);
+      expect(params.get('source')).toBe('first');
+      expect(params.get('destination')).toBe('any');
     });
 
-    it('optimizeFixedDestination pins destination to "last"', async () => {
+    it('optimizeFixedDestination pins destination to "last" and frees the source', async () => {
       mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
       await connector.route({
         waypoints: [
@@ -265,16 +262,15 @@ describe('MapboxRoutingConnector', () => {
           { lat: 1, lng: 1 },
           { lat: 2, lng: 2 },
         ],
-        optimize: true,
         optimizeFixedDestination: true,
       });
-      const [, init] = mockFetch.mock.calls[0]!;
-      const body = JSON.parse(init!.body as string) as Record<string, unknown>;
-      expect(body.source).toBe('any');
-      expect(body.destination).toBe('last');
+      const [url] = mockFetch.mock.calls[0]!;
+      const params = parseUrlParams(url as string);
+      expect(params.get('source')).toBe('any');
+      expect(params.get('destination')).toBe('last');
     });
 
-    it('isRoundTrip=true emits roundtrip:true', async () => {
+    it('isRoundTrip=true emits roundtrip=true (source=first)', async () => {
       mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
       await connector.route({
         waypoints: [
@@ -283,9 +279,10 @@ describe('MapboxRoutingConnector', () => {
         ],
         isRoundTrip: true,
       });
-      const [, init] = mockFetch.mock.calls[0]!;
-      const body = JSON.parse(init!.body as string) as Record<string, unknown>;
-      expect(body.roundtrip).toBe(true);
+      const [url] = mockFetch.mock.calls[0]!;
+      const params = parseUrlParams(url as string);
+      expect(params.get('roundtrip')).toBe('true');
+      expect(params.get('source')).toBe('first');
     });
 
     it('maps canonical waypointOrder by inverting waypoints[].waypoint_index', async () => {
@@ -488,7 +485,9 @@ describe('MapboxRoutingConnector', () => {
       expect(params.get('language')).toBe('fr');
     });
 
-    it('merges _passthrough.body into the optimized-trips request body', async () => {
+    it('merges _passthrough.query into the optimized-trips request query', async () => {
+      // Optimization v1 is a GET, so the escape hatch is `_passthrough.query`
+      // (which can also override a connector-set default like `annotations`).
       mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
       await connector.route({
         waypoints: [
@@ -497,11 +496,11 @@ describe('MapboxRoutingConnector', () => {
           { lat: 2, lng: 2 },
         ],
         optimize: true,
-        _passthrough: { body: { annotations: ['duration'] } },
+        _passthrough: { query: { annotations: 'duration' } },
       });
-      const [, init] = mockFetch.mock.calls[0]!;
-      const body = JSON.parse(init!.body as string) as Record<string, unknown>;
-      expect(body.annotations).toEqual(['duration']);
+      const [url] = mockFetch.mock.calls[0]!;
+      const params = parseUrlParams(url as string);
+      expect(params.get('annotations')).toBe('duration');
     });
 
     it('merges _passthrough.headers onto requests', async () => {

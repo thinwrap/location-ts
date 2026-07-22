@@ -30,7 +30,7 @@ Create a token at https://account.mapbox.com/access-tokens/. Sent as `access_tok
 
 - Directions: https://docs.mapbox.com/api/navigation/directions/
 - Matrix: https://docs.mapbox.com/api/navigation/matrix/
-- Geocoding v6: https://docs.mapbox.com/api/search/geocoding-v6/
+- Geocoding v6: https://docs.mapbox.com/api/search/geocoding/
 - Isochrone: https://docs.mapbox.com/api/navigation/isochrone/
 - Rate limits: https://docs.mapbox.com/api/overview/#rate-limits
 
@@ -39,7 +39,7 @@ Create a token at https://account.mapbox.com/access-tokens/. Sent as `access_tok
 ### Endpoint
 
 - Directions: `GET https://api.mapbox.com/directions/v5/mapbox/{profile}/{coordinates}`
-- Optimized trips: `POST https://api.mapbox.com/optimized-trips/v2` (coordinates in the JSON body)
+- Optimized trips: `GET https://api.mapbox.com/optimized-trips/v1/mapbox/{profile}/{coordinates}`
 
 ### Narrowed input augmentations
 

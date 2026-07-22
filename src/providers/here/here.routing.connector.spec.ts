@@ -283,21 +283,19 @@ describe('HereRoutingConnector', () => {
       expect(mockFetch.mock.calls[0]![0] as string).toContain('findsequence2');
     });
 
-    it('triggers optimization on isRoundTrip', async () => {
-      mockFetch
-        .mockResolvedValueOnce(buildSequenceResponse())
-        .mockResolvedValueOnce(buildRouteResponse());
-      await connector.route({
-        waypoints: [
-          { lat: 0, lng: 0 },
-          { lat: 1, lng: 1 },
-          { lat: 2, lng: 2 },
-          { lat: 3, lng: 3 },
-        ],
-        isRoundTrip: true,
-      });
-      expect(mockFetch).toHaveBeenCalledTimes(2);
-      expect(mockFetch.mock.calls[0]![0] as string).toContain('findsequence2');
+    it('rejects isRoundTrip with unsupported_option (findsequence2 optimizes an open route, no round trip)', async () => {
+      await expect(
+        connector.route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 1, lng: 1 },
+            { lat: 2, lng: 2 },
+            { lat: 3, lng: 3 },
+          ],
+          isRoundTrip: true,
+        }),
+      ).rejects.toMatchObject({ name: 'ConnectorError', providerCode: 'unsupported_option' });
+      expect(mockFetch).not.toHaveBeenCalled();
     });
 
     it('skips optimization when only 2 waypoints (no intermediates)', async () => {

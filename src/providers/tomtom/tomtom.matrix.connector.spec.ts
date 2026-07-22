@@ -51,7 +51,7 @@ function pendingResp(): Response {
 }
 
 function succeededResp(): Response {
-  return new Response(JSON.stringify({ state: 'Succeeded' }), { status: 200 });
+  return new Response(JSON.stringify({ state: 'Completed' }), { status: 200 });
 }
 
 /**
@@ -152,11 +152,10 @@ describe('TomTomMatrixConnector', () => {
     ]);
   });
 
-  // LOC-CP-1 (loc-CR #100): a cell dropped for lacking `routeSummary` used to
-  // yield a SILENTLY sparse matrix. That is now treated as a correctness bug —
-  // an incomplete grid throws a typed ConnectorError rather than returning
-  // fewer cells than requested with no signal.
-  it('should throw ConnectorError when a sync entry lacks routeSummary (sparse grid)', async () => {
+  // A cell dropped for lacking `routeSummary` (an unroutable pair) is OMITTED
+  // from the result — each returned cell is indexed, so the consumer can tell
+  // which pairs are present. Parity with Mapbox/OSRM/HERE/Google.
+  it('should omit a sync entry that lacks routeSummary (sparse grid)', async () => {
     mockFetch.mockResolvedValueOnce(
       new Response(
         JSON.stringify({
@@ -177,15 +176,16 @@ describe('TomTomMatrixConnector', () => {
       ),
     );
 
-    await expect(
-      connector.matrix({
-        origins: [{ lat: 0, lng: 0 }],
-        destinations: [
-          { lat: 1, lng: 1 },
-          { lat: 2, lng: 2 },
-        ],
-      }),
-    ).rejects.toMatchObject({ name: 'ConnectorError', providerCode: 'unknown' });
+    const result = await connector.matrix({
+      origins: [{ lat: 0, lng: 0 }],
+      destinations: [
+        { lat: 1, lng: 1 },
+        { lat: 2, lng: 2 },
+      ],
+    });
+    expect(result.cells).toEqual([
+      { originIndex: 0, destinationIndex: 0, distanceMeters: 5000, durationSeconds: 300 },
+    ]);
   });
 
   it.each<['driving' | 'walking', string]>([
@@ -291,7 +291,7 @@ describe('TomTomMatrixConnector', () => {
     });
   });
 
-  it('should accept immediate Succeeded state on first poll (async path)', async () => {
+  it('should accept immediate Completed state on first poll (async path)', async () => {
     mockFetch
       .mockResolvedValueOnce(submitResp('job-fast'))
       .mockResolvedValueOnce(succeededResp())
@@ -542,11 +542,12 @@ describe('TomTomMatrixConnector', () => {
 
   // LOC-CP-1 (loc-CR #100) — sparse-matrix coverage guard (cells dropped for
   // lacking routeSummary previously yielded a silent sparse matrix)
-  describe('matrix coverage guard (LOC-CP-1)', () => {
-    it('throws ConnectorError when fewer routable cells than the requested grid', async () => {
+  describe('matrix sparse-cell omission', () => {
+    it('omits an unroutable cell (returns a sparse, indexed result) rather than throwing', async () => {
       // 1×2 grid requested, but only one cell carries a routeSummary; the other
-      // is unreachable (detailedError). Pre-fix this returned a silent 1-cell
-      // sparse result; now it must throw.
+      // is unreachable (detailedError). The unroutable pair is OMITTED — each
+      // returned cell is indexed, so the consumer can tell which pairs exist.
+      // (Parity with Mapbox/OSRM/HERE/Google; supersedes the loc-CR #100 throw.)
       const body = {
         data: [
           {
@@ -566,24 +567,17 @@ describe('TomTomMatrixConnector', () => {
         new Response(JSON.stringify(body), { status: 200 }),
       );
 
-      let caught: ConnectorError | null = null;
-      try {
-        await connector.matrix({
-          origins: [{ lat: 0, lng: 0 }],
-          destinations: [
-            { lat: 1, lng: 1 },
-            { lat: 2, lng: 2 },
-          ],
-        });
-      } catch (err) {
-        caught = err as ConnectorError;
-      }
+      const result = await connector.matrix({
+        origins: [{ lat: 0, lng: 0 }],
+        destinations: [
+          { lat: 1, lng: 1 },
+          { lat: 2, lng: 2 },
+        ],
+      });
 
-      expect(caught).toBeInstanceOf(ConnectorError);
-      expect(caught?.providerCode).toBe('unknown');
-      expect(caught?.statusCode).toBeNull();
-      expect(caught?.providerMessage).toContain('1×2');
-      expect((caught?.cause as { data?: unknown })?.data).toEqual(body.data);
+      expect(result.cells).toEqual([
+        { originIndex: 0, destinationIndex: 0, distanceMeters: 5000, durationSeconds: 300 },
+      ]);
     });
 
     it('does not throw when every requested cell is routable (happy path unchanged)', async () => {

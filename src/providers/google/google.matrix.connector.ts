@@ -8,6 +8,7 @@ import type {
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
 import { mergePassthrough } from '../../utils';
+import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { GoogleConfig } from './google.config';
 import type { GoogleRouteMatrixElement } from './google.types';
 
@@ -36,6 +37,13 @@ export class GoogleMatrixConnector
   }
 
   async matrix(options: IMatrixOptions): Promise<IMatrixResult> {
+    // Reject NaN/non-finite coordinates before they serialize into the JSON
+    // body (JSON.stringify(NaN) === "null" would silently corrupt the request).
+    // Out-of-range but finite lat/lng pass through verbatim (thin-wrapper).
+    for (const coord of [...options.origins, ...options.destinations]) {
+      assertFiniteCoordinate(coord, 'Google Matrix');
+    }
+
     const origins = options.origins.map((o) => ({
       waypoint: { location: { latLng: { latitude: o.lat, longitude: o.lng } } },
     }));
@@ -44,19 +52,23 @@ export class GoogleMatrixConnector
       waypoint: { location: { latLng: { latitude: d.lat, longitude: d.lng } } },
     }));
 
+    const travelMode = this.mapTravelMode(options.travelMode);
     const body: Record<string, unknown> = {
       origins,
       destinations,
-      travelMode: this.mapTravelMode(options.travelMode),
-      // TRAFFIC_AWARE when a departureTime is supplied (the consumer cares about
-      // timing), else TRAFFIC_UNAWARE; overridable via `_passthrough.body`.
-      // NOTE (loc-CR #119, 2026-05-29): flagged as a sub-baseline knob, but this
-      // is a defensible internal default backed by tests — left
-      // intact pending a product decision rather than dropped silently.
-      routingPreference: options.departureTime
-        ? 'TRAFFIC_AWARE'
-        : 'TRAFFIC_UNAWARE',
+      travelMode,
     };
+
+    // Google rejects `routingPreference` for WALK/BICYCLE ("Routing preference
+    // cannot be set for WALK or BICYCLE routing mode.") — only DRIVE and
+    // TWO_WHEELER accept it. TRAFFIC_AWARE when a departureTime is supplied
+    // (the consumer cares about timing), else TRAFFIC_UNAWARE; overridable via
+    // `_passthrough.body`.
+    if (travelMode === 'DRIVE' || travelMode === 'TWO_WHEELER') {
+      body.routingPreference = options.departureTime
+        ? 'TRAFFIC_AWARE'
+        : 'TRAFFIC_UNAWARE';
+    }
 
     if (options.avoidTolls) {
       body.routeModifiers = { avoidTolls: true };
@@ -69,13 +81,14 @@ export class GoogleMatrixConnector
     const headers: Record<string, string> = {
       'X-Goog-Api-Key': this.config.apiKey,
       'X-Goog-FieldMask':
-        'originIndex,destinationIndex,distanceMeters,duration,status',
+        'originIndex,destinationIndex,distanceMeters,duration,status,condition',
     };
 
     const merged = mergePassthrough(body, headers, options._passthrough);
 
     const response = await this.sendPostJson(MATRIX_URL, merged.body, {
       headers: merged.headers,
+      query: merged.query,
     });
 
     if (!response.ok) {
@@ -230,10 +243,20 @@ function parseNdjsonElements(text: string): GoogleRouteMatrixElement[] {
  */
 function isSuccessfulElement(el: GoogleRouteMatrixElement): boolean {
   const status = el.status;
-  if (status === undefined || status === null) return true;
-  const code = status.code;
-  if (code === undefined || code === null) return true;
-  return code === 0;
+  const statusOk =
+    status === undefined ||
+    status === null ||
+    status.code === undefined ||
+    status.code === null ||
+    status.code === 0;
+  if (!statusOk) return false;
+  // `condition` is independent of `status`: an element can be status-OK with
+  // `ROUTE_NOT_FOUND` and no distanceMeters/duration. Treat anything other than
+  // ROUTE_EXISTS (when present) as a failed cell so it is omitted from cells[].
+  if (el.condition !== undefined && el.condition !== 'ROUTE_EXISTS') {
+    return false;
+  }
+  return true;
 }
 
 /**

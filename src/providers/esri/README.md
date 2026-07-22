@@ -30,10 +30,10 @@ ArcGIS Enterprise on-prem deployments are supported by overriding endpoints in `
 
 ## Vendor docs
 
-- Route service: https://developers.arcgis.com/rest/network/route/
-- OD Cost Matrix: https://developers.arcgis.com/rest/network/od-cost-matrix/
+- Route service: https://developers.arcgis.com/rest/routing/route-service-direct/
+- OD Cost Matrix: https://developers.arcgis.com/rest/routing/travelCostMatrix-service-direct/
 - Geocoding service: https://developers.arcgis.com/rest/geocode/
-- Service Area: https://developers.arcgis.com/rest/network/service-area/
+- Service Area: https://developers.arcgis.com/rest/routing/serviceArea-service-direct/
 
 ## Routing
 

@@ -108,7 +108,7 @@ describe('EsriIsochroneConnector', () => {
     expect(params.get('breakUnits')).toBe('esriDriveDistanceUnitsMeters');
   });
 
-  it('should pass travelMode for walking', async () => {
+  it('should pass the full Walking Time travelMode JSON object for walking', async () => {
     mockFetch.mockResolvedValueOnce(buildServiceAreaResponse());
 
     await connector.isochrone({
@@ -120,7 +120,12 @@ describe('EsriIsochroneConnector', () => {
 
     const [, init] = mockFetch.mock.calls[0]!;
     const params = new URLSearchParams(init!.body as string);
-    expect(params.get('travelMode')).toBe('Walking Time');
+    // ArcGIS requires a full travel-mode JSON object, not a name string
+    // (a bare "Walking Time" is ignored and the service stays on driving).
+    const travelMode = JSON.parse(params.get('travelMode') as string);
+    expect(travelMode.type).toBe('WALK');
+    expect(travelMode.impedanceAttributeName).toBe('WalkTime');
+    expect(travelMode.name).toBe('Walking Time');
   });
 
   it('should accept arcgisToken alternative auth (dual-auth XOR)', async () => {

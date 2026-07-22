@@ -402,7 +402,9 @@ describe('OsrmMatrixConnector', () => {
       expect(result.raw).toEqual(body);
     });
 
-    it('coerces null cells in vendor body to 0 meters / 0 seconds', async () => {
+    it('omits unroutable (null) cells rather than coercing to 0', async () => {
+      // OSRM returns null for an unroutable pair; that cell must be omitted, not
+      // reported as a 0m/0s cell (which reads as "same location").
       mockFetch.mockResolvedValueOnce(
         buildTableResponse({
           durations: [[null, 120]],
@@ -416,13 +418,8 @@ describe('OsrmMatrixConnector', () => {
           { lat: 2, lng: 2 },
         ],
       });
+      expect(result.cells).toHaveLength(1);
       expect(result.cells[0]).toEqual({
-        originIndex: 0,
-        destinationIndex: 0,
-        distanceMeters: 0,
-        durationSeconds: 0,
-      });
-      expect(result.cells[1]).toEqual({
         originIndex: 0,
         destinationIndex: 1,
         distanceMeters: 2000,

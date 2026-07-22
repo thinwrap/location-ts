@@ -70,13 +70,22 @@ export class GoogleRoutingConnector
       location: { latLng: { latitude: wp.lat, longitude: wp.lng } },
     }));
 
+    const travelMode = this.mapTravelMode(options.travelMode);
     const body: Record<string, unknown> = {
       origin,
       destination,
-      travelMode: this.mapTravelMode(options.travelMode),
-      routingPreference: options.departureTime ? 'TRAFFIC_AWARE' : 'TRAFFIC_UNAWARE',
+      travelMode,
       polylineEncoding: 'ENCODED_POLYLINE',
     };
+
+    // Google rejects `routingPreference` for WALK/BICYCLE ("Routing preference
+    // cannot be set for WALK or BICYCLE routing mode.") — only DRIVE and
+    // TWO_WHEELER accept it. Overridable via `_passthrough.body`.
+    if (travelMode === 'DRIVE' || travelMode === 'TWO_WHEELER') {
+      body.routingPreference = options.departureTime
+        ? 'TRAFFIC_AWARE'
+        : 'TRAFFIC_UNAWARE';
+    }
 
     if (intermediates.length > 0) {
       body.intermediates = intermediates;
@@ -128,6 +137,7 @@ export class GoogleRoutingConnector
 
     const response = await this.sendPostJson(ROUTES_URL, merged.body, {
       headers: merged.headers,
+      query: merged.query,
     });
 
     if (!response.ok) {

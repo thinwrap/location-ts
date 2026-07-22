@@ -11,6 +11,7 @@ import { mergePassthrough, validateIsochroneCap } from '../../utils';
 import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { EsriConfig } from './esri.config';
 import { resolveEsriBearerToken } from './esri.config';
+import { mapEsriTravelMode } from './esri.travel-modes';
 import type { EsriServiceAreaResponse } from './esri.types';
 
 const SERVICE_AREA_URL =
@@ -32,9 +33,11 @@ const MINUTES_TO_SECONDS = 60;
  * for `esriDriveTimeUnitsMinutes`. For `type: 'distance'` input meters are
  * passed through into `defaultBreaks` with `esriDriveDistanceUnitsMeters`.
  *
- * **Travel mode.** Base `'driving'` is the ESRI default; `'walking'`
- * maps to `'Walking Time'`. ESRI does NOT augment `IsochroneOptionsMap` —
- * narrowed type stays at base.
+ * **Travel mode.** Base `'driving'` is the ESRI default; `'walking'` embeds the
+ * canonical World "Walking Time" travel-mode object (see
+ * {@link mapEsriTravelMode}) — ArcGIS requires a full JSON object, not a name
+ * string. ESRI does NOT augment `IsochroneOptionsMap` — narrowed type stays at
+ * base.
  *
  * **Auth handling.** Identical to the other ESRI connectors.
  *
@@ -72,7 +75,12 @@ export class EsriIsochroneConnector
     let breaks: string;
     let breakUnits: string;
     if (options.type === 'time') {
-      breaks = options.values.map((v) => Math.round(v / 60)).join(',');
+      // ESRI accepts FRACTIONAL minutes, so convert seconds losslessly rather
+      // than rounding to whole minutes (which corrupted sub-minute breaks: 30s
+      // → 1 min → 60s, and 20s → 0 → an invalid request). Round to 6 decimals
+      // only to strip float noise (0.000001 min ≈ 60 µs — far below any real
+      // isochrone resolution).
+      breaks = options.values.map((v) => (Math.round((v / 60) * 1e6) / 1e6).toString()).join(',');
       breakUnits = 'esriDriveTimeUnitsMinutes';
     } else {
       breaks = options.values.join(',');
@@ -91,7 +99,7 @@ export class EsriIsochroneConnector
       outSR: '4326',
     };
 
-    const travelMode = mapTravelMode(options.travelMode);
+    const travelMode = mapEsriTravelMode(options.travelMode, 'Isochrone');
     if (travelMode !== undefined) {
       form.travelMode = travelMode;
     }
@@ -280,16 +288,6 @@ function buildFacilitiesFeatureSet(center: {
   };
 }
 
-function mapTravelMode(
-  mode?: 'driving' | 'walking',
-): string | undefined {
-  switch (mode) {
-    case 'walking':
-      return 'Walking Time';
-    default:
-      return undefined;
-  }
-}
 
 function stringifyFormValue(value: unknown): string {
   if (typeof value === 'string') return value;

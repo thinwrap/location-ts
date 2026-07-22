@@ -12,7 +12,7 @@ import type {
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
 import { mergePassthrough } from '../../utils';
-import { assertFiniteCoordinate } from '../../utils/coordinate';
+import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
 import type { HereConfig } from './here.config';
 import type {
   HereGeocodeResponse,
@@ -170,7 +170,7 @@ export class HereGeocodingConnector
     assertFiniteCoordinate(options.location, 'HERE reverseGeocode');
 
     const baseQuery: Record<string, string> = {
-      at: `${options.location.lat},${options.location.lng}`,
+      at: `${formatCoord(options.location.lat)},${formatCoord(options.location.lng)}`,
       apiKey: this.config.apiKey,
     };
 
@@ -229,9 +229,9 @@ export class HereGeocodingConnector
     if (options.location !== undefined) {
       assertFiniteCoordinate(options.location, 'HERE autocomplete location');
       if (options.radius !== undefined) {
-        baseQuery.in = `circle:${options.location.lat},${options.location.lng};r=${options.radius}`;
+        baseQuery.in = `circle:${formatCoord(options.location.lat)},${formatCoord(options.location.lng)};r=${options.radius}`;
       } else {
-        baseQuery.at = `${options.location.lat},${options.location.lng}`;
+        baseQuery.at = `${formatCoord(options.location.lat)},${formatCoord(options.location.lng)}`;
       }
     }
 

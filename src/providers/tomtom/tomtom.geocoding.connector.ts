@@ -12,7 +12,7 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import { mergePassthrough } from '../../utils';
-import { assertFiniteCoordinate } from '../../utils/coordinate';
+import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
 import type { TomTomConfig } from './tomtom.config';
 import type {
   TomTomGeocodeResponse,
@@ -122,7 +122,7 @@ export class TomTomGeocodingConnector
     // Out-of-range lat/lng passes through verbatim (thin-wrapper philosophy).
     assertFiniteCoordinate(options.location, 'TomTom reverseGeocode');
 
-    const url = `${REVERSE_GEOCODE_URL}/${options.location.lat},${options.location.lng}.json`;
+    const url = `${REVERSE_GEOCODE_URL}/${formatCoord(options.location.lat)},${formatCoord(options.location.lng)}.json`;
 
     const baseQuery: Record<string, string> = {
       key: this.config.apiKey,
@@ -190,8 +190,8 @@ export class TomTomGeocodingConnector
     }
     if (options.location !== undefined) {
       assertFiniteCoordinate(options.location, 'TomTom autocomplete location');
-      baseQuery.lat = String(options.location.lat);
-      baseQuery.lon = String(options.location.lng);
+      baseQuery.lat = formatCoord(options.location.lat);
+      baseQuery.lon = formatCoord(options.location.lng);
     }
     if (options.radius !== undefined) {
       baseQuery.radius = String(options.radius);

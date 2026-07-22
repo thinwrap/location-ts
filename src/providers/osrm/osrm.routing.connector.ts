@@ -100,11 +100,21 @@ export class OsrmRoutingConnector
     };
 
     if (useTrip) {
-      const fixedOrigin = options.optimizeFixedOrigin === true;
-      const fixedDestination = options.optimizeFixedDestination === true;
-      baseQuery.source = fixedOrigin ? 'first' : 'any';
-      baseQuery.destination = fixedDestination ? 'last' : 'any';
-      baseQuery.roundtrip = options.isRoundTrip === true ? 'true' : 'false';
+      const roundtrip = options.isRoundTrip === true;
+      let source = options.optimizeFixedOrigin === true ? 'first' : 'any';
+      let destination = options.optimizeFixedDestination === true ? 'last' : 'any';
+      // OSRM rejects source=any + destination=any together with roundtrip=false
+      // (HTTP 400 NotImplemented). A plain `optimize` (neither endpoint fixed,
+      // open route) therefore keeps the input's first & last fixed and reorders
+      // the middle — matching the Mapbox Optimization v1 sibling. Every other
+      // combo (any fixed endpoint, or roundtrip=true) is already legal.
+      if (!roundtrip && source === 'any' && destination === 'any') {
+        source = 'first';
+        destination = 'last';
+      }
+      baseQuery.source = source;
+      baseQuery.destination = destination;
+      baseQuery.roundtrip = roundtrip ? 'true' : 'false';
     }
 
     // 4-arg mergePassthrough: deep-merge body, shallow-merge headers + query.
@@ -139,11 +149,17 @@ export class OsrmRoutingConnector
     }
 
     // OSRM in-body status codes trigger typed errors even on HTTP 200.
-    if (data.code !== 'Ok' || !Array.isArray(data.routes) || !data.routes[0]) {
+    // The `/trip/v1` service returns its route objects under `trips`, not
+    // `routes`; fall back to it when `routes` is absent/empty.
+    let routes = Array.isArray(data.routes) ? data.routes : undefined;
+    if ((!routes || routes.length === 0) && Array.isArray(data.trips)) {
+      routes = data.trips;
+    }
+    if (data.code !== 'Ok' || !routes || !routes[0]) {
       throw this.mapInBodyError(data, useTrip);
     }
 
-    const route = data.routes[0];
+    const route = routes[0];
     const legs = (route.legs ?? []).map((leg) => ({
       distanceMeters: leg.distance,
       durationSeconds: leg.duration,
@@ -219,30 +235,11 @@ export class OsrmRoutingConnector
       }
     }
 
-    // Invalid `/trip` combo: source=any, destination=any, roundtrip=false is
-    // not a legal OSRM combination. We can only hit it when at least one
-    // optimization flag is set (otherwise we dispatch to `/route`).
-    const useTrip =
-      options.optimize === true ||
-      options.optimizeFixedOrigin === true ||
-      options.optimizeFixedDestination === true ||
-      options.isRoundTrip === true;
-
-    if (
-      useTrip &&
-      options.isRoundTrip === false &&
-      options.optimizeFixedOrigin !== true &&
-      options.optimizeFixedDestination !== true
-    ) {
-      throw new ConnectorError({
-        message:
-          'OSRM /trip does not support source=any, destination=any, roundtrip=false',
-        statusCode: null,
-        providerCode: 'invalid_request',
-        providerMessage:
-          'When isRoundTrip=false, OSRM /trip requires optimizeFixedOrigin or optimizeFixedDestination',
-      });
-    }
+    // NOTE: the previously-here "invalid /trip combo" preflight is gone. It
+    // rejected source=any/destination=any/roundtrip=false, but the query builder
+    // no longer emits that combo — a plain `optimize` now maps to
+    // source=first/destination=last (open route, endpoints kept, middle
+    // reordered), which OSRM accepts. See the useTrip query block above.
   }
 
   /**

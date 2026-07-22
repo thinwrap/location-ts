@@ -12,12 +12,17 @@ import { mergePassthrough } from '../../utils';
 import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { EsriConfig } from './esri.config';
 import { resolveEsriBearerToken } from './esri.config';
+import {
+  ESRI_TIME_ATTRIBUTE_NAMES,
+  mapEsriTravelMode,
+} from './esri.travel-modes';
 import type { EsriODMatrixResponse } from './esri.types';
 
 const MATRIX_URL =
   'https://route-api.arcgis.com/arcgis/rest/services/World/OriginDestinationCostMatrix/NAServer/OriginDestinationCostMatrix_World/solveODCostMatrix';
 
 const MINUTES_TO_SECONDS = 60;
+const KILOMETERS_TO_METERS = 1000;
 
 /**
  * ESRI (ArcGIS) OD Cost Matrix connector — shares the ESRI Routing
@@ -38,15 +43,13 @@ const MINUTES_TO_SECONDS = 60;
  * branch AND the `data.error` branch funnel through
  * {@link EsriMatrixConnector.mapVendorError}.
  *
- * **Result-shape normalization:** The modern synchronous response
- * carries the matrix as `odCostMatrix.costMatrix.values` — a row-major 2-D
- * array (rows = origins, cols = destinations). Each cell is either a scalar
- * (single cost attribute) or a `[time, distance]` tuple when both
- * `Total_Time` and `Total_Distance` are requested via
- * `outputType=esriNAODOutputSparseMatrix` + `attributeParameterValues`.
- * The connector flattens to `IMatrixCell[]` and converts ESRI minutes to
- * seconds. A fallback over the legacy `odLines.features[]`
- * FeatureSet shape preserves brownfield parity.
+ * **Result-shape normalization:** With `outputType=esriNAODOutputSparseMatrix`
+ * the response carries the matrix as `odCostMatrix` — a sparse object keyed by
+ * 1-based origin OID, each mapping 1-based destination OID to a cost-value
+ * array ordered per `costAttributeNames` (`[TravelTime(min), Kilometers(km)]`).
+ * The connector flattens to `IMatrixCell[]`, converting minutes → seconds and
+ * kilometers → meters. A fallback over the `odLines.features[]` FeatureSet
+ * (`esriNAODOutputStraightLines`) preserves parity.
  *
  * Token lifecycle (~120 min for `arcgisToken`) is consumer-owned (the wrapper holds no state); documented in the per-connector README
  *
@@ -86,15 +89,16 @@ export class EsriMatrixConnector
       token: resolveEsriBearerToken(this.config),
       origins: JSON.stringify(originsFeatureSet),
       destinations: JSON.stringify(destinationsFeatureSet),
-      // Sparse matrix with both Total_Time + Total_Distance.
+      // Sparse matrix keyed by origin/destination OID. Impedance TravelTime
+      // (minutes) is auto-included in the output; accumulate Kilometers (km) so
+      // each cell array is [TravelTime, Kilometers].
       outputType: 'esriNAODOutputSparseMatrix',
-      impedanceAttributeName: 'Total_Time',
-      // Request both attributes so each cell can carry [time, distance].
-      accumulateAttributeNames: 'Total_Time,Total_Distance',
+      impedanceAttributeName: 'TravelTime',
+      accumulateAttributeNames: 'Kilometers',
       outSR: '4326',
     };
 
-    const travelMode = mapTravelMode(options.travelMode);
+    const travelMode = mapEsriTravelMode(options.travelMode, 'Matrix');
     if (travelMode !== undefined) {
       form.travelMode = travelMode;
     }
@@ -163,10 +167,10 @@ export class EsriMatrixConnector
   }
 
   /**
-   * Normalize a 2xx ESRI response into an {@link IMatrixResult}. Flattens
-   * the 2-D `odCostMatrix.costMatrix.values` array into `cells[]`,
-   * converting ESRI minutes to seconds. Falls back to the
-   * legacy `odLines.features[]` shape for brownfield parity.
+   * Normalize a 2xx ESRI response into an {@link IMatrixResult}. Flattens the
+   * sparse `odCostMatrix` object (origin OID → dest OID → cost values) into
+   * `cells[]`, converting ESRI minutes → seconds and kilometers → meters. Falls
+   * back to the `odLines.features[]` straight-lines FeatureSet.
    */
   private normalizeSuccess(
     data: EsriODMatrixResponse,
@@ -176,96 +180,103 @@ export class EsriMatrixConnector
   ): IMatrixResult {
     const cells: IMatrixCell[] = [];
 
-    if (data.odCostMatrix?.costMatrix?.values !== undefined) {
-      const values = data.odCostMatrix.costMatrix.values;
-      const attrOrder = data.odCostMatrix.costAttributeNames ?? [
-        'Total_Time',
-        'Total_Distance',
-      ];
-      const timeIdx = attrOrder.indexOf('Total_Time');
-      const distIdx = attrOrder.indexOf('Total_Distance');
-
-      // LOC-CP-1 (loc-CR #79/#99): verify the 2D `values` array matches the
-      // requested origins×destinations dimensions BEFORE flattening. A sparse,
-      // asymmetric, or short matrix would otherwise silently emit fewer/wrong
-      // cells with no signal. We surface a typed ConnectorError instead
-      // (mirrors the missing-payload guard below). No 'invalid_response'
-      // ProviderCode exists in error.types.ts; 'unknown' is the closest
-      // existing value for a malformed provider body.
-      const valuesOk =
-        values.length >= numOrigins &&
-        values
-          .slice(0, numOrigins)
-          .every(
-            (row) => Array.isArray(row) && row.length >= numDestinations,
-          );
-      if (!valuesOk) {
-        throw matrixDimensionError(numOrigins, numDestinations, data, status);
+    if (data.odCostMatrix !== undefined) {
+      const odm = data.odCostMatrix;
+      const attrOrder = odm.costAttributeNames ?? ['TravelTime', 'Kilometers'];
+      // The impedance column is named after the active travel mode: driving
+      // reports `TravelTime`, walking reports `WalkTime` (the WALK travelMode
+      // object overrides the requested `impedanceAttributeName`). Locate it by
+      // the known time-impedance names rather than assuming `TravelTime`, else a
+      // walking matrix silently decodes every duration as 0.
+      let timeIdx = -1;
+      for (const name of ESRI_TIME_ATTRIBUTE_NAMES) {
+        const i = attrOrder.indexOf(name);
+        if (i >= 0) {
+          timeIdx = i;
+          break;
+        }
       }
+      const distIdx = attrOrder.indexOf('Kilometers');
 
-      for (let i = 0; i < values.length; i++) {
-        const row = values[i] ?? [];
-        for (let j = 0; j < row.length; j++) {
-          const cell = row[j];
-          const { timeMinutes, distanceMeters } = decodeCostCell(
-            cell,
+      // Sparse shape: every key except `costAttributeNames` is a 1-based origin
+      // OID whose value maps 1-based dest OID → cost-value array. Map OIDs to
+      // 0-based indices via `- 1`; an OID that is non-finite, < 1, or beyond the
+      // requested dimensions would yield a negative/misaligned/out-of-range
+      // cell, so reject the whole response. 'unknown' is the closest existing
+      // ProviderCode for a malformed provider body (no 'invalid_response').
+      for (const [originKey, row] of Object.entries(odm)) {
+        if (originKey === 'costAttributeNames') continue;
+        if (row === undefined || Array.isArray(row) || typeof row !== 'object') {
+          throw matrixOidError(data, status);
+        }
+        const originOID = Number(originKey);
+        if (
+          !Number.isFinite(originOID) ||
+          originOID < 1 ||
+          originOID > numOrigins
+        ) {
+          throw matrixOidError(data, status);
+        }
+        for (const [destKey, values] of Object.entries(row)) {
+          const destOID = Number(destKey);
+          if (
+            !Number.isFinite(destOID) ||
+            destOID < 1 ||
+            destOID > numDestinations
+          ) {
+            throw matrixOidError(data, status);
+          }
+          const { timeMinutes, distanceKm } = decodeCostCell(
+            values,
             timeIdx,
             distIdx,
           );
           cells.push({
-            originIndex: i,
-            destinationIndex: j,
-            distanceMeters,
+            originIndex: originOID - 1,
+            destinationIndex: destOID - 1,
+            distanceMeters: distanceKm * KILOMETERS_TO_METERS,
             durationSeconds: timeMinutes * MINUTES_TO_SECONDS,
           });
         }
       }
+
+      // A SPARSE matrix (Esri omits unreachable pairs) is returned as-is rather
+      // than erroring the whole call — each cell carries its origin/destination
+      // index, so the consumer can tell which pairs are present. Matches the
+      // Mapbox/OSRM/HERE/Google cell-omission semantics (supersedes the earlier
+      // whole-grid guard, which diverged from every other provider). The OID-range
+      // guards above still reject a genuinely malformed/misaligned response.
       return { cells, raw: data };
     }
 
     if (data.odLines?.features !== undefined) {
-      // Legacy `odLines` FeatureSet: 1-based OIDs.
+      // Straight-lines FeatureSet: 1-based OriginID/DestinationID; minutes + km.
       for (const f of data.odLines.features) {
         const attrs = f.attributes;
-        // LOC-CP-1 (loc-CR #101): ESRI's legacy OIDs are 1-based, so this path
-        // maps them to 0-based indices via `- 1`. An OID of 0, undefined, or
-        // non-finite would yield a negative/NaN index and a silently misaligned
-        // (or out-of-range) cell. Reject the whole response rather than emit a
-        // wrong cell — 'unknown' is the closest existing ProviderCode for a
-        // malformed provider body.
+        // LOC-CP-1 (loc-CR #101): OIDs are 1-based, mapped to 0-based indices
+        // via `- 1`. An ID of 0, undefined, or non-finite would yield a
+        // negative/NaN index and a silently misaligned (or out-of-range) cell.
+        // Reject the whole response rather than emit a wrong cell.
         if (
-          !Number.isFinite(attrs.OriginOID) ||
-          !Number.isFinite(attrs.DestinationOID) ||
-          attrs.OriginOID < 1 ||
-          attrs.DestinationOID < 1
+          !Number.isFinite(attrs.OriginID) ||
+          !Number.isFinite(attrs.DestinationID) ||
+          attrs.OriginID < 1 ||
+          attrs.DestinationID < 1
         ) {
-          const message =
-            'ESRI Matrix odLines returned a non-positive or non-finite OID; ' +
-            'cannot map to a 0-based cell index';
-          throw new ConnectorError({
-            message,
-            statusCode: status,
-            providerCode: 'unknown',
-            providerMessage: message,
-            cause: data,
-          });
+          throw matrixOidError(data, status);
         }
         cells.push({
-          originIndex: attrs.OriginOID - 1,
-          destinationIndex: attrs.DestinationOID - 1,
-          distanceMeters: attrs.Total_Distance,
-          durationSeconds: attrs.Total_Time * MINUTES_TO_SECONDS,
+          originIndex: attrs.OriginID - 1,
+          destinationIndex: attrs.DestinationID - 1,
+          distanceMeters: attrs.Total_Kilometers * KILOMETERS_TO_METERS,
+          durationSeconds: attrs.Total_TravelTime * MINUTES_TO_SECONDS,
         });
       }
 
-      // LOC-CP-1 (loc-CR #100/#101): the legacy FeatureSet omits unreachable
-      // pairs, so verify the emitted cells cover the full requested grid before
-      // returning a silently sparse matrix.
-      const expectedCount = numOrigins * numDestinations;
-      if (cells.length < expectedCount) {
-        throw matrixDimensionError(numOrigins, numDestinations, data, status);
-      }
-
+      // A SPARSE FeatureSet (Esri omits unreachable pairs) is returned as-is
+      // rather than erroring the whole call — each cell is indexed, matching the
+      // other providers' cell-omission semantics. The OID-range guards above still
+      // reject a genuinely malformed/misaligned response.
       return { cells, raw: data };
     }
 
@@ -401,27 +412,6 @@ function buildPointFeatureSet(points: LatLng[]): {
   };
 }
 
-function mapTravelMode(
-  mode?: 'driving' | 'walking' | 'cycling',
-): string | undefined {
-  switch (mode) {
-    case 'walking':
-      return 'Walking';
-    case 'cycling':
-      // ESRI World OD Cost Matrix does not ship a public cycling mode. Per the
-      // baseline schema-coherence decision, fail fast with a typed error rather
-      // than silently degrading to driving.
-      throw new ConnectorError({
-        message: 'ESRI Matrix does not support travelMode "cycling"',
-        statusCode: null,
-        providerCode: 'unsupported_travel_mode',
-        providerMessage: 'ESRI Matrix does not support travelMode "cycling"',
-      });
-    default:
-      return undefined;
-  }
-}
-
 function buildRestrictions(options: IMatrixOptions): string {
   const restrictions: string[] = [];
   if (options.avoidTolls) restrictions.push('Avoid Toll Roads');
@@ -438,46 +428,38 @@ function stringifyFormValue(value: unknown): string {
 }
 
 /**
- * Decode a single `costMatrix.values[i][j]` cell. ESRI may emit a scalar
- * (single cost attribute) or an `[a, b]` tuple (multiple attributes ordered
- * per `costAttributeNames`). When only a scalar is present, we attribute it
- * to whichever of `Total_Time`/`Total_Distance` the impedance was requested
- * against (Time is the impedance default).
+ * Decode a single sparse cell's cost-value array. Values are ordered per
+ * `costAttributeNames`; `timeIdx`/`distIdx` locate `TravelTime` (minutes) and
+ * `Kilometers` (km) within it. Missing/non-numeric slots fall back to 0 (the
+ * cell distance/time is then reported as 0 rather than corrupting the grid).
  */
 function decodeCostCell(
-  cell: number | [number, number] | undefined,
+  values: number[],
   timeIdx: number,
   distIdx: number,
-): { timeMinutes: number; distanceMeters: number } {
-  if (Array.isArray(cell)) {
-    const timeMinutes =
-      timeIdx >= 0 && typeof cell[timeIdx] === 'number' ? cell[timeIdx]! : 0;
-    const distanceMeters =
-      distIdx >= 0 && typeof cell[distIdx] === 'number' ? cell[distIdx]! : 0;
-    return { timeMinutes, distanceMeters };
-  }
-  if (typeof cell === 'number') {
-    return { timeMinutes: cell, distanceMeters: 0 };
-  }
-  return { timeMinutes: 0, distanceMeters: 0 };
+): { timeMinutes: number; distanceKm: number } {
+  const timeMinutes =
+    timeIdx >= 0 && typeof values[timeIdx] === 'number' ? values[timeIdx]! : 0;
+  const distanceKm =
+    distIdx >= 0 && typeof values[distIdx] === 'number' ? values[distIdx]! : 0;
+  return { timeMinutes, distanceKm };
 }
 
 /**
- * LOC-CP-1 (loc-CR #79/#99/#100/#101): build the typed {@link ConnectorError}
- * raised when an ESRI matrix payload (modern `costMatrix.values` or legacy
- * `odLines.features`) does not cover the full requested origins×destinations
- * grid. `providerCode: 'unknown'` is the closest existing value for a malformed
- * provider body; the full vendor body is preserved on `cause`.
+ * LOC-CP-1 (loc-CR #101): build the typed {@link ConnectorError} raised when an
+ * ESRI matrix payload carries an OID (sparse origin/dest key or `odLines`
+ * OriginID/DestinationID) that is non-finite, non-positive, or beyond the
+ * requested dimensions — any of which would map to a negative, NaN, or
+ * out-of-range 0-based cell index. `providerCode: 'unknown'` is the closest
+ * existing value for a malformed provider body.
  */
-function matrixDimensionError(
-  numOrigins: number,
-  numDestinations: number,
+function matrixOidError(
   data: EsriODMatrixResponse,
   status: number,
 ): ConnectorError {
   const message =
-    `ESRI Matrix returned a matrix that does not match the requested ` +
-    `${numOrigins}×${numDestinations} dimensions`;
+    'ESRI Matrix returned a non-positive, out-of-range, or non-finite OID; ' +
+    'cannot map to a 0-based cell index';
   return new ConnectorError({
     message,
     statusCode: status,

@@ -76,7 +76,7 @@ describe('GoogleMatrixConnector', () => {
       }),
     );
     expect((init?.headers as Record<string, string>)?.['X-Goog-FieldMask']).toBe(
-      'originIndex,destinationIndex,distanceMeters,duration,status',
+      'originIndex,destinationIndex,distanceMeters,duration,status,condition',
     );
 
     const parsedBody = JSON.parse(init!.body as string) as Record<string, unknown>;
@@ -269,6 +269,39 @@ describe('GoogleMatrixConnector', () => {
 
     expect(result.cells).toHaveLength(1);
     expect(result.cells[0]!.distanceMeters).toBe(1000);
+  });
+
+  it('omits a status-OK cell whose condition is ROUTE_NOT_FOUND', async () => {
+    // Google may return an element with status OK (or absent) but
+    // condition=ROUTE_NOT_FOUND and no distance/duration — it must be omitted,
+    // not fabricated as a 0m/0s cell.
+    mockFetch.mockResolvedValueOnce(
+      buildNdjsonResponse([
+        {
+          originIndex: 0,
+          destinationIndex: 0,
+          distanceMeters: 1000,
+          duration: '60s',
+          condition: 'ROUTE_EXISTS',
+        },
+        {
+          originIndex: 0,
+          destinationIndex: 1,
+          condition: 'ROUTE_NOT_FOUND',
+        },
+      ]),
+    );
+
+    const result = await connector.matrix({
+      origins: [{ lat: 0, lng: 0 }],
+      destinations: [
+        { lat: 1, lng: 1 },
+        { lat: 2, lng: 2 },
+      ],
+    });
+
+    expect(result.cells).toHaveLength(1);
+    expect(result.cells[0]!.destinationIndex).toBe(0);
   });
 
   // duration parsing ("123s" → 123) and distanceMeters passthrough

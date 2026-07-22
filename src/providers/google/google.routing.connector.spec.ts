@@ -123,6 +123,8 @@ describe('GoogleRoutingConnector', () => {
     const [, init] = mockFetch.mock.calls[0]!;
     const body = JSON.parse(init!.body as string) as Record<string, unknown>;
     expect(body.travelMode).toBe('WALK');
+    // Google rejects routingPreference for WALK/BICYCLE — it must be omitted.
+    expect(body.routingPreference).toBeUndefined();
   });
 
   it('should include routeModifiers when avoid options are set', async () => {

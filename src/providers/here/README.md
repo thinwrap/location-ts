@@ -28,10 +28,10 @@ Provision a project at https://platform.here.com/ and create a REST API key. Sen
 
 ## Vendor docs
 
-- Routing v8: https://www.here.com/docs/bundle/routing-api-v8-api-reference/page/index.html
-- Matrix Routing v8: https://www.here.com/docs/bundle/matrix-routing-api-v8-api-reference/page/index.html
-- Geocoding & Search: https://www.here.com/docs/bundle/geocoding-and-search-api-v7-api-reference/page/index.html
-- Isoline Routing v8: https://www.here.com/docs/bundle/isoline-routing-api-v8-api-reference/page/index.html
+- Routing v8: https://docs.here.com/routing/docs/routing-v8-intro
+- Matrix Routing v8: https://docs.here.com/routing/reference/postmatrix
+- Geocoding & Search: https://docs.here.com/geocoding-and-search/reference/
+- Isoline Routing v8: https://docs.here.com/routing/docs/isoline-v8-intro
 - Pricing & rate limits: https://www.here.com/pricing
 
 ## Routing

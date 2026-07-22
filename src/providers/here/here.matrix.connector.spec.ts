@@ -1,3 +1,4 @@
+import { gzipSync } from 'node:zlib';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { HereMatrixConnector } from './here.matrix.connector';
 import type { HereMatrixOptions } from './here.matrix.connector';
@@ -32,29 +33,55 @@ function pendingResp(): Response {
   return new Response(JSON.stringify({ status: 'inProgress' }), { status: 200 });
 }
 
+// Real HERE v8 completion: HTTP 303 See Other with a `Location` response
+// header AND a body `{matrixId, status:"completed", resultUrl}`.
 function completedResp(
-  resultUrl = 'https://matrix.router.hereapi.com/v8/result/m1',
+  resultUrl = 'https://aws-eu-west-1.matrix.router.hereapi.com/v8/result/m1',
 ): Response {
   return new Response(
-    JSON.stringify({ status: 'completed', resultUrl }),
-    { status: 200 },
+    JSON.stringify({ matrixId: 'm1', status: 'completed', resultUrl }),
+    { status: 303, headers: { Location: resultUrl } },
   );
 }
 
-function resultResp(
-  matrix: {
-    numOrigins: number;
-    numDestinations: number;
-    travelTimes: number[];
-    distances: number[];
-  } = {
-    numOrigins: 2,
-    numDestinations: 2,
-    travelTimes: [0, 120, 130, 0],
-    distances: [0, 2000, 2100, 0],
-  },
-): Response {
+type HereMatrixPayload = {
+  numOrigins: number;
+  numDestinations: number;
+  travelTimes: number[];
+  distances: number[];
+  errorCodes?: number[];
+};
+
+const DEFAULT_MATRIX: HereMatrixPayload = {
+  numOrigins: 2,
+  numDestinations: 2,
+  travelTimes: [0, 120, 130, 0],
+  distances: [0, 2000, 2100, 0],
+};
+
+// Plain (uncompressed) retrieve body — models a transport that already
+// decompressed the result (no gzip magic / no Content-Encoding).
+function resultResp(matrix: HereMatrixPayload = DEFAULT_MATRIX): Response {
   return new Response(JSON.stringify({ matrix }), { status: 200 });
+}
+
+// Real HERE retrieve body: gzip-compressed with `Content-Encoding: gzip`. Locks
+// in the connector's defensive gunzip path (undici does not auto-decompress
+// once the connector sets Accept-Encoding itself).
+function gzResultResp(matrix: HereMatrixPayload = DEFAULT_MATRIX): Response {
+  const gz = gzipSync(Buffer.from(JSON.stringify({ matrix })));
+  return new Response(gz, {
+    status: 200,
+    headers: { 'Content-Encoding': 'gzip' },
+  });
+}
+
+// Real HERE retrieve step 1: the resultUrl (a hereapi.com host) does NOT return
+// the payload inline — it 303-redirects to a pre-signed S3 object URL.
+const S3_RESULT_URL =
+  'https://s3.eu-west-1.amazonaws.com/here-routing-large-matrix-prd-eu-west-1/deadbeef.json.gz?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc';
+function resultRedirectResp(location = S3_RESULT_URL): Response {
+  return new Response(null, { status: 303, headers: { Location: location } });
 }
 
 describe('HereMatrixConnector', () => {
@@ -66,6 +93,43 @@ describe('HereMatrixConnector', () => {
 
   it('should have providerId "here"', () => {
     expect(connector.providerId).toBe('here');
+  });
+
+  it('omits cells HERE flags via errorCodes (unspecified value), keeping code 0/3', async () => {
+    // errorCodes parallels travelTimes/distances: 0 OK, 3 usable-with-violation,
+    // any other non-zero marks the cell value as unspecified → must be omitted.
+    mockFetch
+      .mockResolvedValueOnce(submitResp())
+      .mockResolvedValueOnce(completedResp())
+      .mockResolvedValueOnce(
+        resultResp({
+          numOrigins: 2,
+          numDestinations: 2,
+          travelTimes: [0, 120, 0, 0],
+          distances: [0, 2000, 0, 0],
+          // (0,0) OK; (0,1) OK; (1,0) failed with code 4 → omitted; (1,1) code 3 kept.
+          errorCodes: [0, 0, 4, 3],
+        }),
+      );
+
+    const result = await connector.matrix({
+      origins: [
+        { lat: 52.53, lng: 13.38 },
+        { lat: 52.52, lng: 13.4 },
+      ],
+      destinations: [
+        { lat: 52.51, lng: 13.39 },
+        { lat: 52.5, lng: 13.41 },
+      ],
+    });
+
+    expect(result.cells).toHaveLength(3);
+    expect(
+      result.cells.some((c) => c.originIndex === 1 && c.destinationIndex === 0),
+    ).toBe(false);
+    expect(
+      result.cells.some((c) => c.originIndex === 1 && c.destinationIndex === 1),
+    ).toBe(true);
   });
 
   // full submit → poll(pending) → poll(completed) → retrieve cycle
@@ -107,20 +171,27 @@ describe('HereMatrixConnector', () => {
     expect(submitBody.regionDefinition).toEqual({ type: 'autoCircle' });
     expect(submitBody.matrixAttributes).toEqual(['travelTimes', 'distances']);
 
-    // Calls 2 + 3: poll (GET to statusUrl)
+    // Calls 2 + 3: poll (GET to statusUrl). The poll must use redirect:'manual'
+    // so the completion 303 is observable rather than a thrown network error.
     const [poll1Url, poll1Init] = mockFetch.mock.calls[1]!;
     expect(poll1Init?.method).toBe('GET');
+    expect(poll1Init?.redirect).toBe('manual');
     expect(poll1Url as string).toContain(
       'https://matrix.router.hereapi.com/v8/status/m1',
     );
     expect(mockFetch.mock.calls[2]![1]?.method).toBe('GET');
 
-    // Call 4: retrieve (GET to resultUrl)
+    // Call 4: retrieve (GET to resultUrl on the aws-eu-west-1 result host) —
+    // must carry the apiKey and Accept-Encoding: gzip.
     const [retrieveUrl, retrieveInit] = mockFetch.mock.calls[3]!;
     expect(retrieveInit?.method).toBe('GET');
     expect(retrieveUrl as string).toContain(
-      'https://matrix.router.hereapi.com/v8/result/m1',
+      'https://aws-eu-west-1.matrix.router.hereapi.com/v8/result/m1',
     );
+    expect(retrieveUrl as string).toContain('apiKey=test-here-key');
+    expect(
+      (retrieveInit?.headers as Record<string, string>)?.['Accept-Encoding'],
+    ).toBe('gzip');
 
     // 2x2 grid → 4 cells flatten
     expect(result.cells).toHaveLength(4);
@@ -164,6 +235,86 @@ describe('HereMatrixConnector', () => {
 
     expect(mockFetch).toHaveBeenCalledTimes(3);
     expect(result.cells).toHaveLength(1);
+  });
+
+  // 303-poll + GZIP-compressed retrieve body (real HERE shape) — locks in the
+  // defensive gunzip path. distances are METERS, travelTimes SECONDS, used
+  // as-is (no unit conversion).
+  it('should decompress a gzipped retrieve body and normalize a cell', async () => {
+    mockFetch
+      .mockResolvedValueOnce(submitResp())
+      .mockResolvedValueOnce(completedResp())
+      .mockResolvedValueOnce(
+        gzResultResp({
+          numOrigins: 1,
+          numDestinations: 1,
+          travelTimes: [5427],
+          distances: [109144],
+        }),
+      );
+
+    const result = await connector.matrix({
+      origins: [{ lat: 40.7484, lng: -73.9857 }],
+      destinations: [{ lat: 41.1792, lng: -73.1952 }],
+      travelMode: 'driving',
+    });
+
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+    expect(result.cells).toHaveLength(1);
+    // meters + seconds used verbatim (no *1000 / *60 conversion)
+    expect(result.cells[0]).toEqual({
+      originIndex: 0,
+      destinationIndex: 0,
+      durationSeconds: 5427,
+      distanceMeters: 109144,
+    });
+  });
+
+  // Real HERE retrieve is a DOUBLE redirect: the resultUrl (hereapi.com) itself
+  // 303-redirects to a pre-signed S3 object URL that serves the gzip payload.
+  // The apiKey must ride ONLY on the hereapi.com hop, never on the S3 hop.
+  it('should follow the resultUrl → pre-signed S3 redirect and not leak the apiKey to S3', async () => {
+    mockFetch
+      .mockResolvedValueOnce(submitResp())
+      .mockResolvedValueOnce(completedResp())
+      .mockResolvedValueOnce(resultRedirectResp())
+      .mockResolvedValueOnce(
+        gzResultResp({
+          numOrigins: 1,
+          numDestinations: 1,
+          travelTimes: [5427],
+          distances: [109144],
+        }),
+      );
+
+    const result = await connector.matrix({
+      origins: [{ lat: 40.7484, lng: -73.9857 }],
+      destinations: [{ lat: 41.1792, lng: -73.1952 }],
+      travelMode: 'driving',
+    });
+
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+
+    // Hop 1 (call 3): hereapi.com resultUrl — apiKey attached, manual redirect.
+    const [hop1Url, hop1Init] = mockFetch.mock.calls[2]!;
+    expect(hop1Init?.method).toBe('GET');
+    expect(hop1Init?.redirect).toBe('manual');
+    expect(hop1Url as string).toContain('hereapi.com');
+    expect(hop1Url as string).toContain('apiKey=test-here-key');
+
+    // Hop 2 (call 4): the pre-signed S3 URL — followed WITHOUT the apiKey.
+    const [hop2Url, hop2Init] = mockFetch.mock.calls[3]!;
+    expect(hop2Init?.method).toBe('GET');
+    expect(hop2Url as string).toContain('s3.eu-west-1.amazonaws.com');
+    expect(hop2Url as string).not.toContain('test-here-key');
+
+    expect(result.cells).toHaveLength(1);
+    expect(result.cells[0]).toEqual({
+      originIndex: 0,
+      destinationIndex: 0,
+      durationSeconds: 5427,
+      distanceMeters: 109144,
+    });
   });
 
   // travelMode mapping at the submit body level

@@ -255,8 +255,8 @@ describe('Routing facade — type-level narrowing tests', () => {
     // Compile-time-only assertion: wrap in an unreachable factory so we don't
     // execute the runtime path (which would throw "Unknown routing provider").
     const _factory = () =>
-      // @ts-expect-error 'novu' is not a RoutingProvider.
-      new Routing('novu', { apiKey: 'k' });
+      // @ts-expect-error 'not-a-provider' is not a RoutingProvider.
+      new Routing('not-a-provider', { apiKey: 'k' });
     void _factory;
     expect(true).toBe(true);
   });

@@ -26,6 +26,7 @@ function buildSuccessBody(
     attributes?: Record<string, unknown>;
     paths?: number[][][];
     directions?: unknown;
+    stops?: unknown;
   } = {},
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
@@ -48,6 +49,10 @@ function buildSuccessBody(
       ],
     },
   };
+
+  if (overrides.stops !== undefined) {
+    body.stops = overrides.stops;
+  }
 
   if (overrides.directions === OMIT_DIRECTIONS) {
     return body;
@@ -128,6 +133,56 @@ describe('EsriRoutingConnector', () => {
       const [, init] = mockFetch.mock.calls[0]!;
       const params = parseForm(init!.body as string);
       expect(params.get('startTime')).toBe(String(when.getTime()));
+    });
+  });
+
+  describe('travelMode translation', () => {
+    it('sends the full Walking Time travelMode JSON object for walking', async () => {
+      mockFetch.mockResolvedValueOnce(buildSuccessResponse());
+
+      await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+        ],
+        travelMode: 'walking',
+      });
+
+      const [, init] = mockFetch.mock.calls[0]!;
+      const params = parseForm(init!.body as string);
+      // ArcGIS requires a full travel-mode JSON object, not a name string.
+      const travelMode = JSON.parse(params.get('travelMode') as string);
+      expect(travelMode.type).toBe('WALK');
+      expect(travelMode.impedanceAttributeName).toBe('WalkTime');
+      expect(travelMode.name).toBe('Walking Time');
+    });
+
+    it('omits travelMode for driving (the service default is Driving Time)', async () => {
+      mockFetch.mockResolvedValueOnce(buildSuccessResponse());
+
+      await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+        ],
+        travelMode: 'driving',
+      });
+
+      const [, init] = mockFetch.mock.calls[0]!;
+      const params = parseForm(init!.body as string);
+      expect(params.get('travelMode')).toBeNull();
+    });
+
+    it('rejects cycling with unsupported_travel_mode (no public ESRI cycling mode)', async () => {
+      await expect(
+        connector.route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 1, lng: 1 },
+          ],
+          travelMode: 'cycling',
+        }),
+      ).rejects.toMatchObject({ providerCode: 'unsupported_travel_mode' });
     });
   });
 
@@ -280,6 +335,49 @@ describe('EsriRoutingConnector', () => {
       expect(result.totalDurationSeconds).toBe(600);
     });
 
+    it('derives totals from the directions summary (real walking shape: Total_WalkTime, no Total_Time/Total_Length)', async () => {
+      // The live ArcGIS walking response carries neither Total_Time nor
+      // Total_Length; its impedance attribute is Total_WalkTime, and the
+      // reliable totals live in directions[0].summary (meters + minutes).
+      // The pre-fix connector read Total_Time first and yielded duration 0.
+      mockFetch.mockResolvedValueOnce(
+        buildSuccessResponse(
+          buildSuccessBody({
+            attributes: {
+              Total_WalkTime: 13.094903051108146,
+              Total_Kilometers: 1.091226960340165,
+              Total_Miles: 0.6780697279993455,
+            },
+            directions: [
+              {
+                summary: {
+                  totalLength: 1091.226960340165,
+                  totalTime: 13.094903051108146,
+                  totalDriveTime: 13.094903051108146,
+                },
+                features: [
+                  { attributes: { length: 0, time: 0, maneuverType: 'esriDMTStop' } },
+                  { attributes: { length: 1091.226960340165, time: 13.094903051108146 } },
+                  { attributes: { length: 0, time: 0, maneuverType: 'esriDMTStop' } },
+                ],
+              },
+            ],
+          }),
+        ),
+      );
+
+      const result = await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+        ],
+        travelMode: 'walking',
+      });
+
+      expect(result.totalDistanceMeters).toBeCloseTo(1091.23, 1);
+      expect(result.totalDurationSeconds).toBeCloseTo(13.094903051108146 * 60, 3);
+    });
+
     it('reconstructs per-leg distance/duration from directions delimited by esriDMTStop', async () => {
       mockFetch.mockResolvedValueOnce(
         buildSuccessResponse(
@@ -369,14 +467,24 @@ describe('EsriRoutingConnector', () => {
       expect(result.polyline).toBe('_p~iF~ps|U_ulLnnqC_mqNvxq`@');
     });
 
-    it('exposes waypointOrder when findBestSequence reorders Stops attribute', async () => {
+    it('derives waypointOrder from the stops FeatureSet Sequence attribute', async () => {
       mockFetch.mockResolvedValueOnce(
         buildSuccessResponse(
           buildSuccessBody({
             attributes: {
               Total_Length: 1000,
               Total_Time: 20,
-              Stops: '0,2,1,3',
+            },
+            // `stops` features are returned in INPUT order; `Sequence` is the
+            // 1-based visiting position. Sequences [1,3,2,4] invert to the
+            // canonical visiting order of input indices [0,2,1,3].
+            stops: {
+              features: [
+                { attributes: { Name: 'Location 1', ObjectID: 1, Sequence: 1 } },
+                { attributes: { Name: 'Location 2', ObjectID: 2, Sequence: 3 } },
+                { attributes: { Name: 'Location 3', ObjectID: 3, Sequence: 2 } },
+                { attributes: { Name: 'Location 4', ObjectID: 4, Sequence: 4 } },
+              ],
             },
           }),
         ),
@@ -395,7 +503,7 @@ describe('EsriRoutingConnector', () => {
       expect(result.waypointOrder).toEqual([0, 2, 1, 3]);
     });
 
-    it('omits waypointOrder when Stops attribute is absent', async () => {
+    it('omits waypointOrder when the stops FeatureSet is absent', async () => {
       mockFetch.mockResolvedValueOnce(buildSuccessResponse());
 
       const result = await connector.route({
@@ -425,6 +533,7 @@ describe('EsriRoutingConnector', () => {
       const [, init] = mockFetch.mock.calls[0]!;
       const params = parseForm(init!.body as string);
       expect(params.get('findBestSequence')).toBe('true');
+      expect(params.get('returnStops')).toBe('true');
       expect(params.get('preserveFirstStop')).toBe('true');
       expect(params.get('preserveLastStop')).toBe('true');
     });

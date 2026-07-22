@@ -8,7 +8,7 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import { decodeFlexPolyline, mergePassthrough, validateIsochroneCap } from '../../utils';
-import { assertFiniteCoordinate } from '../../utils/coordinate';
+import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
 import type { HereConfig } from './here.config';
 import type { HereIsolineResponse } from './here.types';
 
@@ -58,7 +58,7 @@ export class HereIsochroneConnector
 
     const baseQuery: Record<string, string> = {
       apiKey: this.config.apiKey,
-      origin: `${options.center.lat},${options.center.lng}`,
+      origin: `${formatCoord(options.center.lat)},${formatCoord(options.center.lng)}`,
       'range[type]': options.type,
       'range[values]': options.values.join(','),
       transportMode,

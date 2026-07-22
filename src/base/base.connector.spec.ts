@@ -118,8 +118,13 @@ describe('BaseConnector', () => {
       });
     });
 
-    it('attaches the original error as cause', async () => {
-      const netErr = new TypeError('boom');
+    it('does not propagate a BYO fetch error verbatim (fixed message + sanitized cause)', async () => {
+      // A leaky BYO fetchImpl could embed the key-bearing request URL in its
+      // error message; the connector must surface neither the raw message nor
+      // the raw error object — only the error's class name on a sanitized cause.
+      const netErr = new TypeError(
+        'request to https://api.example.com/x?key=SECRET failed',
+      );
       mockFetch.mockRejectedValueOnce(netErr);
       const c = new TestConnector();
       let thrown: unknown;
@@ -129,7 +134,11 @@ describe('BaseConnector', () => {
         thrown = e;
       }
       expect(thrown).toBeInstanceOf(ConnectorError);
-      expect((thrown as ConnectorError).cause).toBe(netErr);
+      const err = thrown as ConnectorError;
+      expect(err.message).toBe('Network request failed');
+      expect(err.message).not.toContain('SECRET');
+      expect(err.cause).not.toBe(netErr);
+      expect(err.cause).toEqual({ raw: { name: 'TypeError' } });
     });
   });
 

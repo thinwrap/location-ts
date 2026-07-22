@@ -20,19 +20,20 @@ const MATRIX_URL =
   'https://route-api.arcgis.com/arcgis/rest/services/World/OriginDestinationCostMatrix/NAServer/OriginDestinationCostMatrix_World/solveODCostMatrix';
 
 /**
- * Build a modern `odCostMatrix.costMatrix.values` payload.
+ * Build a real sparse `odCostMatrix` payload (esriNAODOutputSparseMatrix).
  *
- * Each cell is a `[Total_Time(minutes), Total_Distance(meters)]` tuple matching
- * the `costAttributeNames` order in.
+ * `rows` is keyed by 1-based origin OID; each maps a 1-based destination OID to
+ * a cost-value array ordered per `costAttributeNames`
+ * (`[TravelTime(minutes), Kilometers(km)]` by default).
  */
 function buildOdCostMatrixBody(
-  values: Array<Array<number | [number, number]>>,
-  costAttributeNames: string[] = ['Total_Time', 'Total_Distance'],
+  rows: Record<string, Record<string, number[]>>,
+  costAttributeNames: string[] = ['TravelTime', 'Kilometers'],
 ): Record<string, unknown> {
   return {
     odCostMatrix: {
       costAttributeNames,
-      costMatrix: { values },
+      ...rows,
     },
   };
 }
@@ -59,7 +60,7 @@ describe('EsriMatrixConnector', () => {
   describe('HTTP dispatch ', () => {
     it('POSTs form-encoded data to the solveODCostMatrix endpoint', async () => {
       mockFetch.mockResolvedValueOnce(
-        buildSuccessResponse(buildOdCostMatrixBody([[[5, 1000]]])),
+        buildSuccessResponse(buildOdCostMatrixBody({ '1': { '1': [5, 1] } })),
       );
 
       await connector.matrix({
@@ -83,7 +84,7 @@ describe('EsriMatrixConnector', () => {
 
     it('forwards departureTime as epoch milliseconds in `startTime`', async () => {
       mockFetch.mockResolvedValueOnce(
-        buildSuccessResponse(buildOdCostMatrixBody([[[5, 1000]]])),
+        buildSuccessResponse(buildOdCostMatrixBody({ '1': { '1': [5, 1] } })),
       );
 
       const when = new Date('2026-05-17T08:00:00Z');
@@ -97,13 +98,43 @@ describe('EsriMatrixConnector', () => {
       const params = parseForm(init!.body as string);
       expect(params.get('startTime')).toBe(String(when.getTime()));
     });
+
+    it('sends the full Walking Time travelMode JSON object for walking', async () => {
+      mockFetch.mockResolvedValueOnce(
+        buildSuccessResponse(buildOdCostMatrixBody({ '1': { '1': [5, 1] } })),
+      );
+
+      await connector.matrix({
+        origins: [{ lat: 0, lng: 0 }],
+        destinations: [{ lat: 1, lng: 1 }],
+        travelMode: 'walking',
+      });
+
+      const [, init] = mockFetch.mock.calls[0]!;
+      const params = parseForm(init!.body as string);
+      const travelMode = JSON.parse(params.get('travelMode') as string);
+      expect(travelMode.type).toBe('WALK');
+      expect(travelMode.impedanceAttributeName).toBe('WalkTime');
+    });
+
+    it('rejects cycling with unsupported_travel_mode', async () => {
+      await expect(
+        connector.matrix({
+          origins: [{ lat: 0, lng: 0 }],
+          destinations: [{ lat: 1, lng: 1 }],
+          travelMode: 'cycling',
+        }),
+      ).rejects.toMatchObject({ providerCode: 'unsupported_travel_mode' });
+    });
   });
 
   describe('FeatureSet `origins`/`destinations` encoding ', () => {
     it('serializes origins as ESRI FeatureSet with WGS-84 spatialReference', async () => {
       // 2 origins × 1 destination — response must cover the full grid.
       mockFetch.mockResolvedValueOnce(
-        buildSuccessResponse(buildOdCostMatrixBody([[[5, 1000]], [[8, 4000]]])),
+        buildSuccessResponse(
+          buildOdCostMatrixBody({ '1': { '1': [5, 1] }, '2': { '1': [8, 4] } }),
+        ),
       );
 
       await connector.matrix({
@@ -138,7 +169,9 @@ describe('EsriMatrixConnector', () => {
     it('serializes destinations as ESRI FeatureSet with WGS-84 spatialReference', async () => {
       // 1 origin × 2 destinations — response must cover the full grid.
       mockFetch.mockResolvedValueOnce(
-        buildSuccessResponse(buildOdCostMatrixBody([[[5, 1000], [10, 5000]]])),
+        buildSuccessResponse(
+          buildOdCostMatrixBody({ '1': { '1': [5, 1], '2': [10, 5] } }),
+        ),
       );
 
       await connector.matrix({
@@ -172,7 +205,7 @@ describe('EsriMatrixConnector', () => {
   describe('Auth handling ', () => {
     it('forwards apiKey via the `token` form field', async () => {
       mockFetch.mockResolvedValueOnce(
-        buildSuccessResponse(buildOdCostMatrixBody([[[5, 1000]]])),
+        buildSuccessResponse(buildOdCostMatrixBody({ '1': { '1': [5, 1] } })),
       );
 
       await connector.matrix({
@@ -187,7 +220,7 @@ describe('EsriMatrixConnector', () => {
 
     it('forwards arcgisToken via the same `token` form field when set instead', async () => {
       mockFetch.mockResolvedValueOnce(
-        buildSuccessResponse(buildOdCostMatrixBody([[[5, 1000]]])),
+        buildSuccessResponse(buildOdCostMatrixBody({ '1': { '1': [5, 1] } })),
       );
 
       const c = new EsriMatrixConnector({ arcgisToken: 'oauth-bearer' });
@@ -237,60 +270,53 @@ describe('EsriMatrixConnector', () => {
   });
 
   describe('Result-shape normalization ', () => {
-    it('flattens odCostMatrix.costMatrix.values 2-D array into cells with minute→second conversion', async () => {
+    // Live NYC → Bridgeport ground truth (route-api.arcgis.com World OD Cost
+    // Matrix, verified 2026-07-20): TravelTime in minutes, Kilometers in km.
+    const TIME1 = 93.25787017375364;
+    const KM1 = 98.94833503121721;
+    const TIME2 = 81.54786997057796;
+    const KM2 = 99.08865887338234;
+
+    it('flattens the sparse odCostMatrix object into cells with minute→second + km→meter conversion', async () => {
+      // Real 2-origin × 1-destination sparse shape from the ground-truth doc.
       mockFetch.mockResolvedValueOnce(
         buildSuccessResponse(
-          buildOdCostMatrixBody([
-            [
-              [5, 1000],
-              [10, 5000],
-            ],
-            [
-              [8, 4000],
-              [3, 1500],
-            ],
-          ]),
+          buildOdCostMatrixBody({
+            '1': { '1': [TIME1, KM1] },
+            '2': { '1': [TIME2, KM2] },
+          }),
         ),
       );
 
       const result = await connector.matrix({
         origins: [
-          { lat: 40.7128, lng: -74.006 },
+          { lat: 40.7484, lng: -73.9857 },
           { lat: 40.758, lng: -73.9855 },
         ],
-        destinations: [
-          { lat: 40.7484, lng: -73.9856 },
-          { lat: 40.7614, lng: -73.9776 },
-        ],
+        destinations: [{ lat: 41.1792, lng: -73.1952 }],
       });
 
-      expect(result.cells).toHaveLength(4);
+      expect(result.cells).toHaveLength(2);
       expect(result.cells[0]).toEqual({
         originIndex: 0,
         destinationIndex: 0,
-        distanceMeters: 1000,
-        durationSeconds: 300, // 5 min * 60
+        distanceMeters: KM1 * 1000, // 98.94833503121721 km → 98948.33… m
+        durationSeconds: TIME1 * 60, // 93.25787… min → 5595.47… s
       });
       expect(result.cells[1]).toEqual({
-        originIndex: 0,
-        destinationIndex: 1,
-        distanceMeters: 5000,
-        durationSeconds: 600,
-      });
-      expect(result.cells[3]).toEqual({
         originIndex: 1,
-        destinationIndex: 1,
-        distanceMeters: 1500,
-        durationSeconds: 180,
+        destinationIndex: 0,
+        distanceMeters: KM2 * 1000,
+        durationSeconds: TIME2 * 60,
       });
     });
 
-    it('honors costAttributeNames ordering when Total_Distance precedes Total_Time', async () => {
+    it('honors costAttributeNames ordering when Kilometers precedes TravelTime', async () => {
       mockFetch.mockResolvedValueOnce(
         buildSuccessResponse(
           buildOdCostMatrixBody(
-            [[[1000, 5]]], // [distance, time] with reversed names
-            ['Total_Distance', 'Total_Time'],
+            { '1': { '1': [KM1, TIME1] } }, // [km, time] with reversed names
+            ['Kilometers', 'TravelTime'],
           ),
         ),
       );
@@ -304,12 +330,46 @@ describe('EsriMatrixConnector', () => {
       expect(result.cells[0]).toEqual({
         originIndex: 0,
         destinationIndex: 0,
-        distanceMeters: 1000,
-        durationSeconds: 300,
+        distanceMeters: KM1 * 1000,
+        durationSeconds: TIME1 * 60,
       });
     });
 
-    it('falls back to legacy odLines.features[] shape for brownfield parity', async () => {
+    it('decodes the WalkTime impedance column for a walking matrix (real live shape)', async () => {
+      // With a WALK travel mode, ArcGIS overrides the requested impedance, so
+      // costAttributeNames comes back as ['WalkTime', 'Kilometers'] — NOT
+      // 'TravelTime'. The pre-fix decoder looked up 'TravelTime' only and
+      // silently reported every duration as 0. Live values from
+      // route-api.arcgis.com (2026-07-21).
+      const WALK_MIN = 13.094903051108146;
+      const WALK_KM = 1.091226960340165;
+      mockFetch.mockResolvedValueOnce(
+        buildSuccessResponse(
+          buildOdCostMatrixBody(
+            { '1': { '1': [WALK_MIN, WALK_KM] } },
+            ['WalkTime', 'Kilometers'],
+          ),
+        ),
+      );
+
+      const result = await connector.matrix({
+        origins: [{ lat: 0, lng: 0 }],
+        destinations: [{ lat: 1, lng: 1 }],
+        travelMode: 'walking',
+      });
+
+      expect(result.cells).toHaveLength(1);
+      expect(result.cells[0]).toEqual({
+        originIndex: 0,
+        destinationIndex: 0,
+        distanceMeters: WALK_KM * 1000,
+        durationSeconds: WALK_MIN * 60,
+      });
+    });
+
+    it('falls back to the odLines.features[] straight-lines shape', async () => {
+      // Real straight-lines shape: OriginID/DestinationID + Total_TravelTime
+      // (minutes) / Total_Kilometers (km). 1 origin × 2 destinations.
       mockFetch.mockResolvedValueOnce(
         new Response(
           JSON.stringify({
@@ -317,18 +377,20 @@ describe('EsriMatrixConnector', () => {
               features: [
                 {
                   attributes: {
-                    OriginOID: 1,
-                    DestinationOID: 1,
-                    Total_Time: 5,
-                    Total_Distance: 1000,
+                    ObjectID: 1,
+                    OriginID: 1,
+                    DestinationID: 1,
+                    Total_TravelTime: TIME1,
+                    Total_Kilometers: KM1,
                   },
                 },
                 {
                   attributes: {
-                    OriginOID: 1,
-                    DestinationOID: 2,
-                    Total_Time: 10,
-                    Total_Distance: 5000,
+                    ObjectID: 2,
+                    OriginID: 1,
+                    DestinationID: 2,
+                    Total_TravelTime: TIME2,
+                    Total_Kilometers: KM2,
                   },
                 },
               ],
@@ -350,14 +412,14 @@ describe('EsriMatrixConnector', () => {
       expect(result.cells[0]).toEqual({
         originIndex: 0,
         destinationIndex: 0,
-        distanceMeters: 1000,
-        durationSeconds: 300,
+        distanceMeters: KM1 * 1000,
+        durationSeconds: TIME1 * 60,
       });
       expect(result.cells[1]!.destinationIndex).toBe(1);
     });
 
     it('exposes the raw vendor body in result.raw', async () => {
-      const body = buildOdCostMatrixBody([[[5, 1000]]]);
+      const body = buildOdCostMatrixBody({ '1': { '1': [5, 1] } });
       mockFetch.mockResolvedValueOnce(buildSuccessResponse(body));
 
       const result = await connector.matrix({
@@ -366,13 +428,16 @@ describe('EsriMatrixConnector', () => {
       });
 
       expect(result.raw).toMatchObject({
-        odCostMatrix: { costMatrix: { values: [[[5, 1000]]] } },
+        odCostMatrix: {
+          costAttributeNames: ['TravelTime', 'Kilometers'],
+          '1': { '1': [5, 1] },
+        },
       });
     });
 
     it('emits restrictionAttributeNames for avoidTolls', async () => {
       mockFetch.mockResolvedValueOnce(
-        buildSuccessResponse(buildOdCostMatrixBody([[[5, 1000]]])),
+        buildSuccessResponse(buildOdCostMatrixBody({ '1': { '1': [5, 1] } })),
       );
 
       await connector.matrix({
@@ -534,7 +599,7 @@ describe('EsriMatrixConnector', () => {
         new Response(
           JSON.stringify({
             error: { message: 'Invalid token', code: 498 },
-            odCostMatrix: { costMatrix: { values: [] } },
+            odCostMatrix: { costAttributeNames: ['TravelTime', 'Kilometers'] },
           }),
           { status: 200 },
         ),
@@ -614,7 +679,7 @@ describe('EsriMatrixConnector', () => {
   describe('_passthrough merging', () => {
     it('merges _passthrough.body onto the form fields', async () => {
       mockFetch.mockResolvedValueOnce(
-        buildSuccessResponse(buildOdCostMatrixBody([[[5, 1000]]])),
+        buildSuccessResponse(buildOdCostMatrixBody({ '1': { '1': [5, 1] } })),
       );
 
       await connector.matrix({
@@ -630,7 +695,7 @@ describe('EsriMatrixConnector', () => {
 
     it('merges _passthrough.headers and _passthrough.query into the request', async () => {
       mockFetch.mockResolvedValueOnce(
-        buildSuccessResponse(buildOdCostMatrixBody([[[5, 1000]]])),
+        buildSuccessResponse(buildOdCostMatrixBody({ '1': { '1': [5, 1] } })),
       );
 
       await connector.matrix({
@@ -649,58 +714,64 @@ describe('EsriMatrixConnector', () => {
     });
   });
 
-  // LOC-CP-1 (loc-CR #79/#99/#100/#101) — matrix dimension/coverage + OID guards
-  describe('matrix dimension guard (LOC-CP-1)', () => {
-    it('throws ConnectorError when a costMatrix row is shorter than the destination count', async () => {
-      // 2×2 requested, but row 1 has only 1 col. Pre-fix this silently emitted
-      // fewer cells with no signal; now it must throw.
+  // Matrix sparse-cell omission + OID guards. A sparse matrix (unroutable pairs
+  // omitted by Esri) is returned as-is with indexed cells — parity with the other
+  // providers, superseding the earlier whole-grid throw (loc-CR #79/#99/#100).
+  describe('matrix sparse-cell omission + OID guards', () => {
+    it('omits a destination a sparse origin lacks (returns the indexed cells)', async () => {
+      // 2×2 requested, but origin 2 only has dest 1 → three routable cells.
       mockFetch.mockResolvedValueOnce(
         buildSuccessResponse(
-          buildOdCostMatrixBody([[[5, 1000], [10, 5000]], [[8, 4000]]]),
+          buildOdCostMatrixBody({
+            '1': { '1': [5, 1], '2': [10, 5] },
+            '2': { '1': [8, 4] },
+          }),
         ),
       );
 
-      let caught: ConnectorError | null = null;
-      try {
-        await connector.matrix({
-          origins: [
-            { lat: 0, lng: 0 },
-            { lat: 1, lng: 1 },
-          ],
-          destinations: [
-            { lat: 2, lng: 2 },
-            { lat: 3, lng: 3 },
-          ],
-        });
-      } catch (err) {
-        caught = err as ConnectorError;
-      }
+      const result = await connector.matrix({
+        origins: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+        ],
+        destinations: [
+          { lat: 2, lng: 2 },
+          { lat: 3, lng: 3 },
+        ],
+      });
 
-      expect(caught).toBeInstanceOf(ConnectorError);
-      expect(caught?.providerCode).toBe('unknown');
-      expect(caught?.providerMessage).toContain('2×2');
+      expect(result.cells.map((c) => [c.originIndex, c.destinationIndex])).toEqual([
+        [0, 0],
+        [0, 1],
+        [1, 0],
+      ]);
     });
 
-    it('throws ConnectorError when costMatrix has fewer rows than origins', async () => {
+    it('returns a sparse result when the matrix has fewer origins than requested', async () => {
       mockFetch.mockResolvedValueOnce(
-        buildSuccessResponse(buildOdCostMatrixBody([[[5, 1000], [10, 5000]]])),
+        buildSuccessResponse(
+          buildOdCostMatrixBody({ '1': { '1': [5, 1], '2': [10, 5] } }),
+        ),
       );
 
-      await expect(
-        connector.matrix({
-          origins: [
-            { lat: 0, lng: 0 },
-            { lat: 1, lng: 1 },
-          ],
-          destinations: [
-            { lat: 2, lng: 2 },
-            { lat: 3, lng: 3 },
-          ],
-        }),
-      ).rejects.toMatchObject({ name: 'ConnectorError', providerCode: 'unknown' });
+      const result = await connector.matrix({
+        origins: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+        ],
+        destinations: [
+          { lat: 2, lng: 2 },
+          { lat: 3, lng: 3 },
+        ],
+      });
+
+      expect(result.cells.map((c) => [c.originIndex, c.destinationIndex])).toEqual([
+        [0, 0],
+        [0, 1],
+      ]);
     });
 
-    it('throws ConnectorError on a legacy odLines OID of 0 (would produce a negative index)', async () => {
+    it('throws ConnectorError on an odLines OriginID of 0 (would produce a negative index)', async () => {
       mockFetch.mockResolvedValueOnce(
         new Response(
           JSON.stringify({
@@ -708,10 +779,10 @@ describe('EsriMatrixConnector', () => {
               features: [
                 {
                   attributes: {
-                    OriginOID: 0,
-                    DestinationOID: 1,
-                    Total_Time: 5,
-                    Total_Distance: 1000,
+                    OriginID: 0,
+                    DestinationID: 1,
+                    Total_TravelTime: 5,
+                    Total_Kilometers: 1,
                   },
                 },
               ],
@@ -736,8 +807,8 @@ describe('EsriMatrixConnector', () => {
       expect(caught?.providerMessage).toContain('OID');
     });
 
-    it('throws ConnectorError when legacy odLines omits unreachable pairs (sparse coverage)', async () => {
-      // 1×2 grid requested, but only one routable feature returned.
+    it('omits unreachable pairs from an odLines FeatureSet (sparse coverage)', async () => {
+      // 1×2 grid requested, but only one routable feature returned → one cell.
       mockFetch.mockResolvedValueOnce(
         new Response(
           JSON.stringify({
@@ -745,10 +816,10 @@ describe('EsriMatrixConnector', () => {
               features: [
                 {
                   attributes: {
-                    OriginOID: 1,
-                    DestinationOID: 1,
-                    Total_Time: 5,
-                    Total_Distance: 1000,
+                    OriginID: 1,
+                    DestinationID: 1,
+                    Total_TravelTime: 5,
+                    Total_Kilometers: 1,
                   },
                 },
               ],
@@ -758,15 +829,14 @@ describe('EsriMatrixConnector', () => {
         ),
       );
 
-      await expect(
-        connector.matrix({
-          origins: [{ lat: 0, lng: 0 }],
-          destinations: [
-            { lat: 1, lng: 1 },
-            { lat: 2, lng: 2 },
-          ],
-        }),
-      ).rejects.toMatchObject({ name: 'ConnectorError', providerCode: 'unknown' });
+      const result = await connector.matrix({
+        origins: [{ lat: 0, lng: 0 }],
+        destinations: [
+          { lat: 1, lng: 1 },
+          { lat: 2, lng: 2 },
+        ],
+      });
+      expect(result.cells.map((c) => [c.originIndex, c.destinationIndex])).toEqual([[0, 0]]);
     });
   });
 

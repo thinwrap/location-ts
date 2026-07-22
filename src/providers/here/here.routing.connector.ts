@@ -8,6 +8,7 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import { decodeFlexPolyline, encodePolyline, mergePassthrough } from '../../utils';
+import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
 import type { HereConfig } from './here.config';
 import type {
   HereRouteResponse,
@@ -57,11 +58,32 @@ export class HereRoutingConnector
       });
     }
 
+    // Reject NaN/non-finite waypoints before they serialize into the URL query
+    // (`${NaN}` becomes the string "NaN"); both dispatch shapes below
+    // (callFindSequence + callRoutes) read the same coordinates. Out-of-range
+    // but finite lat/lng pass through verbatim (thin-wrapper philosophy).
+    for (const wp of waypoints) {
+      assertFiniteCoordinate(wp, 'HERE Routing waypoint');
+    }
+
+    // HERE findsequence2 optimizes an OPEN route (fixed first/last waypoint); it
+    // cannot return a closed round trip. Surface the unsupported flag instead of
+    // silently returning an open route (parity with OSRM's unsupported-combo guard).
+    if (options.isRoundTrip === true) {
+      throw new ConnectorError({
+        message: 'HERE route optimization does not support round trips (isRoundTrip)',
+        statusCode: null,
+        providerCode: 'unsupported_option',
+        providerMessage:
+          'HERE findsequence2 optimizes an open route (fixed first/last waypoint) and cannot return a closed round trip; remove isRoundTrip or use a provider that supports it (e.g. Mapbox/OSRM).',
+      });
+    }
+
+    // (isRoundTrip === true already threw above; it no longer contributes here.)
     const useOptimization =
       options.optimize === true ||
       options.optimizeFixedOrigin === true ||
-      options.optimizeFixedDestination === true ||
-      options.isRoundTrip === true;
+      options.optimizeFixedDestination === true;
 
     let orderedWaypoints: LatLng[] = waypoints;
     let waypointOrder: number[] | undefined;
@@ -120,8 +142,8 @@ export class HereRoutingConnector
       transportMode,
       return: 'polyline,summary',
       routingMode: 'fast',
-      origin: `${first.lat},${first.lng}`,
-      destination: `${last.lat},${last.lng}`,
+      origin: `${formatCoord(first.lat)},${formatCoord(first.lng)}`,
+      destination: `${formatCoord(last.lat)},${formatCoord(last.lng)}`,
     };
 
     if (options.departureTime) {
@@ -147,7 +169,7 @@ export class HereRoutingConnector
       urlParams.append(key, val);
     }
     for (const wp of intermediates) {
-      urlParams.append('via', `${wp.lat},${wp.lng}`);
+      urlParams.append('via', `${formatCoord(wp.lat)},${formatCoord(wp.lng)}`);
     }
 
     const url = `${ROUTER_URL}?${urlParams.toString()}`;
@@ -220,26 +242,36 @@ export class HereRoutingConnector
 
     const baseQuery: Record<string, string> = {
       apiKey: this.config.apiKey,
-      start: `${first.lat},${first.lng}`,
-      end: `${last.lat},${last.lng}`,
+      start: `${formatCoord(first.lat)},${formatCoord(first.lng)}`,
+      end: `${formatCoord(last.lat)},${formatCoord(last.lng)}`,
       mode: `fastest;${transportMode};traffic:disabled`,
     };
 
     if (options.departureTime) {
-      baseQuery.departureTime = options.departureTime.toISOString();
+      // HERE findsequence2 documents the departure-time param as `departure`
+      // (ISO 8601); `departureTime` is not recognized and was silently ignored,
+      // so traffic-aware sequencing never took effect.
+      baseQuery.departure = options.departureTime.toISOString();
     }
 
-    const urlParams = new URLSearchParams();
-    for (const [key, val] of Object.entries(baseQuery)) {
-      urlParams.append(key, val);
-    }
+    // Merge `_passthrough` (query + headers) into this leg too — it was silently
+    // dropped, so a consumer could not tune the sequence request (e.g. `improveFor`,
+    // `mode` overrides). The connector query (including the per-intermediate
+    // destinationN keys) is the base; passthrough.query overrides on collision.
+    const connectorQuery: Record<string, string> = { ...baseQuery };
     for (let i = 0; i < intermediates.length; i++) {
       const wp = intermediates[i]!;
-      urlParams.append(`destination${i + 1}`, `${wp.lat},${wp.lng}`);
+      connectorQuery[`destination${i + 1}`] = `${formatCoord(wp.lat)},${formatCoord(wp.lng)}`;
+    }
+    const merged = mergePassthrough({} as Record<string, unknown>, {}, options._passthrough, connectorQuery);
+
+    const urlParams = new URLSearchParams();
+    for (const [key, val] of Object.entries(merged.query)) {
+      urlParams.append(key, val);
     }
 
     const url = `${SEQUENCE_URL}?${urlParams.toString()}`;
-    const response = await this.sendGet(url);
+    const response = await this.sendGet(url, { headers: merged.headers });
 
     if (!response.ok) {
       throw await this.raiseHttpError(response, 'HERE Waypoints Sequence');

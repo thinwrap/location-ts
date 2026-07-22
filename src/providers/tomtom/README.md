@@ -29,8 +29,8 @@ Create a key at https://developer.tomtom.com/user/me/apps. Sent as `key=` query 
 ## Vendor docs
 
 - Routing: https://developer.tomtom.com/routing-api/documentation/tomtom-maps/calculate-route
-- Matrix Routing: https://developer.tomtom.com/routing-api/documentation/tomtom-maps/matrix-routing
-- Geocoding: https://developer.tomtom.com/search-api/documentation/geocoding-service/geocode
+- Matrix Routing: https://developer.tomtom.com/matrix-routing-v2-api/documentation/synchronous-matrix
+- Geocoding: https://developer.tomtom.com/geocoding-api/documentation/geocode
 - Reachable Range: https://developer.tomtom.com/routing-api/documentation/tomtom-maps/calculate-reachable-range
 - Rate limits: https://developer.tomtom.com/
 

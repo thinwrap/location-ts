@@ -25,6 +25,9 @@ export interface GoogleRouteMatrixElement {
   distanceMeters?: number;
   duration?: string;
   status?: GoogleRouteMatrixStatus;
+  // Independent of `status`: `ROUTE_EXISTS` vs `ROUTE_NOT_FOUND`. A cell can be
+  // status-OK with `ROUTE_NOT_FOUND` and no distanceMeters/duration.
+  condition?: string;
 }
 
 /** RPC-style per-cell status; `code === 0` means OK (cell succeeded). */

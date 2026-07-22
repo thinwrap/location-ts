@@ -47,7 +47,8 @@ function buildTripResponse() {
   return new Response(
     JSON.stringify({
       code: 'Ok',
-      routes: [
+      // The OSRM Trip service returns its route objects under `trips`.
+      trips: [
         {
           geometry: '_p~iF~ps|U_ulLnnqC_mqNvxq`@',
           legs: [
@@ -224,24 +225,23 @@ describe('OsrmRoutingConnector', () => {
       }
     });
 
-    it('throws invalid_request for invalid /trip combo (source=any, destination=any, roundtrip=false)', async () => {
-      try {
-        await connector.route({
-          waypoints: THREE_WAYPOINTS,
-          optimize: true,
-          isRoundTrip: false,
-          optimizeFixedOrigin: false,
-          optimizeFixedDestination: false,
-        });
-        expect.fail('expected throw');
-      } catch (err) {
-        expect(err).toBeInstanceOf(ConnectorError);
-        const ce = err as ConnectorError;
-        expect(ce.providerCode).toBe('invalid_request');
-        expect(ce.statusCode).toBeNull();
-        expect(ce.providerMessage).toContain('optimizeFixedOrigin');
-      }
-      expect(mockFetch).not.toHaveBeenCalled();
+    it('remaps the otherwise-invalid open-route combo (any/any/roundtrip=false) to source=first&destination=last', async () => {
+      // optimize + explicit isRoundTrip=false + neither endpoint fixed would be
+      // source=any/destination=any/roundtrip=false — the combo OSRM rejects with
+      // HTTP 400. The connector remaps it to first/last (open route, endpoints
+      // kept, middle reordered) so the request is valid, rather than erroring.
+      mockFetch.mockResolvedValueOnce(buildTripResponse());
+      await connector.route({
+        waypoints: THREE_WAYPOINTS,
+        optimize: true,
+        isRoundTrip: false,
+        optimizeFixedOrigin: false,
+        optimizeFixedDestination: false,
+      });
+      const q = queryOf();
+      expect(q.get('source')).toBe('first');
+      expect(q.get('destination')).toBe('last');
+      expect(q.get('roundtrip')).toBe('false');
     });
 
     it('does NOT throw the invalid combo when only optimizeFixedOrigin is set', async () => {
@@ -344,7 +344,7 @@ describe('OsrmRoutingConnector', () => {
       connector = new OsrmRoutingConnector(defaultConfig);
     });
 
-    it('dispatches /trip/v1 + source=any&destination=any&roundtrip=true when optimize=true', async () => {
+    it('dispatches /trip/v1 + source=first&destination=last&roundtrip=false when optimize=true', async () => {
       mockFetch.mockResolvedValueOnce(buildTripResponse());
 
       const result = await connector.route({
@@ -355,9 +355,11 @@ describe('OsrmRoutingConnector', () => {
       const url = urlOf();
       expect(url).toContain('/trip/v1/driving/');
       const q = queryOf();
-      expect(q.get('source')).toBe('any');
-      expect(q.get('destination')).toBe('any');
-      // optimize=true alone (no isRoundTrip set) emits roundtrip=false.
+      // Plain optimize is an OPEN route: OSRM rejects source=any + destination=any
+      // with roundtrip=false (HTTP 400), so unfixed endpoints fall back to the
+      // input's first/last and only the middle is reordered — matching Mapbox v1.
+      expect(q.get('source')).toBe('first');
+      expect(q.get('destination')).toBe('last');
       expect(q.get('roundtrip')).toBe('false');
 
       expect(result.totalDistanceMeters).toBe(4000);
@@ -429,7 +431,8 @@ describe('OsrmRoutingConnector', () => {
         new Response(
           JSON.stringify({
             code: 'Ok',
-            routes: [
+            // OSRM Trip service returns route objects under `trips`.
+            trips: [
               {
                 geometry: '_p~iF~ps|U_ulLnnqC_mqNvxq`@',
                 legs: [
@@ -476,7 +479,8 @@ describe('OsrmRoutingConnector', () => {
         new Response(
           JSON.stringify({
             code: 'Ok',
-            routes: [
+            // OSRM Trip service returns route objects under `trips`.
+            trips: [
               {
                 geometry: '_p~iF~ps|U_ulLnnqC_mqNvxq`@',
                 legs: [

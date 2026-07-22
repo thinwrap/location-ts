@@ -12,7 +12,7 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import { mergePassthrough } from '../../utils';
-import { assertFiniteCoordinate } from '../../utils/coordinate';
+import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
 import type { EsriConfig } from './esri.config';
 import { resolveEsriBearerToken } from './esri.config';
 import type {
@@ -117,7 +117,7 @@ export class EsriGeocodingConnector
       f: 'json',
       token: resolveEsriBearerToken(this.config),
       // ESRI accepts `location=<lng>,<lat>` (lng-first per ESRI x/y convention).
-      location: `${options.location.lng},${options.location.lat}`,
+      location: `${formatCoord(options.location.lng)},${formatCoord(options.location.lat)}`,
     };
 
     if (options.language !== undefined) {
@@ -170,7 +170,7 @@ export class EsriGeocodingConnector
     };
 
     if (options.location !== undefined) {
-      baseQuery.location = `${options.location.lng},${options.location.lat}`;
+      baseQuery.location = `${formatCoord(options.location.lng)},${formatCoord(options.location.lat)}`;
     }
 
     const data = await this.dispatchGet<EsriSuggestResponse>(

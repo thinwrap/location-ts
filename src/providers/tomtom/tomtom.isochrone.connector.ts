@@ -9,7 +9,7 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import { mergePassthrough, validateIsochroneCap } from '../../utils';
-import { assertFiniteCoordinate } from '../../utils/coordinate';
+import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
 import type { TomTomConfig } from './tomtom.config';
 import type { TomTomReachableRangeResponse } from './tomtom.types';
 
@@ -61,7 +61,7 @@ export class TomTomIsochroneConnector
     validateIsochroneCap(options);
     assertFiniteCoordinate(options.center, 'TomTom isochrone center');
 
-    const baseUrl = `${REACHABLE_RANGE_URL}/${options.center.lat},${options.center.lng}/json`;
+    const baseUrl = `${REACHABLE_RANGE_URL}/${formatCoord(options.center.lat)},${formatCoord(options.center.lng)}/json`;
     const travelMode = this.mapTravelMode(
       options.travelMode as 'driving' | 'walking' | 'cycling' | undefined,
     );

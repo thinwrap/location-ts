@@ -8,7 +8,7 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import { mergePassthrough, validateIsochroneCap } from '../../utils';
-import { assertFiniteCoordinate } from '../../utils/coordinate';
+import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
 import type { MapboxConfig } from './mapbox.config';
 import type { MapboxIsochroneResponse } from './mapbox.types';
 
@@ -56,7 +56,7 @@ export class MapboxIsochroneConnector
     const profile = this.mapProfile(
       options.travelMode as 'driving' | 'walking' | 'cycling' | undefined,
     );
-    const url = `${ISOCHRONE_URL}/${profile}/${options.center.lng},${options.center.lat}`;
+    const url = `${ISOCHRONE_URL}/${profile}/${formatCoord(options.center.lng)},${formatCoord(options.center.lat)}`;
 
     const baseQuery: Record<string, string> = {
       access_token: this.config.accessToken,

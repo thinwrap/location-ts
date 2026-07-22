@@ -3,19 +3,26 @@ export interface EsriRouteFeatureAttributes {
   Total_Length?: number;
   /** Travel time in minutes. */
   Total_Time?: number;
-  /** Legacy field: brownfield responses report Total_TravelTime in minutes. */
+  /** Driving-mode impedance: total travel time in minutes. */
   Total_TravelTime?: number;
+  /** Walking-mode impedance: total walk time in minutes (WALK travel mode). */
+  Total_WalkTime?: number;
   /** Legacy field: brownfield responses report Total_Miles. */
   Total_Miles?: number;
   /** Legacy field: brownfield responses report Total_Kilometers (kilometers). */
   Total_Kilometers?: number;
-  /**
-   * Reordered input-stop indices when `findBestSequence=true` is requested.
-   * Comma-separated list of original waypoint indices (0-based) in the new
-   * traversal order. Surface depends on ESRI service version; see
-   * `waypointOrder`.
-   */
-  Stops?: string;
+}
+
+/**
+ * Attributes on each feature of the `stops` FeatureSet (returned when
+ * `returnStops=true`). `Sequence` is the 1-based position of that stop in the
+ * optimized route when `findBestSequence=true` was requested; the stop features
+ * are returned in INPUT order.
+ */
+export interface EsriStopFeatureAttributes {
+  Sequence?: number;
+  Name?: string;
+  ObjectID?: number;
 }
 
 export interface EsriDirectionStepAttributes {
@@ -43,52 +50,73 @@ export interface EsriRouteResponse {
     features: Array<{
       attributes: EsriDirectionStepAttributes;
     }>;
+    /**
+     * Route-level totals. Travel-mode-independent: `totalLength` is in meters
+     * when `directionsLengthUnits=esriNAUMeters`, `totalTime` is in minutes.
+     * Preferred over the `Total_*` route attributes, whose names vary by the
+     * active impedance (TravelTime vs WalkTime).
+     */
+    summary?: {
+      totalLength?: number;
+      totalTime?: number;
+      totalDriveTime?: number;
+    };
   }>;
+  // Returned when `returnStops=true`; features are in INPUT order, each with a
+  // 1-based `Sequence` = its position in the optimized route.
+  stops?: {
+    features: Array<{
+      attributes: EsriStopFeatureAttributes;
+    }>;
+  };
   error?: { message: string; code: number };
 }
 
 /**
  * ESRI OD Cost Matrix synchronous response.
  *
- * The modern synchronous `solveODCostMatrix` endpoint returns the cost matrix
- * via `odCostMatrix.costMatrix.values` as a 2-D array (rows = origins,
- * cols = destinations). Each cell carries either a single scalar (when only
- * one cost attribute is requested) or a `[Total_Time, Total_Distance]` tuple
- * when both are requested via `outputType=esriNAODOutputSparseMatrix` and
- * `attributeParameterValues` covers both `Total_Time` and `Total_Distance`.
+ * With `outputType=esriNAODOutputSparseMatrix` the `solveODCostMatrix` endpoint
+ * returns `odCostMatrix` as a sparse object: a `costAttributeNames` array
+ * naming the per-cell value order, plus one key per 1-based **origin OID**
+ * mapping a 1-based **destination OID** to an array of cost values in
+ * `costAttributeNames` order. With `impedanceAttributeName=TravelTime` +
+ * `accumulateAttributeNames=Kilometers` each cell array is
+ * `[TravelTime(minutes), Kilometers(km)]`.
  *
- * `Total_Time` is reported in minutes, `Total_Distance` in meters when
- * `defaultBreaksUnits=esriNAUMinutes`/`outputGeometryPrecision=...` are set
- * with `outSR=4326` — we normalize to seconds + meters in the connector.
+ * With `outputType=esriNAODOutputStraightLines` the service instead returns an
+ * `odLines.features[]` FeatureSet whose attributes carry `OriginID` /
+ * `DestinationID` (1-based) plus `Total_TravelTime` (minutes) and
+ * `Total_Kilometers` (km). Retained as a fallback path.
  *
- * Legacy synchronous responses (older NAServer revisions) emit a flat
- * `odLines.features[]` FeatureSet; we retain that shape as a fallback to
- * preserve brownfield parity.
+ * The connector normalizes minutes → seconds (×60) and kilometers → meters
+ * (×1000).
  */
 export interface EsriODMatrixResponse {
-  /** Modern (post-2020) synchronous response shape. */
-  odCostMatrix?: {
-    costAttributeNames?: string[];
-    /**
-     * 2-D matrix of cost values. Each cell is either a number (single
-     * cost attribute) or a `[time, distance]` tuple (both requested).
-     */
-    costMatrix: {
-      values: Array<Array<number | [number, number]>>;
-    };
-  };
-  /** Legacy synchronous response shape (kept for brownfield parity). */
+  /** Sparse-matrix response shape (`esriNAODOutputSparseMatrix`). */
+  odCostMatrix?: EsriODCostMatrix;
+  /** Straight-lines response shape (`esriNAODOutputStraightLines`) — fallback. */
   odLines?: {
     features: Array<{
       attributes: {
-        OriginOID: number;
-        DestinationOID: number;
-        Total_Time: number; // minutes
-        Total_Distance: number; // meters when meters-units requested
+        OriginID: number;
+        DestinationID: number;
+        Total_TravelTime: number; // minutes
+        Total_Kilometers: number; // kilometers
       };
     }>;
   };
   error?: { message: string; code: number };
+}
+
+/**
+ * Sparse `odCostMatrix` payload. `costAttributeNames` names the order of the
+ * numbers in each cell array; every **other** key is a 1-based origin OID
+ * (string) whose value maps a 1-based destination OID (string) to the cell's
+ * cost values.
+ */
+export interface EsriODCostMatrix {
+  costAttributeNames?: string[];
+  [originOID: string]: string[] | Record<string, number[]> | undefined;
 }
 
 export interface EsriGeocodeResponse {

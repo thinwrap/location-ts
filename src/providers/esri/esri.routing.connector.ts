@@ -12,10 +12,12 @@ import { encodePolyline, mergePassthrough } from '../../utils';
 import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { EsriConfig } from './esri.config';
 import { resolveEsriBearerToken } from './esri.config';
+import { mapEsriTravelMode } from './esri.travel-modes';
 import type {
   EsriDirectionStepAttributes,
   EsriRouteFeatureAttributes,
   EsriRouteResponse,
+  EsriStopFeatureAttributes,
 } from './esri.types';
 
 const ROUTE_URL =
@@ -83,8 +85,25 @@ export class EsriRoutingConnector
       outSR: '4326',
     };
 
+    // ESRI findBestSequence optimizes an OPEN route (optionally preserving the
+    // first/last stop); it has no closed round-trip mode. Surface the unsupported
+    // flag instead of silently returning an open route.
+    if (options.isRoundTrip === true) {
+      throw new ConnectorError({
+        message: 'ESRI route optimization does not support round trips (isRoundTrip)',
+        statusCode: null,
+        providerCode: 'unsupported_option',
+        providerMessage:
+          'ESRI findBestSequence optimizes an open route and cannot return a closed round trip; remove isRoundTrip or use a provider that supports it (e.g. Mapbox/OSRM).',
+      });
+    }
+
     if (options.optimize === true) {
       form.findBestSequence = 'true';
+      // Needed to recover the optimized visiting order: the `stops` FeatureSet
+      // carries each stop's 1-based `Sequence` (there is no `Stops` route
+      // attribute).
+      form.returnStops = 'true';
       if (options.optimizeFixedOrigin === true) {
         form.preserveFirstStop = 'true';
       }
@@ -93,7 +112,7 @@ export class EsriRoutingConnector
       }
     }
 
-    const travelMode = mapTravelMode(options.travelMode);
+    const travelMode = mapEsriTravelMode(options.travelMode, 'Routing');
     if (travelMode !== undefined) {
       form.travelMode = travelMode;
     }
@@ -161,9 +180,10 @@ export class EsriRoutingConnector
 
   /**
    * Normalize a 2xx ESRI response into an {@link IRoutingResult}. Resolves
-   * `routes.features[0]` (the chosen route), extracts totals from its
-   * attributes, reconstructs per-leg distance/duration from the directions
-   * FeatureSet, and re-encodes the geometry paths as a precision-5 polyline.
+   * `routes.features[0]` (the chosen route), extracts totals from the directions
+   * summary (travel-mode-independent), reconstructs per-leg distance/duration
+   * from the directions FeatureSet, and re-encodes the geometry paths as a
+   * precision-5 polyline.
    */
   private normalizeSuccess(
     data: EsriRouteResponse,
@@ -183,22 +203,35 @@ export class EsriRoutingConnector
 
     const attrs: EsriRouteFeatureAttributes = feature.attributes ?? {};
 
-    // Prefer Total_Length (meters, requested via directionsLengthUnits=
-    // esriNAUMeters). Fall back to Total_Kilometers * 1000 for older
-    // brownfield responses.
+    // Totals come from the directions summary, which is travel-mode-independent
+    // (`totalLength` in meters via directionsLengthUnits=esriNAUMeters,
+    // `totalTime` in minutes). The route feature's `Total_*` attributes are
+    // named after the active impedance — driving reports `Total_TravelTime`,
+    // walking reports `Total_WalkTime`, and neither `Total_Length` nor
+    // `Total_Time` is emitted at all — so reading them directly silently yields
+    // 0 for any non-driving mode. Fall back to the attributes only when the
+    // summary is absent (verified live against route-api.arcgis.com 2026-07-21).
+    const summary = data.directions?.[0]?.summary;
+
     const totalDistanceMeters =
-      typeof attrs.Total_Length === 'number'
-        ? attrs.Total_Length
-        : typeof attrs.Total_Kilometers === 'number'
-          ? attrs.Total_Kilometers * 1000
-          : 0;
+      typeof summary?.totalLength === 'number'
+        ? summary.totalLength
+        : typeof attrs.Total_Length === 'number'
+          ? attrs.Total_Length
+          : typeof attrs.Total_Kilometers === 'number'
+            ? attrs.Total_Kilometers * 1000
+            : 0;
 
     const totalTimeMinutes =
-      typeof attrs.Total_Time === 'number'
-        ? attrs.Total_Time
-        : typeof attrs.Total_TravelTime === 'number'
-          ? attrs.Total_TravelTime
-          : 0;
+      typeof summary?.totalTime === 'number'
+        ? summary.totalTime
+        : typeof attrs.Total_Time === 'number'
+          ? attrs.Total_Time
+          : typeof attrs.Total_TravelTime === 'number'
+            ? attrs.Total_TravelTime
+            : typeof attrs.Total_WalkTime === 'number'
+              ? attrs.Total_WalkTime
+              : 0;
     const totalDurationSeconds = totalTimeMinutes * MINUTES_TO_SECONDS;
 
     const legs = reconstructLegs(
@@ -221,7 +254,10 @@ export class EsriRoutingConnector
     );
     const polyline = encodePolyline(allPoints);
 
-    const waypointOrder = extractWaypointOrder(attrs, waypoints.length);
+    const waypointOrder = extractWaypointOrder(
+      data.stops?.features,
+      waypoints.length,
+    );
 
     return {
       legs,
@@ -350,27 +386,6 @@ function buildStopsFeatureSet(waypoints: LatLng[]): {
   };
 }
 
-function mapTravelMode(
-  mode?: 'driving' | 'walking' | 'cycling',
-): string | undefined {
-  switch (mode) {
-    case 'walking':
-      return 'Walking';
-    case 'cycling':
-      // ESRI World Route does not ship a public cycling mode. Per the baseline
-      // schema-coherence decision (consistent with ESRI Matrix), fail fast with
-      // a typed error rather than silently degrading to driving.
-      throw new ConnectorError({
-        message: 'ESRI Routing does not support travelMode "cycling"',
-        statusCode: null,
-        providerCode: 'unsupported_travel_mode',
-        providerMessage: 'ESRI Routing does not support travelMode "cycling"',
-      });
-    default:
-      return undefined;
-  }
-}
-
 function buildRestrictions(options: IRoutingOptions): string {
   const restrictions: string[] = [];
   if (options.avoidTolls) restrictions.push('Avoid Toll Roads');
@@ -467,26 +482,37 @@ function reconstructLegs(
 }
 
 /**
- * Extract the reordered waypoint sequence when `findBestSequence=true` was
- * requested. ESRI may surface it in `routes.features[0].attributes.Stops`
- * (comma-separated input indices). Returns `undefined` when not present.
+ * Derive the optimized visiting sequence when `findBestSequence=true` was
+ * requested. ESRI returns the `stops` FeatureSet (`returnStops=true`) in INPUT
+ * order, each stop carrying a 1-based `Sequence` = its position in the
+ * optimized route. Invert to the canonical `waypointOrder` = full visiting
+ * sequence of INPUT indices (`order[Sequence - 1] = inputIndex`). Returns
+ * `undefined` when the sequence data is absent, incomplete, or malformed.
  */
 function extractWaypointOrder(
-  attrs: EsriRouteFeatureAttributes,
+  stops: Array<{ attributes: EsriStopFeatureAttributes }> | undefined,
   totalStops: number,
 ): number[] | undefined {
-  const stopsAttr = attrs.Stops;
-  if (typeof stopsAttr !== 'string' || stopsAttr === '') return undefined;
+  if (!stops || stops.length !== totalStops) return undefined;
 
-  const order: number[] = [];
-  for (const piece of stopsAttr.split(',')) {
-    const trimmed = piece.trim();
-    if (trimmed === '') continue;
-    const n = parseInt(trimmed, 10);
-    if (Number.isFinite(n)) order.push(n);
+  const order = new Array<number>(totalStops);
+  const filled = new Array<boolean>(totalStops).fill(false);
+  for (let inputIdx = 0; inputIdx < stops.length; inputIdx++) {
+    const seq = stops[inputIdx]?.attributes?.Sequence;
+    if (
+      typeof seq !== 'number' ||
+      !Number.isInteger(seq) ||
+      seq < 1 ||
+      seq > totalStops ||
+      filled[seq - 1]
+    ) {
+      return undefined;
+    }
+    filled[seq - 1] = true;
+    order[seq - 1] = inputIdx;
   }
 
-  return order.length === totalStops ? order : undefined;
+  return order;
 }
 
 function readBodyErrorCode(body: Record<string, unknown> | null): number | null {

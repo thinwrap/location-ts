@@ -13,7 +13,7 @@ import type {
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
 import { mergePassthrough } from '../../utils';
-import { assertFiniteCoordinate } from '../../utils/coordinate';
+import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
 import type { MapboxConfig } from './mapbox.config';
 import type {
   MapboxGeocodingV6Feature,
@@ -133,8 +133,8 @@ export class MapboxGeocodingConnector
     assertFiniteCoordinate(options.location, 'Mapbox reverseGeocode');
 
     const baseQuery: Record<string, string> = {
-      longitude: String(options.location.lng),
-      latitude: String(options.location.lat),
+      longitude: formatCoord(options.location.lng),
+      latitude: formatCoord(options.location.lat),
       access_token: this.config.accessToken,
     };
 

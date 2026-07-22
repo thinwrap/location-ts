@@ -8,11 +8,10 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import { encodePolyline, joinCoords, mergePassthrough } from '../../utils';
-import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { MapboxConfig } from './mapbox.config';
 
 const DIRECTIONS_URL = 'https://api.mapbox.com/directions/v5/mapbox';
-const OPTIMIZED_TRIPS_URL = 'https://api.mapbox.com/optimized-trips/v2';
+const OPTIMIZED_TRIPS_URL = 'https://api.mapbox.com/optimized-trips/v1/mapbox';
 
 /**
  * Mapbox routing connector — the architectural outlier.
@@ -21,9 +20,12 @@ const OPTIMIZED_TRIPS_URL = 'https://api.mapbox.com/optimized-trips/v2';
  * flags on the {@link IRoutingOptions} input:
  *
  * `GET /directions/v5/mapbox/{profile}/{coords}` — plain routing.
- * `POST /optimized-trips/v2` — when any of
+ * `GET /optimized-trips/v1/mapbox/{profile}/{coords}` — waypoint-order
+ *     optimization (single-vehicle TSP), when any of
  *     `optimize | optimizeFixedOrigin | optimizeFixedDestination | isRoundTrip`
- *     is set.
+ *     is set. (Optimization v1 is the single-route optimizer that matches every
+ *     sibling provider's `optimize` behavior; v2 is a fleet/VRP product that
+ *     belongs to a future multi-vehicle surface, not this facade.)
  *
  * The dispatch logic lives entirely inside this connector — there
  * is no shared translator middleware. The connector-private precision-6
@@ -95,7 +97,7 @@ export class MapboxRoutingConnector
       });
     }
 
-    // `/optimized-trips/v2` returns the routes under `trips`; `/directions/v5`
+    // `/optimized-trips/v1` returns the routes under `trips`; `/directions/v5`
     // returns them under `routes`. Normalize.
     const routes =
       (data.routes && data.routes.length > 0
@@ -197,45 +199,55 @@ export class MapboxRoutingConnector
   }
 
   /**
-   * `/optimized-trips/v2` POST dispatch (3). Body carries `coordinates`,
-   * `profile`, `roundtrip`, and the optional `source`/`destination` constraints.
+   * `/optimized-trips/v1` GET dispatch. `joinCoords` guards finite coordinates
+   * and builds the `lng,lat;…` path. The `source`/`destination`/`roundtrip`
+   * query params select the optimization shape.
+   *
+   * Optimization v1 (OSRM-trip-based) requires that a non-roundtrip request fix
+   * at least one endpoint — `source=any` + `destination=any` + `roundtrip=false`
+   * is rejected. So plain `optimize` (and the both-fixed case) keeps BOTH
+   * endpoints and reorders the intermediates, matching Google/TomTom/HERE/Esri;
+   * the fixed-origin/-destination flags pin just their endpoint and free the
+   * other; `isRoundTrip` returns to the first waypoint.
    */
   private async dispatchOptimized(
     options: IRoutingOptions,
     profile: string,
   ): Promise<Response> {
-    // Reject NaN/non-finite coordinates before they serialize into the request
-    // body (JSON.stringify(NaN) === "null" would silently corrupt the geometry).
-    // Mirrors the plain `/directions` path, where `joinCoords` guards the same.
-    // Out-of-range but finite lat/lng pass through verbatim (thin-wrapper).
-    for (const coord of options.waypoints) {
-      assertFiniteCoordinate(coord, 'Mapbox routing waypoint');
-    }
-    const coordinates = options.waypoints.map((c) => [c.lng, c.lat]);
-
-    const body: Record<string, unknown> = {
-      coordinates,
-      profile,
-      roundtrip: options.isRoundTrip === true,
-    };
-
-    // fixed-origin/fixed-destination flags pin the endpoints; plain
-    // `optimize: true` (without the fixed flags) leaves both unconstrained.
-    if (options.optimizeFixedOrigin === true) {
-      body.source = 'first';
-    } else if (options.optimize === true) {
-      body.source = 'any';
-    }
-
-    if (options.optimizeFixedDestination === true) {
-      body.destination = 'last';
-    } else if (options.optimize === true) {
-      body.destination = 'any';
-    }
+    const coords = joinCoords(options.waypoints, 'lnglat', ';');
+    const url = `${OPTIMIZED_TRIPS_URL}/${profile}/${coords}`;
 
     const baseQuery: Record<string, string> = {
       access_token: this.config.accessToken,
+      geometries: 'polyline6',
+      overview: 'full',
+      steps: 'true',
+      annotations: 'duration,distance',
+      roundtrip: options.isRoundTrip === true ? 'true' : 'false',
     };
+
+    if (options.isRoundTrip === true) {
+      // Round trip returns to the first waypoint.
+      baseQuery.source = 'first';
+    } else if (
+      options.optimizeFixedOrigin === true &&
+      options.optimizeFixedDestination !== true
+    ) {
+      baseQuery.source = 'first';
+      baseQuery.destination = 'any';
+    } else if (
+      options.optimizeFixedDestination === true &&
+      options.optimizeFixedOrigin !== true
+    ) {
+      baseQuery.source = 'any';
+      baseQuery.destination = 'last';
+    } else {
+      // Plain `optimize`, or both endpoints fixed: keep origin first and
+      // destination last, reorder the middle (the only any/any alternative that
+      // v1 accepts for a non-roundtrip request).
+      baseQuery.source = 'first';
+      baseQuery.destination = 'last';
+    }
 
     const excludes = buildExcludes(options);
     if (excludes) baseQuery.exclude = excludes;
@@ -244,12 +256,14 @@ export class MapboxRoutingConnector
       baseQuery.depart_at = options.departureTime.toISOString();
     }
 
-    const merged = mergePassthrough(body, {}, options._passthrough, baseQuery);
+    const merged = mergePassthrough(
+      {} as Record<string, unknown>,
+      {},
+      options._passthrough,
+      baseQuery,
+    );
 
-    return this.sendPostJson(OPTIMIZED_TRIPS_URL, merged.body, {
-      headers: merged.headers,
-      query: merged.query,
-    });
+    return this.sendGet(url, { headers: merged.headers, query: merged.query });
   }
 
   /**

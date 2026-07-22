@@ -312,6 +312,10 @@ describe('TomTomRoutingConnector', () => {
     });
 
     it('sends computeBestOrder=true when optimize is set with >2 waypoints', async () => {
+      // Input [A,B,C,D]; origin A(0) and destination D(3) are fixed; only the
+      // 2 intermediates B(1),C(2) are reordered. TomTom's optimizedWaypoints
+      // covers ONLY those intermediates, providedIndex 0-based over them:
+      // sorted by optimizedIndex → providedIndex [1,0] → input indices [2,1].
       mockFetch.mockResolvedValueOnce(buildRouteResponse({ optimized: true }));
 
       const result = await connector.route({
@@ -319,30 +323,30 @@ describe('TomTomRoutingConnector', () => {
           { lat: 40.7128, lng: -74.006 },
           { lat: 40.73, lng: -73.995 },
           { lat: 40.758, lng: -73.9855 },
+          { lat: 40.77, lng: -73.98 },
         ],
         optimize: true,
       });
 
       expect(queryOf().get('computeBestOrder')).toBe('true');
-      // Canonical waypointOrder = full visiting sequence of INPUT indices.
-      // optimizedWaypoints sorted by optimizedIndex, projected to providedIndex:
-      // [{providedIndex:1,optimizedIndex:0},{providedIndex:0,optimizedIndex:1}]
-      // → [1, 0] (full order for this 2-element vendor response).
-      expect(result.waypointOrder).toEqual([1, 0]);
+      // Canonical waypointOrder = full visiting sequence of INPUT indices with
+      // the fixed origin (0) and destination (N-1) bracketing the projected
+      // intermediates.
+      expect(result.waypointOrder).toEqual([0, 2, 1, 3]);
     });
 
     // Cross-language canonical waypointOrder parity fixture. Logical input
-    // [A,B,C,D]; optimal visiting order A,C,B,D ⇒ canonical [0,2,1,3].
-    // TomTom reports optimizedWaypoints {providedIndex, optimizedIndex};
-    // sorting by optimizedIndex and projecting providedIndex yields [0,2,1,3].
+    // [A,B,C,D,E]; origin A(0)/destination E(4) fixed; intermediates B,C,D
+    // (input 1,2,3, providedIndex 0,1,2) reordered to visit D,B,C. TomTom's
+    // optimizedWaypoints (intermediate-relative) → projected to input indices,
+    // bracketed by origin/destination, yields canonical [0,3,1,2,4].
     it('canonical waypointOrder: full visiting sequence of input indices', async () => {
       const body = {
         ...buildRouteBody(),
         optimizedWaypoints: [
-          { providedIndex: 0, optimizedIndex: 0 },
-          { providedIndex: 2, optimizedIndex: 1 },
+          { providedIndex: 2, optimizedIndex: 0 },
+          { providedIndex: 0, optimizedIndex: 1 },
           { providedIndex: 1, optimizedIndex: 2 },
-          { providedIndex: 3, optimizedIndex: 3 },
         ],
       };
       mockFetch.mockResolvedValueOnce(
@@ -355,11 +359,12 @@ describe('TomTomRoutingConnector', () => {
           { lat: 1, lng: 1 },
           { lat: 2, lng: 2 },
           { lat: 3, lng: 3 },
+          { lat: 4, lng: 4 },
         ],
         optimize: true,
       });
 
-      expect(result.waypointOrder).toEqual([0, 2, 1, 3]);
+      expect(result.waypointOrder).toEqual([0, 3, 1, 2, 4]);
     });
 
     it('omits computeBestOrder when optimize is set but only two waypoints', async () => {

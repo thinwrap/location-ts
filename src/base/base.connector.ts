@@ -58,11 +58,17 @@ export abstract class BaseConnector {
       // re-sending auth headers (X-Goog-Api-Key etc.) to the redirect target.
       return await this.fetchImpl(url, { redirect: 'error', ...init });
     } catch (err) {
+      // A BYO `fetchImpl`'s error is intentionally NOT propagated verbatim: a
+      // leaky implementation can embed the (key-bearing) request URL in its
+      // message, which would then surface in `ConnectorError.message` /
+      // `.cause` and get logged. Use a fixed message and a sanitized cause
+      // carrying only the error's class name, never its message or the raw
+      // error object.
       throw new ConnectorError({
-        message: (err as Error)?.message ?? 'Network error',
+        message: 'Network request failed',
         statusCode: null,
         providerCode: 'provider_unavailable',
-        cause: err,
+        cause: { raw: { name: (err as Error)?.name } },
       });
     }
   }

@@ -1,3 +1,4 @@
+import { gunzipSync } from 'node:zlib';
 import { BaseConnector } from '../../base/base.connector';
 import type {
   IMatrixCell,
@@ -8,6 +9,7 @@ import type {
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
 import { mergePassthrough } from '../../utils';
+import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { HereConfig } from './here.config';
 import type { HereMatrixResponse } from './here.types';
 
@@ -87,6 +89,14 @@ export class HereMatrixConnector
   }
 
   async matrix(options: IMatrixOptions): Promise<IMatrixResult> {
+    // Reject NaN/non-finite coordinates before they serialize into the JSON
+    // body (JSON.stringify(NaN) === "null" would silently corrupt the request)
+    // and before the submit round-trip. Out-of-range but finite lat/lng pass
+    // through verbatim (thin-wrapper).
+    for (const coord of [...options.origins, ...options.destinations]) {
+      assertFiniteCoordinate(coord, 'HERE Matrix');
+    }
+
     const { matrixId, statusUrl } = await this.submit(options);
     const resultUrl = await this.poll(matrixId, statusUrl, options);
     return this.retrieve(resultUrl, options);
@@ -208,9 +218,23 @@ export class HereMatrixConnector
         Math.round(delayMs * POLL_BACKOFF_MULTIPLIER),
       );
 
-      const statusResponse = await this.sendGet(statusUrl, {
+      const statusResponse = await this.hereGet(statusUrl, {
         query: { apiKey: this.config.apiKey },
       });
+
+      // Real HERE v8 behavior: on completion the poll returns `303 See Other`
+      // with `Location: <resultUrl>` and a body `{status:"completed",
+      // resultUrl}`. This MUST be handled BEFORE the generic non-2xx guard
+      // below (a 303 is not `ok`, so it would otherwise raise). `pollGet` uses
+      // `redirect: 'manual'` so the 303 is observable here rather than
+      // surfacing as a thrown network error (the base transport forces
+      // `redirect: 'error'`, which turns the redirect into a failure).
+      if (statusResponse.status === 303) {
+        const body = (await statusResponse.json().catch(() => null)) as
+          | Record<string, unknown>
+          | null;
+        return this.requireResultUrl(body, statusResponse);
+      }
 
       if (!statusResponse.ok) {
         throw await this.raiseHttpError(statusResponse, 'HERE Matrix poll');
@@ -227,21 +251,11 @@ export class HereMatrixConnector
             ? status.state
             : null;
 
+      // A 200 body with status "completed" is also treated as completion
+      // (belt-and-braces alongside the 303 path above), reading resultUrl from
+      // the body or the Location header.
       if (state === 'completed') {
-        const resultUrl =
-          status !== null && typeof status.resultUrl === 'string'
-            ? status.resultUrl
-            : null;
-        if (resultUrl === null) {
-          throw new ConnectorError({
-            message: 'HERE Matrix poll completed without resultUrl',
-            statusCode: statusResponse.status,
-            providerCode: 'unknown',
-            providerMessage: 'HERE Matrix poll completed without resultUrl',
-            cause: status,
-          });
-        }
-        return resultUrl;
+        return this.requireResultUrl(status, statusResponse);
       }
 
       if (state === 'failed') {
@@ -281,17 +295,64 @@ export class HereMatrixConnector
     // (WI-3): reject non-HERE hosts / malformed URLs up front.
     this.assertHereApiUrl(resultUrl, 'resultUrl');
 
-    const response = await this.sendGet(resultUrl, {
+    // Step 3a: GET the (validated hereapi.com) resultUrl WITH the apiKey. HERE
+    // requires the apiKey here (401 without) and the request header
+    // `Accept-Encoding: gzip` (406 Not Acceptable without). On success HERE does
+    // NOT return the payload inline — it responds `303 See Other` with
+    // `Location: <pre-signed S3 URL>`. We read that redirect MANUALLY
+    // (redirect:'manual', via hereGet) rather than auto-following, so the
+    // apiKey is never forwarded off the HERE host to the storage backend.
+    let response = await this.hereGet(resultUrl, {
       query: { apiKey: this.config.apiKey },
+      headers: { 'Accept-Encoding': 'gzip' },
     });
+
+    // Step 3b: follow the single redirect hop to the pre-signed result URL,
+    // WITHOUT attaching the apiKey — the signed URL is self-authenticating (it
+    // carries its own AWS SigV4 query params) and lives on a non-HERE host, so
+    // it is intentionally not run through assertHereApiUrl and never receives
+    // the key. A direct 200 (no redirect — the shape the public docs describe)
+    // is handled by simply skipping this hop.
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      if (location === null || location === '') {
+        throw new ConnectorError({
+          message: 'HERE Matrix retrieve redirect missing Location header',
+          statusCode: response.status,
+          providerCode: 'unknown',
+          providerMessage:
+            'HERE Matrix retrieve redirect missing Location header',
+          cause: null,
+        });
+      }
+      // The redirect target is a non-HERE (pre-signed storage) host so it isn't
+      // run through assertHereApiUrl, but it MUST still be https — refuse a
+      // plaintext/other-scheme downgrade from a tampered/misbehaving response.
+      let redirectProtocol: string | null = null;
+      try {
+        redirectProtocol = new URL(location).protocol;
+      } catch {
+        redirectProtocol = null;
+      }
+      if (redirectProtocol !== 'https:') {
+        throw new ConnectorError({
+          message: 'HERE Matrix result redirect must be an https URL',
+          statusCode: response.status,
+          providerCode: 'unknown',
+          providerMessage: 'HERE Matrix result redirect must be an https URL',
+          cause: null,
+        });
+      }
+      response = await this.hereGet(location, {
+        headers: { 'Accept-Encoding': 'gzip' },
+      });
+    }
 
     if (!response.ok) {
       throw await this.raiseHttpError(response, 'HERE Matrix retrieve');
     }
 
-    const data = (await response.json().catch(() => null)) as
-      | HereMatrixResponse
-      | null;
+    const data = await this.readMatrixBody(response);
     if (data === null || data.matrix === undefined || data.matrix === null) {
       throw new ConnectorError({
         message: 'HERE Matrix retrieve missing matrix payload',
@@ -302,7 +363,7 @@ export class HereMatrixConnector
       });
     }
 
-    const { numDestinations, travelTimes, distances } = data.matrix;
+    const { numDestinations, travelTimes, distances, errorCodes } = data.matrix;
     const originCount = options.origins.length;
     const destCount = options.destinations.length;
 
@@ -355,6 +416,15 @@ export class HereMatrixConnector
     for (let oi = 0; oi < originCount; oi++) {
       for (let di = 0; di < destCount; di++) {
         const index = oi * stride + di;
+        // HERE reports per-cell failures via `errorCodes` (0 = OK, 3 = computed
+        // with a violated constraint but still usable). Any other non-zero code
+        // means the travelTimes/distances value is unspecified — omit the cell
+        // rather than emit its sentinel value. Contract: failed entries are
+        // omitted from `cells[]`.
+        const errorCode = errorCodes?.[index];
+        if (errorCode !== undefined && errorCode !== 0 && errorCode !== 3) {
+          continue;
+        }
         const cell: IMatrixCell = {
           originIndex: oi,
           destinationIndex: di,
@@ -366,6 +436,118 @@ export class HereMatrixConnector
     }
 
     return { cells, raw: data };
+  }
+
+  /**
+   * Connector-local GET for the async poll + retrieve steps. Unlike
+   * {@link BaseConnector.sendGet} — which forces `redirect: 'error'` so a
+   * redirect never silently re-sends auth to the target — this uses
+   * `redirect: 'manual'` so HERE's async redirects are OBSERVABLE (status +
+   * `Location` header readable) instead of surfacing as a thrown network error.
+   * Both HERE async hops are `303 See Other`: the poll completion redirects to
+   * the resultUrl, and the resultUrl redirects to a pre-signed S3 object URL.
+   * `manual` does NOT follow the redirect, so this connector decides — per hop —
+   * whether to attach the apiKey (only to validated hereapi.com hosts) before
+   * fetching the next URL. Mirrors the base transport's error sanitization (a
+   * leaky BYO-fetch message could embed the key-bearing URL, so it is never
+   * propagated verbatim). Kept local per the per-connector-locality invariant.
+   */
+  private async hereGet(
+    url: string,
+    options?: {
+      query?: Record<string, string>;
+      headers?: Record<string, string>;
+    },
+  ): Promise<Response> {
+    const qs = options?.query
+      ? new URLSearchParams(options.query).toString()
+      : '';
+    const separator = url.includes('?') ? '&' : '?';
+    const finalUrl = qs.length === 0 ? url : `${url}${separator}${qs}`;
+    try {
+      return await this.fetchImpl(finalUrl, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: options?.headers,
+      });
+    } catch (err) {
+      throw new ConnectorError({
+        message: 'Network request failed',
+        statusCode: null,
+        providerCode: 'provider_unavailable',
+        cause: { raw: { name: (err as Error)?.name } },
+      });
+    }
+  }
+
+  /**
+   * Resolve the async result URL from a completed poll response: the body's
+   * `resultUrl` (preferred; present in both the 303 body and any 200 completed
+   * body) or the `Location` response header (set on the 303). Raises a typed
+   * {@link ConnectorError} when neither is present.
+   */
+  private requireResultUrl(
+    body: Record<string, unknown> | null,
+    response: Response,
+  ): string {
+    const fromBody =
+      body !== null &&
+      typeof body.resultUrl === 'string' &&
+      body.resultUrl !== ''
+        ? body.resultUrl
+        : null;
+    const location = response.headers.get('location');
+    const resultUrl =
+      fromBody ?? (location !== null && location !== '' ? location : null);
+    if (resultUrl === null) {
+      throw new ConnectorError({
+        message: 'HERE Matrix poll completed without resultUrl',
+        statusCode: response.status,
+        providerCode: 'unknown',
+        providerMessage: 'HERE Matrix poll completed without resultUrl',
+        cause: body,
+      });
+    }
+    return resultUrl;
+  }
+
+  /**
+   * Read + JSON-parse the retrieve body, decompressing defensively. HERE serves
+   * the matrix result gzip-compressed; because the retrieve sets
+   * `Accept-Encoding: gzip` itself, the default undici transport does NOT
+   * auto-decompress, so the body arrives as raw gzip bytes (magic `0x1f 0x8b`,
+   * `Content-Encoding: gzip`) which are gunzipped via Node's built-in `zlib`
+   * (zero runtime deps). A transport that already decompressed presents plain
+   * JSON (no gzip magic / stripped `Content-Encoding`) and parses directly. The
+   * gunzip is guarded so a stray `Content-Encoding` header on an
+   * already-decompressed body cannot throw. Kept local per per-connector
+   * locality.
+   */
+  private async readMatrixBody(
+    response: Response,
+  ): Promise<HereMatrixResponse | null> {
+    const raw = Buffer.from(await response.arrayBuffer());
+    const encoding = response.headers.get('content-encoding');
+    const looksGzipped =
+      (encoding !== null && encoding.toLowerCase().includes('gzip')) ||
+      (raw.length >= 2 && raw[0] === 0x1f && raw[1] === 0x8b);
+
+    let jsonBuf = raw;
+    if (looksGzipped) {
+      try {
+        jsonBuf = gunzipSync(raw);
+      } catch {
+        // Body was already decompressed by the transport but still carried the
+        // Content-Encoding header — parse the raw bytes as-is.
+        jsonBuf = raw;
+      }
+    }
+
+    try {
+      return JSON.parse(jsonBuf.toString('utf8')) as HereMatrixResponse;
+    } catch {
+      return null;
+    }
   }
 
   /**

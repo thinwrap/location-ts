@@ -149,8 +149,8 @@ describe('Matrix facade — type-level narrowing tests', () => {
     // Compile-time-only assertion: wrap in an unreachable factory so we don't
     // execute the runtime path (which would throw "Unknown matrix provider").
     const _factory = () =>
-      // @ts-expect-error 'novu' is not a MatrixProvider.
-      new Matrix('novu', { apiKey: 'k' });
+      // @ts-expect-error 'not-a-provider' is not a MatrixProvider.
+      new Matrix('not-a-provider', { apiKey: 'k' });
     void _factory;
     expect(true).toBe(true);
   });

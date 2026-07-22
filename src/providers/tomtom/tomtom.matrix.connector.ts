@@ -8,6 +8,7 @@ import type {
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
 import { mergePassthrough } from '../../utils';
+import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { TomTomConfig } from './tomtom.config';
 import type { TomTomMatrixResponse } from './tomtom.types';
 
@@ -31,7 +32,7 @@ const POLL_DEFAULT_DEADLINE_MS = 60_000;
  *   - > 2500 cells → submit-poll-retrieve via `/routing/matrix/2/async`:
  *       1. `POST /async?key=…` returns `{ jobId }`.
  *       2. `GET /async/{jobId}?key=…` is polled with exponential backoff
- *          (1s start, x1.5, capped at 5s) until `state === 'Succeeded'`,
+ *          (1s start, x1.5, capped at 5s) until `state === 'Completed'`,
  *          `state === 'Failed'`, or the 60s deadline expires.
  *       3. `GET /async/{jobId}/result?key=…` retrieves the same `data[]` shape
  *          as the sync path.
@@ -77,6 +78,14 @@ export class TomTomMatrixConnector
   }
 
   async matrix(options: IMatrixOptions): Promise<IMatrixResult> {
+    // Reject NaN/non-finite coordinates before they serialize into the JSON
+    // body (JSON.stringify(NaN) === "null" would silently corrupt the request);
+    // covers both the sync and async dispatch paths below. Out-of-range but
+    // finite lat/lng pass through verbatim (thin-wrapper).
+    for (const coord of [...options.origins, ...options.destinations]) {
+      assertFiniteCoordinate(coord, 'TomTom Matrix');
+    }
+
     const cellCount = options.origins.length * options.destinations.length;
 
     if (cellCount <= SYNC_CELL_THRESHOLD) {
@@ -187,7 +196,7 @@ export class TomTomMatrixConnector
   }
 
   /**
-   * Step 2: poll the async job until `Succeeded`, `Failed`, or deadline.
+   * Step 2: poll the async job until `Completed`, `Failed`, or deadline.
    *
    * Exponential backoff: start 1 s, multiplier 1.5, capped at 5 s. Deadline
    * configurable via `options._passthrough.body.timeoutMs`; default 60 s
@@ -236,7 +245,9 @@ export class TomTomMatrixConnector
           ? status.state
           : null;
 
-      if (state === 'Succeeded') return;
+      // TomTom Matrix v2 async job states are Submitted | Validated |
+      // Completed | Failed. Success is 'Completed' (there is no 'Succeeded').
+      if (state === 'Completed') return;
 
       if (state === 'Failed') {
         throw new ConnectorError({
@@ -335,20 +346,17 @@ export class TomTomMatrixConnector
    * into `IMatrixCell[]`. Cells without `routeSummary` are skipped, matching
    * the sibling PHP connector. Native meters + seconds.
    *
-   * LOC-CP-1 (loc-CR #100): before returning, verify `data[]` actually covers
-   * the full requested origins×destinations grid. TomTom drops cells lacking a
-   * `routeSummary` (e.g. unreachable pairs / per-cell `detailedError`), which
-   * would otherwise yield a SPARSE matrix with no signal — the consumer can't
-   * tell a missing cell from a never-requested one. We surface a typed
-   * ConnectorError instead (mirrors the non-JSON-body guards above). No
-   * 'invalid_response' ProviderCode exists in error.types.ts; 'unknown' is the
-   * closest existing value for a malformed/incomplete provider body. The full
-   * vendor body is preserved on `cause` per the repo convention.
+   * A SPARSE result (an unroutable origin×destination pair dropped by TomTom)
+   * is OMITTED rather than erroring the whole call — each returned cell carries
+   * its `originIndex`/`destinationIndex`, so a consumer can tell exactly which
+   * pairs are present. This matches the Mapbox/OSRM/HERE/Google cell-omission
+   * semantics (supersedes the earlier loc-CR #100 whole-grid guard, which
+   * diverged from every other provider).
    */
   private normalizeCells(
     data: TomTomMatrixResponse,
-    numOrigins: number,
-    numDestinations: number,
+    _numOrigins: number,
+    _numDestinations: number,
   ): IMatrixResult {
     const cells: IMatrixCell[] = [];
     const entries = Array.isArray(data.data) ? data.data : [];
@@ -362,20 +370,6 @@ export class TomTomMatrixConnector
           durationSeconds: entry.routeSummary.travelTimeInSeconds,
         });
       }
-    }
-
-    const expectedCount = numOrigins * numDestinations;
-    if (cells.length < expectedCount) {
-      const message =
-        `TomTom Matrix returned ${cells.length} routable cell(s) but the ` +
-        `requested ${numOrigins}×${numDestinations} grid needs ${expectedCount}`;
-      throw new ConnectorError({
-        message,
-        statusCode: null,
-        providerCode: 'unknown',
-        providerMessage: message,
-        cause: data,
-      });
     }
 
     return { cells, raw: data };

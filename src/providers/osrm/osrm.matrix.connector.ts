@@ -183,11 +183,17 @@ export class OsrmMatrixConnector
     const cells: IMatrixCell[] = [];
     for (let oi = 0; oi < options.origins.length; oi++) {
       for (let di = 0; di < options.destinations.length; di++) {
+        const durationSeconds = durations[oi]?.[di];
+        const distanceMeters = distances[oi]?.[di];
+        // OSRM `/table` returns `null` for an unroutable pair. Omit the cell
+        // rather than coercing to 0 (which reads as "same location"). Contract:
+        // missing/failed entries are omitted from `cells[]`.
+        if (durationSeconds == null || distanceMeters == null) continue;
         cells.push({
           originIndex: oi,
           destinationIndex: di,
-          durationSeconds: durations[oi]?.[di] ?? 0,
-          distanceMeters: distances[oi]?.[di] ?? 0,
+          durationSeconds,
+          distanceMeters,
         });
       }
     }
