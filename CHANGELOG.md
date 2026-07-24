@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-07-24
+
+### Added
+
+- **ESRI walking travel mode.** `travelMode: 'walking'` now selects ESRI's
+  pedestrian network across routing, matrix, and isochrone by sending the full
+  ArcGIS "Walking Time" travel-mode definition — a bare `"Walking"` token is
+  ignored by the service, which silently keeps the default driving impedance.
+  The mode-dependent impedance column (`WalkTime`) is read back correctly.
+  `travelMode: 'cycling'` raises `unsupported_travel_mode`; ArcGIS's World
+  network services do not provide a cycling mode.
+
+### Changed
+
+- **HERE Matrix (v8)** now requests `Accept-Encoding: gzip` and transparently
+  gunzips the compressed matrix payload — HERE returns the matrix result
+  gzip-encoded (406 without the header) and the default undici transport does
+  not auto-decompress it.
+
+### Fixed
+
+- **ESRI OD cost matrix** now sends valid `origins` / `destinations` FeatureSets
+  and reads the real `Total_TravelTime` / `Total_Kilometers` output attributes
+  (kilometres converted to metres), replacing a malformed request/response path
+  that returned no usable results.
+- **Connector hardening (second review pass)** across the ESRI, Google, HERE,
+  Mapbox, OSRM, and TomTom connectors — additional malformed-`200`-response
+  guards and coordinate-edge validation so every failure surfaces as a
+  `ConnectorError` rather than a raw `TypeError`.
+
+### Internal
+
+- `node:zlib` is externalised in the `size-limit` config (alongside
+  `node:crypto`) so the bundle-size CI gate resolves the Node built-in. No
+  runtime dependency is added — the zero-dependency guarantee is intact.
+
 ## [1.0.1] — 2026-07-20
 
 ### Changed
