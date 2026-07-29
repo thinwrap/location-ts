@@ -87,7 +87,6 @@ describe('MapboxGeocodingConnector', () => {
       expect(result.candidates).toHaveLength(1);
     });
 
-    // `countryFilter` → `country=` lowercase, comma-separated
     it('should translate countryFilter to lowercase country= comma list', async () => {
       mockFetch.mockResolvedValueOnce(buildV6Response());
 
@@ -255,6 +254,27 @@ describe('MapboxGeocodingConnector', () => {
       expect(params.get('access_token')).toBe('pk.test123');
     });
 
+    it('should map countryFilter to a lowercased country CSV', async () => {
+      mockFetch.mockResolvedValueOnce(buildSearchboxResponse());
+
+      await connector.autocomplete({
+        input: 'coffee',
+        countryFilter: ['IL', 'PS'],
+      });
+
+      const [url] = mockFetch.mock.calls[0]!;
+      expect(parseUrlParams(url as string).get('country')).toBe('il,ps');
+    });
+
+    it('should omit country when no countryFilter is given', async () => {
+      mockFetch.mockResolvedValueOnce(buildSearchboxResponse());
+
+      await connector.autocomplete({ input: 'coffee' });
+
+      const [url] = mockFetch.mock.calls[0]!;
+      expect(parseUrlParams(url as string).has('country')).toBe(false);
+    });
+
     // UUID session_token generated per call via crypto.randomUUID
     it('should generate a session_token via crypto.randomUUID per call', async () => {
       mockFetch.mockResolvedValueOnce(buildSearchboxResponse());
@@ -358,6 +378,8 @@ describe('MapboxGeocodingConnector', () => {
       expect(result.predictions[0]).toEqual({
         description: 'Blue Bottle Coffee, 66 Mint St, San Francisco, CA',
         placeId: 'id1',
+        // This fixture carries `name` but no `place_formatted`.
+        structuredFormat: { mainText: 'Blue Bottle' },
       });
       expect(result.predictions[1]!.description).toBe(
         'Sightglass Coffee, 270 7th St, San Francisco, CA',

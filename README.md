@@ -35,6 +35,100 @@ try {
 }
 ```
 
+## Routing options that cost money
+
+Three inputs exist because the cheap thing and the correct thing are not always the same
+request. All three default to the lean option; you opt up explicitly.
+
+| Option | Default | What it changes |
+|---|---|---|
+| `polylineQuality` | `'simplified'` | Geometry fidelity. `'detailed'` returned a **30x larger** polyline on Mapbox and **31x** on OSRM in measurement, with identical distances and durations. Honoured by Google/Mapbox/OSRM; silently ignored by HERE/TomTom/Esri, which expose no equivalent knob. |
+| `trafficMode` | `'none'` | Whether to route against live traffic. `'live'` selects a **Pro-tier SKU** on Google, so it is never enabled implicitly — not even by passing `departureTime`. |
+| `include` | `[]` | Which optional output fields to fetch. Each token maps 1:1 onto one optional result field. |
+
+```typescript
+const result = await routing.route({
+  waypoints,
+  trafficMode: 'live',                        // opt into traffic-aware routing
+  polylineQuality: 'detailed',                // opt into full geometry
+  include: ['durationWithoutTraffic'],        // opt into the extra output field
+});
+
+// Present only when requested AND returned natively — never synthesized, so its
+// absence tells you this provider did not supply it.
+const congestion =
+  result.totalDurationWithoutTrafficSeconds !== undefined
+    ? result.totalDurationSeconds - result.totalDurationWithoutTrafficSeconds
+    : undefined;
+```
+
+`durationWithoutTraffic` is native on Google (`staticDuration`), HERE (`baseDuration`) and
+TomTom (`noTrafficTravelTimeInSeconds`); Mapbox, OSRM and Esri do not return it, so the
+field stays absent there rather than being faked.
+
+## Autocomplete → place details
+
+`autocomplete()` returns predictions; `placeDetails()` resolves one into a full
+candidate. "Place details" and "geocode by place id" are the same vendor call on all
+five providers, so this is one operation, not two — and it returns an ordinary
+`IGeocodeCandidate` you can feed straight into whatever already consumes them.
+
+```typescript
+const geocoding = new Geocoding('google', { apiKey: process.env.GOOGLE_KEY! });
+
+const { predictions } = await geocoding.autocomplete({ input: 'blue bottle' });
+
+// Render the usual two-line suggestion without splitting `description` on a comma.
+for (const p of predictions) {
+  console.log(p.structuredFormat?.mainText ?? p.description);
+  console.log(p.structuredFormat?.secondaryText ?? '');
+}
+
+const { candidate } = await geocoding.placeDetails({ placeId: predictions[0]!.placeId! });
+console.log(candidate.location); // → { lat, lng }
+```
+
+`placeId` values are **provider-scoped** — a Google place id is meaningless to Mapbox.
+Use the same facade for both calls.
+
+### Two things that cost money here
+
+**Google's Place Details SKU is driven by the field mask**, so `name`
+(`displayName`) is a Pro-tier field and only requested behind an opt-in:
+
+```typescript
+await geocoding.placeDetails({ placeId, include: ['name'] });
+```
+
+Note this is the *opposite* of Compute Routes, whose SKU is driven by request
+*features* — the rule has to be checked per API rather than generalized.
+
+**Mapbox Search Box bills per session, not per request.** A `suggest` and the
+`retrieve` that follows count as one billable session only when they carry the same
+`session_token`; omitting it doubles the bill:
+
+```typescript
+const sessionToken = crypto.randomUUID();          // one per user interaction
+await mapbox.autocomplete({ input, _passthrough: { query: { session_token: sessionToken } } });
+await mapbox.placeDetails({ placeId, sessionToken });
+```
+
+The wrapper cannot generate or remember that token — it holds no state — so
+threading it through is the consumer's job.
+
+### `structuredFormat` support
+
+| Provider | `mainText` / `secondaryText` |
+|---|---|
+| Google | `structuredFormat.mainText` / `.secondaryText` — default-on, free |
+| Mapbox | `name` / `place_formatted` |
+| HERE | `title` / `address.label` — `secondaryText` absent for *query*-type suggestions, which carry no address |
+| TomTom | `poi.name` / `address.freeformAddress` — **absent for street results**, which have no `poi.name` |
+| Esri | not supported — returns a single flat `text` |
+
+It is **never synthesized**: an absent `structuredFormat` means the provider gave no
+distinct main part, and `description` remains the thing to render.
+
 ## Switching providers
 
 Change the provider ID and config; the input and output shape stay identical.
@@ -96,11 +190,39 @@ try {
       case 'unsupported_travel_mode': /* fall back to a supported travel mode */ break;
       case 'profile_not_configured':  /* compile the OSRM profile             */ break;
       case 'matrix_polling_timeout':  /* resume via e.cause.matrixId          */ break;
+      case 'no_route':                /* no route between these points        */ break;
+      case 'timeout':                 /* request exceeded the transport bound */ break;
       case 'unknown':                 /* fallback                             */ break;
     }
   } else throw e;
 }
 ```
+
+### `no_route` — "there is no route", normalized
+
+The providers agree on nothing here. Google answers HTTP **200** with the `routes` key
+absent; HERE 200 with `routes: []` plus a `notices[].code`; Mapbox `code: "NoRoute"` on
+either 200 or 422; OSRM the same codes on a **400**; TomTom a 400 with
+`detailedError.code`; Esri a 200 whose in-body `error.code: 400` names an **unlocated**
+stop in `details[]`. Branching on "no usable route" used to mean reimplementing all six.
+Now:
+
+```typescript
+if (e instanceof ConnectorError && e.providerCode === 'no_route') {
+  // Well-formed request, provider answered, no route exists. A business
+  // outcome — not a bug to fix and not worth retrying.
+}
+```
+
+In practice this almost always means *a waypoint could not be matched to the road
+network* rather than *the road network is disconnected*: every provider tested happily
+routes Reykjavik→Oslo via ferry.
+
+### `timeout`
+
+Requests carry a default 30-second bound so a hung provider cannot leave a promise
+pending forever. Timeout policy remains a BYO-transport concern — supply your own
+`fetch` with its own signal and it fires first.
 
 The wrapper performs no automatic retry. The `Retry-After` header (when present on
 HTTP 429) is surfaced via `e.cause.retryAfter` (raw header string) and the parsed
@@ -258,6 +380,23 @@ one line per call. Error handling and retry composition stay yours.
 - [`.ai/guidelines.md`](.ai/guidelines.md) — contributor entry point: how to add a connector.
 - [`.ai/ARCHITECTURE.md`](.ai/ARCHITECTURE.md) — 6 location-distinctive invariants.
 - [`.ai/CONVENTIONS.md`](.ai/CONVENTIONS.md) — naming, file layout, test patterns.
+
+## Security
+
+Report vulnerabilities **privately** — please do not open a public issue. Preferred: a
+[private security advisory](https://github.com/thinwrap/location-ts/security/advisories/new)
+on this repository. Alternatively, email **security@thinwrap.dev**. Include the affected
+versions and a minimal reproduction if you have one.
+
+A vulnerability in a *provider's* own API or service belongs to that vendor rather than
+to this wrapper — please report those upstream.
+
+Supply chain: releases are published to npm via GitHub Actions OIDC
+trusted-publishing with **Sigstore provenance attestation** — verify an installed copy
+with `npm audit signatures @thinwrap/location@<version>`. No long-lived npm publish
+token exists in this repository or its CI secrets, the publishing account requires
+two-factor authentication (TOTP, with npm's `auth-and-writes` setting), and CI consumes
+no external reusable workflows.
 
 ## License
 

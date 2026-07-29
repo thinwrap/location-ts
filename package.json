@@ -1,6 +1,6 @@
 {
   "name": "@thinwrap/location",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Lightweight, SDK-free location API wrapper for routing, distance matrix, geocoding, and isochrone across Google, Mapbox, HERE, ESRI, TomTom, and OSRM.",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",

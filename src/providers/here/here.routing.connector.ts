@@ -1,13 +1,19 @@
 import { BaseConnector } from '../../base/base.connector';
 import type {
   IRoutingConnector,
+  IRoutingLeg,
   IRoutingOptions,
   IRoutingResult,
   LatLng,
   ProviderCode,
 } from '../../types';
 import { ConnectorError } from '../../types';
-import { decodeFlexPolyline, encodePolyline, mergePassthrough } from '../../utils';
+import {
+  decodeFlexPolyline,
+  encodePolyline,
+  isCompleteWaypointOrder,
+  mergePassthrough,
+} from '../../utils';
 import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
 import type { HereConfig } from './here.config';
 import type {
@@ -79,7 +85,7 @@ export class HereRoutingConnector
       });
     }
 
-    // (isRoundTrip === true already threw above; it no longer contributes here.)
+    // `isRoundTrip` is absent by design — the guard above already threw for it.
     const useOptimization =
       options.optimize === true ||
       options.optimizeFixedOrigin === true ||
@@ -90,22 +96,12 @@ export class HereRoutingConnector
 
     if (useOptimization && waypoints.length > 2) {
       const sequence = await this.callFindSequence(waypoints, options);
-      // The returned sequence must be a permutation of [0..N-1] before it can
-      // be used to reorder waypoints; otherwise `waypoints[i]` may be undefined
-      // or a waypoint may be dropped/duplicated.
-      const n = waypoints.length;
-      const seen = new Array<boolean>(n).fill(false);
-      let validPermutation = sequence.length === n;
-      if (validPermutation) {
-        for (const i of sequence) {
-          if (!Number.isInteger(i) || i < 0 || i >= n || seen[i]) {
-            validPermutation = false;
-            break;
-          }
-          seen[i] = true;
-        }
-      }
-      if (!validPermutation) {
+      // The returned sequence must be a complete permutation of [0..N-1] before
+      // it can be used to reorder waypoints; otherwise `waypoints[i]` may be
+      // undefined or a waypoint may be dropped/duplicated. HERE is the one
+      // connector that throws rather than omitting the ordering, because the
+      // sequence also drives the waypoint order of the follow-up /routes call.
+      if (!isCompleteWaypointOrder(sequence, waypoints.length)) {
         throw new ConnectorError({
           message: 'HERE findsequence2 returned an invalid waypoint ordering',
           statusCode: null,
@@ -193,34 +189,67 @@ export class HereRoutingConnector
     }
     const route = data.routes?.[0];
     if (!route) {
+      // Live-verified: HERE answers an unroutable request with HTTP 200,
+      // `routes: []`, and a critical entry in `notices[]` (e.g.
+      // `couldNotMatchOrigin`). Surface the notice text so the caller sees WHY
+      // without having to dig through `cause`.
+      const notice = readHereNotice(data);
+      const providerMessage =
+        notice !== null
+          ? `HERE Routing returned no routes: ${notice}`
+          : 'HERE Routing returned no routes';
       throw new ConnectorError({
-        message: 'HERE Routing returned no routes',
+        message: providerMessage,
         statusCode: response.status,
-        providerCode: 'unknown',
-        providerMessage: 'HERE Routing returned no routes',
+        providerCode: 'no_route',
+        providerMessage,
         cause: data,
       });
     }
+
+    // HERE ships `baseDuration` inside the `summary` block already requested, so
+    // the opt-in costs nothing extra here — it only gates whether the field is
+    // surfaced, keeping the normalized shape identical across providers.
+    const wantsBaseDuration =
+      options.include?.includes('durationWithoutTraffic') === true;
 
     const allCoords: LatLng[] = [];
     const legs = (route.sections ?? []).map((section) => {
       if (typeof section.polyline === 'string' && section.polyline !== '') {
         allCoords.push(...decodeFlexPolyline(section.polyline));
       }
-      return {
+      const leg: IRoutingLeg = {
         distanceMeters: section.summary?.length ?? 0,
         durationSeconds: section.summary?.duration ?? 0,
       };
+      if (wantsBaseDuration && typeof section.summary?.baseDuration === 'number') {
+        leg.durationWithoutTrafficSeconds = section.summary.baseDuration;
+      }
+      return leg;
     });
 
     const totalDistanceMeters = legs.reduce((s, l) => s + l.distanceMeters, 0);
     const totalDurationSeconds = legs.reduce((s, l) => s + l.durationSeconds, 0);
+
+    // Summed from the sections HERE returned, matching how the traffic-aware
+    // totals above are derived — and only when every section carried the value,
+    // so a partial response omits the field rather than under-reporting it.
+    const baseDurations = legs.map((l) => l.durationWithoutTrafficSeconds);
+    const totalDurationWithoutTrafficSeconds =
+      wantsBaseDuration &&
+      baseDurations.length > 0 &&
+      baseDurations.every((d): d is number => typeof d === 'number')
+        ? baseDurations.reduce((a, b) => a + b, 0)
+        : undefined;
 
     return {
       legs,
       totalDistanceMeters,
       totalDurationSeconds,
       polyline: encodePolyline(allCoords),
+      ...(totalDurationWithoutTrafficSeconds !== undefined
+        ? { totalDurationWithoutTrafficSeconds }
+        : {}),
       raw: data,
     };
   }
@@ -244,7 +273,21 @@ export class HereRoutingConnector
       apiKey: this.config.apiKey,
       start: `${formatCoord(first.lat)},${formatCoord(first.lng)}`,
       end: `${formatCoord(last.lat)},${formatCoord(last.lng)}`,
-      mode: `fastest;${transportMode};traffic:disabled`,
+      // Two fixes in one string, deliberately split by cost:
+      //
+      // `tollroad:-3` — the toll modifier is FREE, so `avoidTolls` is honoured
+      // unconditionally. Without it the optimizer ordered waypoints as if tolls
+      // were fine and only the follow-up /routes call avoided them, so the
+      // ordering and the route disagreed.
+      //
+      // `traffic:` — enabling traffic on findsequence2 is BILLABLE, so it
+      // follows the explicit `trafficMode` opt-in and stays disabled by default.
+      mode: [
+        'fastest',
+        transportMode,
+        `traffic:${options.trafficMode === 'live' ? 'enabled' : 'disabled'}`,
+        ...(options.avoidTolls === true ? ['tollroad:-3'] : []),
+      ].join(';'),
     };
 
     if (options.departureTime) {
@@ -420,6 +463,31 @@ function mapTravelMode(mode?: 'driving' | 'walking' | 'cycling'): string {
     default:
       return 'car';
   }
+}
+
+/**
+ * Read the first critical `notices[]` entry from a HERE routing response.
+ *
+ * Live-verified shape: an unroutable request returns HTTP 200 with
+ * `{ routes: [], notices: [{ title, code, severity }] }` — e.g.
+ * `couldNotMatchOrigin` / severity `critical`. The notice is the only statement
+ * of *why*, so it is woven into `providerMessage`; the full array stays in
+ * `cause`.
+ */
+function readHereNotice(data: unknown): string | null {
+  if (data === null || typeof data !== 'object') return null;
+  const notices = (data as { notices?: unknown }).notices;
+  if (!Array.isArray(notices)) return null;
+  for (const notice of notices) {
+    if (notice === null || typeof notice !== 'object') continue;
+    const n = notice as { code?: unknown; title?: unknown };
+    const code = typeof n.code === 'string' && n.code !== '' ? n.code : null;
+    const title = typeof n.title === 'string' && n.title !== '' ? n.title : null;
+    if (code !== null && title !== null) return `${title} (${code})`;
+    if (title !== null) return title;
+    if (code !== null) return code;
+  }
+  return null;
 }
 
 function buildAvoidFeatures(options: IRoutingOptions): string {

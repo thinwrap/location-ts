@@ -13,10 +13,12 @@ const ALL_PROVIDER_CODES: ProviderCode[] = [
   'unsupported_travel_mode',
   'profile_not_configured',
   'matrix_polling_timeout',
+  'no_route',
+  'timeout',
 ];
 
 describe('ConnectorError', () => {
-  it('accepts each of the 11 ProviderCode values', () => {
+  it('accepts each of the 13 ProviderCode values', () => {
     for (const code of ALL_PROVIDER_CODES) {
       const err = new ConnectorError({ statusCode: 400, providerCode: code });
       expect(err.providerCode).toBe(code);

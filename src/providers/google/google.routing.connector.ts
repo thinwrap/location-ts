@@ -1,8 +1,13 @@
 import { BaseConnector } from '../../base/base.connector';
-import type { IRoutingConnector, IRoutingOptions, IRoutingResult } from '../../types';
+import type {
+  IRoutingConnector,
+  IRoutingLeg,
+  IRoutingOptions,
+  IRoutingResult,
+} from '../../types';
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
-import { mergePassthrough } from '../../utils';
+import { isCompleteWaypointOrder, mergePassthrough } from '../../utils';
 import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { GoogleConfig } from './google.config';
 import type { GoogleRoutesResponse } from './google.types';
@@ -10,20 +15,12 @@ import type { GoogleRoutesResponse } from './google.types';
 const ROUTES_URL = 'https://routes.googleapis.com/directions/v2:computeRoutes';
 
 /**
- * Google Routes v2 connector — per-connector template.
+ * Google Routes v2 connector.
  *
  * POSTs to https://routes.googleapis.com/directions/v2:computeRoutes with
  * `X-Goog-Api-Key` and `X-Goog-FieldMask` headers, normalizing the response
  * to {@link IRoutingResult} (meters, seconds, Google precision-5 polyline).
  * No retry, no caching, no stateful behaviour.
- *
- * Subsequent per-connector stories (1.7–1.29) follow this body shape:
- * 1. Build vendor body.
- * 2. {@link mergePassthrough} body / headers / query.
- * 3. Call {@link BaseConnector.sendPostJson} (or sendGet/sendPostForm).
- * 4. On non-2xx, parse body + raise {@link ConnectorError} with
- * {@link mapVendorError} ProviderCode + Retry-After surfacing by design.
- * 5. Normalize 2xx body into the operation result DTO.
  */
 export class GoogleRoutingConnector
   extends BaseConnector
@@ -76,15 +73,24 @@ export class GoogleRoutingConnector
       destination,
       travelMode,
       polylineEncoding: 'ENCODED_POLYLINE',
+      // OVERVIEW is Google's own default; naming it explicitly makes the
+      // normalized default visible in the request and lets 'detailed' opt up.
+      polylineQuality:
+        options.polylineQuality === 'detailed' ? 'HIGH_QUALITY' : 'OVERVIEW',
     };
 
     // Google rejects `routingPreference` for WALK/BICYCLE ("Routing preference
     // cannot be set for WALK or BICYCLE routing mode.") — only DRIVE and
     // TWO_WHEELER accept it. Overridable via `_passthrough.body`.
+    //
+    // `TRAFFIC_AWARE` is a **Pro-tier SKU feature** on Compute Routes while the
+    // base tier is Essentials, so it is driven by the explicit `trafficMode`
+    // opt-in and NOT by the presence of `departureTime` — deriving it from a
+    // departure time would silently move a caller onto Pro pricing for asking
+    // about a future trip.
     if (travelMode === 'DRIVE' || travelMode === 'TWO_WHEELER') {
-      body.routingPreference = options.departureTime
-        ? 'TRAFFIC_AWARE'
-        : 'TRAFFIC_UNAWARE';
+      body.routingPreference =
+        options.trafficMode === 'live' ? 'TRAFFIC_AWARE' : 'TRAFFIC_UNAWARE';
     }
 
     if (intermediates.length > 0) {
@@ -117,14 +123,20 @@ export class GoogleRoutingConnector
       };
     }
 
+    // Google's field mask is mandatory AND governs the response size, so it is
+    // built from what the caller actually asked for.
+    const wantsStaticDuration =
+      options.include?.includes('durationWithoutTraffic') === true;
+
     const fieldMask = [
       'routes.legs.distanceMeters',
       'routes.legs.duration',
-      'routes.legs.staticDuration',
       'routes.distanceMeters',
       'routes.duration',
-      'routes.staticDuration',
       'routes.polyline.encodedPolyline',
+      ...(wantsStaticDuration
+        ? ['routes.legs.staticDuration', 'routes.staticDuration']
+        : []),
       ...(reorder ? ['routes.optimizedIntermediateWaypointIndex'] : []),
     ].join(',');
 
@@ -172,19 +184,29 @@ export class GoogleRoutingConnector
     }
     const route = data.routes?.[0];
     if (!route) {
+      // Google signals "no route exists" as HTTP 200 with an empty `routes[]`,
+      // not as an error status.
       throw new ConnectorError({
         message: 'Google Routing returned no routes',
         statusCode: response.status,
-        providerCode: 'unknown',
+        providerCode: 'no_route',
         providerMessage: 'Google Routing returned no routes',
         cause: data,
       });
     }
 
-    const legs = (route.legs ?? []).map((leg) => ({
-      distanceMeters: leg.distanceMeters ?? 0,
-      durationSeconds: parseDuration(leg.duration ?? '0s'),
-    }));
+    const legs = (route.legs ?? []).map((leg) => {
+      const normalized: IRoutingLeg = {
+        distanceMeters: leg.distanceMeters ?? 0,
+        durationSeconds: parseDuration(leg.duration ?? '0s'),
+      };
+      // Only when asked for AND actually returned — never synthesized from
+      // `duration`, so absence stays meaningful.
+      if (wantsStaticDuration && typeof leg.staticDuration === 'string') {
+        normalized.durationWithoutTrafficSeconds = parseDuration(leg.staticDuration);
+      }
+      return normalized;
+    });
 
     // Canonical `waypointOrder` = full visiting sequence of INPUT indices.
     // Google reports `optimizedIntermediateWaypointIndex` — the optimized
@@ -194,13 +216,23 @@ export class GoogleRoutingConnector
     // trip Google treats every non-origin waypoint as an intermediate, so the
     // origin plus the projected intermediates already cover all input indices
     // and no separate destination is appended.
+    //
+    // Google does not always return real indices: when it declines to optimize
+    // it answers `[-1]`, which projects to `[0, 0, N-1]` — a corrupt ordering
+    // that duplicates the origin and drops a waypoint. Validate the projection
+    // and omit it unless it is a complete permutation.
     let waypointOrder: number[] | undefined;
     const optimizedIntermediates = route.optimizedIntermediateWaypointIndex;
     if (Array.isArray(optimizedIntermediates)) {
-      const projected = optimizedIntermediates.map((i) => i + 1);
-      waypointOrder = options.isRoundTrip
+      const projected = optimizedIntermediates.map((i) =>
+        typeof i === 'number' ? i + 1 : i,
+      );
+      const candidate = options.isRoundTrip
         ? [0, ...projected]
         : [0, ...projected, waypoints.length - 1];
+      if (isCompleteWaypointOrder(candidate, waypoints.length)) {
+        waypointOrder = candidate;
+      }
     }
 
     return {
@@ -209,13 +241,19 @@ export class GoogleRoutingConnector
       totalDurationSeconds: parseDuration(route.duration ?? '0s'),
       polyline: route.polyline?.encodedPolyline ?? '',
       ...(waypointOrder !== undefined ? { waypointOrder } : {}),
+      ...(wantsStaticDuration && typeof route.staticDuration === 'string'
+        ? {
+            totalDurationWithoutTrafficSeconds: parseDuration(route.staticDuration),
+          }
+        : {}),
       raw: data,
     };
   }
 
   /**
-   * Map (HTTP status, decoded body) → canonical {@link ProviderCode}. Per
-   * (per-connector locality). */
+   * Map (HTTP status, decoded body) → canonical {@link ProviderCode}. Lives on the
+   * connector rather than in `BaseConnector`: error translation is per-provider.
+   */
   private mapVendorError(httpStatus: number, body: unknown): ProviderCode {
     // Prefer the structured google.rpc.ErrorInfo reason (robust) over the HTTP
     // status: Google returns 400 INVALID_ARGUMENT for an invalid key, which the

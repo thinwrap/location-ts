@@ -3,31 +3,26 @@ import type { LatLng } from './coordinate.type';
 import type { Passthrough } from './passthrough.type';
 
 /**
- * Isochrone input options. **LOCKED AT v1.0.**
+ * Isochrone input options.
  *
  * A consumer can compute an isochrone via
  * `new Isochrone(providerId, cfg).isochrone(input)`.
  *
- * Honesty corrections applied at v1.0:
+ * Two shape decisions follow from the ≥90% baseline rule:
  *
- * `departureTime` is promoted to the base shape because all 4
- *   Isochrone providers (Mapbox, HERE, ESRI, TomTom) support a
- *   departure-time-conditioned isochrone natively.
- * base `travelMode` is narrowed to `'driving' | 'walking'`
- *   only — `'cycling'` is **demoted to provider-narrowed** because only 2/4
- *   providers (Mapbox, TomTom) have native bicycle support. The Mapbox and
- *   TomTom per-connector files augment {@link IsochroneOptionsMap} to add
- *   `'cycling'` back for those two providers.
+ * - `departureTime` is on the base shape because all four isochrone providers
+ *   (Mapbox, HERE, ESRI, TomTom) condition on a departure time natively.
+ * - `travelMode` is only `'driving' | 'walking'`, because just two of the four
+ *   (Mapbox, TomTom) have native bicycle support. Those two widen it back to
+ *   include `'cycling'` via {@link IsochroneOptionsMap}.
  *
- * The 4-value cap (Mapbox's native ceiling) is enforced at runtime
- * via `validateIsochroneCap` rather than in the type — TS cannot express
- * "array of at most 4 items" cleanly, and lifting the cap to the type would
- * defeat the purpose of letting callers provide a dynamic `values` array.
+ * The 4-value cap (Mapbox's native ceiling) is enforced at runtime via
+ * `validateIsochroneCap` rather than in the type: TS cannot express "array of at
+ * most 4 items" without forcing callers to build a tuple, which defeats passing a
+ * dynamic `values` array.
  *
  * Per-provider augmentation: providers may extend this via
  * {@link IsochroneOptionsMap} (TS module augmentation).
- *
- * Changing any field shape post-v1.0 requires a major version bump.
  *
  * @see IsochroneOptionsMap
  * @see IsochroneOptionsFor
@@ -58,15 +53,13 @@ export interface IIsochroneOptions {
 }
 
 /**
- * A single isochrone contour — one polygon per requested break. **LOCKED AT v1.0.**
+ * A single isochrone contour — one polygon per requested break.
  *
  * `value` matches the corresponding `IIsochroneOptions.values[i]` in the same
  * unit (seconds for `'time'`, meters for `'distance'`).
  *
  * `geometry` is a standard GeoJSON Polygon (`{ type: 'Polygon', coordinates:
  * number[][][] }`) with a closed outer ring (first and last coordinate equal).
- *
- * Changing any field shape post-v1.0 requires a major version bump.
  */
 export interface IIsochroneContour {
   value: number;
@@ -74,7 +67,7 @@ export interface IIsochroneContour {
 }
 
 /**
- * Normalized Isochrone result. **LOCKED AT v1.0.**
+ * Normalized Isochrone result.
  *
  * `contours` is sorted by `value` ascending so callers can rely on
  * `contours[0]` being the smallest break.
@@ -88,8 +81,6 @@ export interface IIsochroneContour {
  * per value). When `_meta` is present, `_meta.requestCount` is that call count
  * (>1). Any path fulfilled in a single HTTP call omits the `_meta` key
  * entirely (cross-language convergence with the PHP sibling).
- *
- * Changing any field shape post-v1.0 requires a major version bump.
  */
 export interface IIsochroneResult {
   contours: IIsochroneContour[];
@@ -99,14 +90,12 @@ export interface IIsochroneResult {
 
 /**
  * Internal connector contract implemented by every per-provider Isochrone
- * connector class (e.g. `MapboxIsochroneConnector`). **LOCKED AT v1.0.**
+ * connector class (e.g. `MapboxIsochroneConnector`).
  *
  * `providerId` is intentionally typed as `string` rather than
  * `IsochroneProvider` so that bring-your-own-connector consumers can pass a
  * custom provider id. Per-connector classes narrow it via
  * `readonly providerId = 'mapbox';`.
- *
- * Changing any field shape post-v1.0 requires a major version bump.
  */
 export interface IIsochroneConnector {
   readonly providerId: string;
@@ -116,21 +105,19 @@ export interface IIsochroneConnector {
 /**
  * Provider-specific Isochrone input augmentations.
  *
- * Each per-connector file may augment this interface via TS
- * module augmentation in its `src/providers/<id>/<id>.types.ts` file.
- * Providers that don't augment fall back to {@link IIsochroneOptions} via
- * {@link IsochroneOptionsFor}.
+ * Mapbox and TomTom widen `travelMode` to include `'cycling'`; HERE and ESRI stay
+ * at the base `'driving' | 'walking'` and are absent from this map, falling back to
+ * {@link IIsochroneOptions} via {@link IsochroneOptionsFor}.
  *
- * Mapbox and TomTom augment this map
- * to widen `travelMode` to include `'cycling'`. HERE and ESRI do NOT
- * augment; their narrowed type stays at base `'driving' | 'walking'`.
+ * The declaration must live in the provider's `<id>.config.ts` — see
+ * {@link AutocompleteOptionsMap} in `geocoding.interface.ts` for why declaring it in
+ * `<id>.types.ts` makes it invisible to consumers.
  *
- * @example Mapbox augments to re-add cycling:
+ * @example `src/providers/mapbox/mapbox.config.ts`:
  * ```ts
- * // src/providers/mapbox/mapbox.types.ts
  * declare module '../../types/isochrone.interface' {
  *   interface IsochroneOptionsMap {
- *     mapbox: Omit<IIsochroneOptions, 'travelMode'> & {
+ *     mapbox: Omit<import('../../types').IIsochroneOptions, 'travelMode'> & {
  *       travelMode?: 'driving' | 'walking' | 'cycling';
  *     };
  *   }
@@ -139,7 +126,7 @@ export interface IIsochroneConnector {
  */
 // eslint-disable-next-line @typescript-eslint/no-empty-object-type
 export interface IsochroneOptionsMap {
-  // Augmented per-provider via TS module augmentation. Empty here at v1.0.
+  // Mapbox and TomTom add their keys from their `*.config.ts` modules.
 }
 
 /**
@@ -147,9 +134,8 @@ export interface IsochroneOptionsMap {
  * {@link IIsochroneOptions} when the provider hasn't augmented
  * {@link IsochroneOptionsMap}.
  *
- * At v1.0 with no per-provider augmentations, `IsochroneOptionsFor<P>` for
- * HERE/ESRI resolves to `IIsochroneOptions`. Mapbox/TomTom augment to widen
- * `travelMode`.
+ * So `IsochroneOptionsFor<'here'>` is `IIsochroneOptions`, while
+ * `IsochroneOptionsFor<'mapbox'>` also accepts `travelMode: 'cycling'`.
  */
 export type IsochroneOptionsFor<P extends string> = P extends keyof IsochroneOptionsMap
   ? IsochroneOptionsMap[P]

@@ -47,6 +47,11 @@ export interface MapboxGeocodingV6Feature {
   properties?: {
     mapbox_id?: string;
     full_address?: string;
+    /**
+     * The POI/street name distinct from the full address. Returned by Search Box
+     * `retrieve`; absent on plain Geocoding v6 features.
+     */
+    name?: string;
     /** v6 viewport: `[west, south, east, north]` (lng/lat pairs). */
     bbox?: [number, number, number, number];
   };
@@ -67,6 +72,11 @@ export interface MapboxSearchboxSuggestion {
   name?: string;
   full_address?: string;
   mapbox_id?: string;
+  /**
+   * The address portion without the `name` — Search Box's secondary display line,
+   * and the source of `structuredFormat.secondaryText`.
+   */
+  place_formatted?: string;
 }
 
 export interface MapboxSearchboxSuggestResponse {
@@ -87,22 +97,8 @@ export interface MapboxIsochroneResponse {
   }>;
 }
 
-// --------------------------------------------------------------------------
-// IsochroneOptionsMap augmentation
-//
-// the base `IIsochroneOptions.travelMode` is narrowed to
-// `'driving' | 'walking'`. Mapbox is 1 of 2 providers (alongside TomTom) with
-// native bicycle support, so it widens `travelMode` back to include
-// `'cycling'` here via TypeScript module augmentation. HERE and ESRI do not
-// augment — their narrowed type stays at base.
-// --------------------------------------------------------------------------
-
-import type { IIsochroneOptions } from '../../types';
-
-declare module '../../types/isochrone.interface' {
-  interface IsochroneOptionsMap {
-    mapbox: Omit<IIsochroneOptions, 'travelMode'> & {
-      travelMode?: 'driving' | 'walking' | 'cycling';
-    };
-  }
-}
+// Mapbox's INPUT augmentations (`sessionToken`, and widening the isochrone
+// `travelMode` back to include `'cycling'`) deliberately do NOT live here — see
+// `mapbox.config.ts`. A `declare module` block only applies if its file is part of
+// the consumer's compilation, and nothing in the emitted type graph imports this
+// module, so an augmentation here is invisible from the published package.

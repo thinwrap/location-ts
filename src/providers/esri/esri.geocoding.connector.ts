@@ -2,6 +2,8 @@ import { BaseConnector } from '../../base/base.connector';
 import type {
   IAutocompleteOptions,
   IAutocompleteResult,
+  IPlaceDetailsOptions,
+  IPlaceDetailsResult,
   IGeocodeCandidate,
   IGeocodeOptions,
   IGeocodeResult,
@@ -29,9 +31,8 @@ const SUGGEST_URL =
   'https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/suggest';
 
 /**
- * ESRI (ArcGIS) World Geocoding Service connector — per-connector template
- * (ESRI Routing and 1.16 ESRI Matrix for the
- * dual-auth + 200-with-error-body + mapVendorError patterns).
+ * ESRI (ArcGIS) World Geocoding Service connector. Shares ESRI's dual-auth and
+ * 200-with-error-body handling with the Routing and Matrix connectors.
  *
  * **Three endpoints under `GeocodeServer/`:**
  * - `findAddressCandidates` for forward geocoding (multi-result natively).
@@ -98,9 +99,9 @@ export class EsriGeocodingConnector
     );
 
     return {
-      candidates: (data.candidates ?? []).map((c) =>
-        this.normalizeForwardCandidate(c),
-      ),
+      candidates: (data.candidates ?? [])
+        .map((c) => this.normalizeForwardCandidate(c))
+        .filter((c): c is IGeocodeCandidate => c !== null),
       raw: data,
     };
   }
@@ -146,11 +147,18 @@ export class EsriGeocodingConnector
     // wrap: 1 element. `placeId` is `undefined` because reverseGeocode
     // lacks a stable opaque ID; `viewport` is `undefined` because ESRI's
     // reverse endpoint does not return an `extent`.
+    // No coordinates means no usable candidate — never a fabricated (0,0).
+    const y = data.location?.y;
+    const x = data.location?.x;
+    if (typeof y !== 'number' || typeof x !== 'number') {
+      return { candidates: [], raw: data };
+    }
+
     return {
       candidates: [
         {
           formattedAddress,
-          location: { lat: data.location.y, lng: data.location.x },
+          location: { lat: y, lng: x },
         },
       ],
       raw: data,
@@ -171,6 +179,11 @@ export class EsriGeocodingConnector
 
     if (options.location !== undefined) {
       baseQuery.location = `${formatCoord(options.location.lng)},${formatCoord(options.location.lat)}`;
+    }
+    // `countryFilter` → `countryCode` (comma-joined alpha-2; ESRI uses alpha-2
+    // directly), same translation as forward geocode.
+    if (options.countryFilter !== undefined && options.countryFilter.length > 0) {
+      baseQuery.countryCode = options.countryFilter.join(',');
     }
 
     const data = await this.dispatchGet<EsriSuggestResponse>(
@@ -197,6 +210,53 @@ export class EsriGeocodingConnector
    * {@link EsriGeocodingConnector.raiseHttpError} /
    * {@link EsriGeocodingConnector.raiseBodyError}.
    */
+  /**
+   * Resolve an Esri `magicKey` (from `autocomplete()`) to a full candidate.
+   *
+   * `GET .../findAddressCandidates?magicKey=` — the same endpoint as forward
+   * geocode, so the same normalizer applies.
+   *
+   * **Live-verified that `magicKey` alone is sufficient.** Esri's docs pair it
+   * with the original `SingleLine` text, and the plan here originally did too;
+   * probing showed the key on its own resolves to the byte-identical candidate.
+   * That is why `placeId` needs no companion field and Esri needs no narrowed
+   * input — our `placeId` IS the magicKey.
+   */
+  async placeDetails(options: IPlaceDetailsOptions): Promise<IPlaceDetailsResult> {
+    const baseQuery: Record<string, string> = {
+      f: 'json',
+      token: resolveEsriBearerToken(this.config),
+      magicKey: options.placeId,
+      outFields: '*',
+    };
+    if (options.language !== undefined) {
+      baseQuery.langCode = options.language;
+    }
+
+    const data = await this.dispatchGet<EsriGeocodeResponse>(
+      GEOCODE_URL,
+      baseQuery,
+      options._passthrough,
+      'ESRI place details failed',
+    );
+
+    const first = data.candidates?.[0];
+    const candidate = first !== undefined ? this.normalizeForwardCandidate(first) : null;
+    if (candidate === null) {
+      throw new ConnectorError({
+        message: 'ESRI Place Details returned no candidate',
+        statusCode: null,
+        providerCode: 'no_route',
+        providerMessage: 'ESRI Place Details returned no candidate',
+        cause: data,
+      });
+    }
+
+    // Esri returns only an address — there is no separate display name to
+    // surface, so `name` stays absent even when requested.
+    return { candidate, raw: data };
+  }
+
   private async dispatchGet<T extends { error?: { message: string; code: number } }>(
     url: string,
     baseQuery: Record<string, string>,
@@ -259,10 +319,18 @@ export class EsriGeocodingConnector
    */
   private normalizeForwardCandidate(
     c: EsriGeocodeResponse['candidates'][number],
-  ): IGeocodeCandidate {
+  ): IGeocodeCandidate | null {
+    // Skip a candidate without real coordinates rather than emitting a fabricated
+    // (0,0) location or letting a missing `location` surface as a raw TypeError.
+    const y = c.location?.y;
+    const x = c.location?.x;
+    if (typeof y !== 'number' || typeof x !== 'number') {
+      return null;
+    }
+
     const candidate: IGeocodeCandidate = {
       formattedAddress: c.address,
-      location: { lat: c.location.y, lng: c.location.x },
+      location: { lat: y, lng: x },
     };
 
     if (c.extent !== undefined && c.extent !== null) {

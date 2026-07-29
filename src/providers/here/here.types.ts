@@ -7,6 +7,12 @@ export interface HereRouteResponse {
       summary: {
         length: number;
         duration: number;
+        /**
+         * Traffic-free duration. HERE ships it inside `summary` (no extra
+         * `return=` value needed), but it is only surfaced when the caller opts
+         * in via `include: ['durationWithoutTraffic']`.
+         */
+        baseDuration?: number;
       };
     }>;
   }>;
@@ -24,16 +30,10 @@ export interface HereSequenceResponse {
 }
 
 /**
- * HERE Routing v8 supports a richer set of vehicle classes than the base
- * {@link IRoutingOptions.travelMode}. Per (canonical example) and
- * of, HERE narrows `RoutingOptionsMap['here']` to add an
- * optional `transportMode` field carrying these extra modes.
- *
- * When set on input, `transportMode` overrides the base `travelMode` mapping
- * inside the connector.
+ * The vehicle classes HERE Routing v8 accepts beyond the three the base
+ * {@link IRoutingOptions.travelMode} carries.
  *
  * @see HereRoutingOptions
- * @see RoutingOptionsMap
  */
 export type HereTransportMode =
   | 'car'
@@ -53,11 +53,10 @@ export interface HereRoutingOptions extends IRoutingOptions {
   transportMode?: HereTransportMode;
 }
 
-declare module '../../types/routing.interface' {
-  interface RoutingOptionsMap {
-    here: HereRoutingOptions;
-  }
-}
+// The `RoutingOptionsMap` augmentation binding `here` to `HereRoutingOptions`
+// deliberately does NOT live here — see `here.config.ts`. A `declare module` block
+// only applies if its file is part of the consumer's compilation, and nothing in
+// the emitted type graph imports this module.
 
 export interface HereMatrixResponse {
   matrix: {

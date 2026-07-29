@@ -6,6 +6,9 @@ import type {
   IReverseGeocodeOptions,
   IReverseGeocodeResult,
   IAutocompleteOptions,
+  IAutocompletePrediction,
+  IPlaceDetailsOptions,
+  IPlaceDetailsResult,
   IAutocompleteResult,
   IGeocodeCandidate,
 } from '../../types';
@@ -23,6 +26,7 @@ import type {
 const GEOCODE_URL = 'https://geocode.search.hereapi.com/v1/geocode';
 const REVGEOCODE_URL = 'https://revgeocode.search.hereapi.com/v1/revgeocode';
 const AUTOSUGGEST_URL = 'https://autosuggest.search.hereapi.com/v1/autosuggest';
+const LOOKUP_URL = 'https://lookup.search.hereapi.com/v1/lookup';
 
 /**
  * Complete ISO 3166-1 alpha-2 → alpha-3 country code translation.
@@ -98,6 +102,40 @@ export class HereGeocodingConnector
     super(fetchImpl);
   }
 
+  /**
+   * `countryFilter` (alpha-2) → HERE's `in=countryCode:<alpha-3 CSV>` value.
+   *
+   * Shared by `geocode` and `autocomplete` so the two cannot drift on which
+   * codes they accept. Returns `undefined` when there is nothing to filter on,
+   * which keeps "no country filter" distinguishable from "an empty one".
+   */
+  private toCountryCodeFilter(
+    countryFilter: string[] | undefined,
+  ): string | undefined {
+    if (countryFilter === undefined || countryFilter.length === 0) {
+      return undefined;
+    }
+
+    const alpha3: string[] = [];
+    for (const code of countryFilter) {
+      // Skip empty/whitespace-only entries gracefully rather than emitting a
+      // confusing "mapping unavailable for " error.
+      if (typeof code !== 'string' || code.trim() === '') continue;
+      const mapped = ISO_ALPHA2_TO_ALPHA3[code.toUpperCase()];
+      if (mapped === undefined) {
+        throw new ConnectorError({
+          message: `HERE country code mapping unavailable for ${code}; please use _passthrough.query.in to pass HERE's alpha-3 directly.`,
+          statusCode: null,
+          providerCode: 'invalid_request',
+          providerMessage: `HERE country code mapping unavailable for ${code}; please use _passthrough.query.in to pass HERE's alpha-3 directly.`,
+        });
+      }
+      alpha3.push(mapped);
+    }
+
+    return alpha3.length > 0 ? `countryCode:${alpha3.join(',')}` : undefined;
+  }
+
   async geocode(options: IGeocodeOptions): Promise<IGeocodeResult> {
     const baseQuery: Record<string, string> = {
       q: options.address,
@@ -106,27 +144,9 @@ export class HereGeocodingConnector
 
     if (options.language) baseQuery.lang = options.language;
 
-    if (options.countryFilter && options.countryFilter.length > 0) {
-      // alpha-2 → alpha-3 translation; unmapped codes raise.
-      const alpha3: string[] = [];
-      for (const code of options.countryFilter) {
-        // Skip empty/whitespace-only entries gracefully rather than emitting a
-        // confusing "mapping unavailable for " error.
-        if (typeof code !== 'string' || code.trim() === '') continue;
-        const mapped = ISO_ALPHA2_TO_ALPHA3[code.toUpperCase()];
-        if (mapped === undefined) {
-          throw new ConnectorError({
-            message: `HERE country code mapping unavailable for ${code}; please use _passthrough.query.in to pass HERE's alpha-3 directly.`,
-            statusCode: null,
-            providerCode: 'invalid_request',
-            providerMessage: `HERE country code mapping unavailable for ${code}; please use _passthrough.query.in to pass HERE's alpha-3 directly.`,
-          });
-        }
-        alpha3.push(mapped);
-      }
-      if (alpha3.length > 0) {
-        baseQuery.in = `countryCode:${alpha3.join(',')}`;
-      }
+    const countryCodeFilter = this.toCountryCodeFilter(options.countryFilter);
+    if (countryCodeFilter !== undefined) {
+      baseQuery.in = countryCodeFilter;
     }
 
     const merged = mergePassthrough(
@@ -157,7 +177,9 @@ export class HereGeocodingConnector
       });
     }
     return {
-      candidates: (data.items ?? []).map((item) => normalizeCandidate(item)),
+      candidates: (data.items ?? [])
+        .map((item) => normalizeCandidate(item))
+        .filter((c): c is IGeocodeCandidate => c !== null),
       raw: data,
     };
   }
@@ -207,7 +229,9 @@ export class HereGeocodingConnector
     // reverse-geocode mirrors forward shape — return all candidates,
     // not just the first result.
     return {
-      candidates: (data.items ?? []).map((item) => normalizeCandidate(item)),
+      candidates: (data.items ?? [])
+        .map((item) => normalizeCandidate(item))
+        .filter((c): c is IGeocodeCandidate => c !== null),
       raw: data,
     };
   }
@@ -235,6 +259,8 @@ export class HereGeocodingConnector
       }
     }
 
+    const countryCodeFilter = this.toCountryCodeFilter(options.countryFilter);
+
     const merged = mergePassthrough(
       {} as Record<string, unknown>,
       {},
@@ -242,10 +268,37 @@ export class HereGeocodingConnector
       baseQuery,
     );
 
-    const response = await this.sendGet(AUTOSUGGEST_URL, {
-      headers: merged.headers,
-      query: merged.query,
-    });
+    // Autosuggest is the one HERE endpoint that mandates a search context:
+    // exactly one of `at`, `in=circle` or `in=bbox`, and a country filter has to
+    // accompany one of them. Without it HERE rejects the request, so fail here
+    // with something actionable instead of relaying a vendor 400. Checked after
+    // the merge so a consumer supplying their own `in=bbox:` still satisfies it.
+    if (!merged.query.at && !merged.query.in) {
+      const message =
+        'HERE Autosuggest requires a search context: pass `location` (optionally with `radius`), or supply one via _passthrough.query.at / _passthrough.query.in.';
+      throw new ConnectorError({
+        message,
+        statusCode: null,
+        providerCode: 'invalid_request',
+        providerMessage: message,
+      });
+    }
+
+    // The country filter rides ALONGSIDE the spatial context rather than
+    // replacing it, and HERE spells both as `in`. URLSearchParams keeps the pair
+    // via .append (NOT .set), the same way repeated `via` works on routing.
+    const urlParams = new URLSearchParams();
+    for (const [key, val] of Object.entries(merged.query)) {
+      urlParams.append(key, val);
+    }
+    if (countryCodeFilter !== undefined) {
+      urlParams.append('in', countryCodeFilter);
+    }
+
+    const response = await this.sendGet(
+      `${AUTOSUGGEST_URL}?${urlParams.toString()}`,
+      { headers: merged.headers },
+    );
 
     if (!response.ok) {
       throw await this.raiseHttpError(response, 'HERE Autosuggest');
@@ -264,10 +317,25 @@ export class HereGeocodingConnector
       });
     }
     return {
-      predictions: (data.items ?? []).map((item) => ({
-        description: item.title,
-        placeId: item.id,
-      })),
+      predictions: (data.items ?? []).map((item) => {
+        const prediction: IAutocompletePrediction = {
+          description: item.title,
+          placeId: item.id,
+        };
+        // HERE's *query*-type suggestions carry a title but no address at all, so
+        // `secondaryText` is omitted rather than emitted as an empty string a UI
+        // would render as a blank second line.
+        if (typeof item.title === 'string' && item.title !== '') {
+          const label = item.address?.label;
+          prediction.structuredFormat = {
+            mainText: item.title,
+            ...(typeof label === 'string' && label !== ''
+              ? { secondaryText: label }
+              : {}),
+          };
+        }
+        return prediction;
+      }),
       raw: data,
     };
   }
@@ -312,6 +380,65 @@ export class HereGeocodingConnector
    * Parse the response body + raise a {@link ConnectorError} for non-2xx. The
    * cause object merges in Retry-After when present by design (no structured retry field).
    */
+  /**
+   * Resolve a HERE place id to a full candidate.
+   *
+   * `GET https://lookup.search.hereapi.com/v1/lookup?id=` — the same normalizer as
+   * geocode, since HERE returns one `items[]`-shaped entry.
+   */
+  async placeDetails(options: IPlaceDetailsOptions): Promise<IPlaceDetailsResult> {
+    const query: Record<string, string> = {
+      apiKey: this.config.apiKey,
+      id: options.placeId,
+    };
+    if (options.language !== undefined) {
+      query.lang = options.language;
+    }
+
+    const merged = mergePassthrough({}, {}, options._passthrough, query);
+    const response = await this.sendGet(LOOKUP_URL, {
+      headers: merged.headers,
+      query: merged.query,
+    });
+
+    if (!response.ok) {
+      throw await this.raiseHttpError(response, 'HERE Place Details');
+    }
+
+    const data = (await response.json().catch(() => null)) as HereGeocodeItem | null;
+    if (data === null) {
+      throw new ConnectorError({
+        message: 'HERE Place Details returned a malformed response body',
+        statusCode: response.status,
+        providerCode: 'unknown',
+        providerMessage: 'HERE Place Details returned a malformed response body',
+        cause: data,
+      });
+    }
+
+    const candidate = normalizeCandidate(data);
+    if (candidate === null) {
+      throw new ConnectorError({
+        message: 'HERE Place Details returned no position',
+        statusCode: response.status,
+        providerCode: 'no_route',
+        providerMessage: 'HERE Place Details returned no position',
+        cause: data,
+      });
+    }
+
+    const wantsName = options.include?.includes('name') === true;
+    return {
+      candidate,
+      // HERE's `title` is the display name; free, but still gated so the shape
+      // matches every other provider.
+      ...(wantsName && typeof data.title === 'string' && data.title !== ''
+        ? { name: data.title }
+        : {}),
+      raw: data,
+    };
+  }
+
   private async raiseHttpError(
     response: Response,
     label: string,
@@ -346,7 +473,21 @@ export class HereGeocodingConnector
  * - `placeId` ← `id` (HERE's locationId).
  * - `viewport` ← derived from `mapView` (south/west/north/east) when present.
  */
-function normalizeCandidate(item: HereGeocodeItem): IGeocodeCandidate {
+/**
+ * Normalize one HERE `items[]` entry.
+ *
+ * Returns `null` (the caller skips the row) when `position.lat`/`lng` are absent
+ * or non-numeric — never fabricate a Null-Island (0,0) candidate, and never let a
+ * missing node surface as a raw `TypeError` outside the `ConnectorError`
+ * contract. Same rule as the other four geocoding connectors.
+ */
+function normalizeCandidate(item: HereGeocodeItem): IGeocodeCandidate | null {
+  const lat = item.position?.lat;
+  const lng = item.position?.lng;
+  if (typeof lat !== 'number' || typeof lng !== 'number') {
+    return null;
+  }
+
   const formattedAddress =
     typeof item.title === 'string' && item.title !== ''
       ? item.title
@@ -354,7 +495,7 @@ function normalizeCandidate(item: HereGeocodeItem): IGeocodeCandidate {
 
   const candidate: IGeocodeCandidate = {
     formattedAddress,
-    location: { lat: item.position.lat, lng: item.position.lng },
+    location: { lat, lng },
   };
 
   if (typeof item.id === 'string' && item.id !== '') {

@@ -68,35 +68,34 @@ const THREE_DESTS = [
 ];
 
 describe('OsrmMatrixConnector', () => {
-  describe('Constructor — baseUrl validation', () => {
+  // baseUrl is validated at CALL time, not construction time — see the routing
+  // connector spec for the rationale.
+  describe('baseUrl validation (at call time)', () => {
     it('exposes providerId "osrm"', () => {
       const connector = new OsrmMatrixConnector(defaultConfig);
       expect(connector.providerId).toBe('osrm');
     });
 
-    it('throws ConnectorError when baseUrl is missing', () => {
-      expect(
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        () => new OsrmMatrixConnector({} as any),
-      ).toThrow(ConnectorError);
+    it.each([
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ['a missing baseUrl', {} as any],
+      ['an empty baseUrl', { baseUrl: '' }],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ['a null config', null as any],
+    ])('constructing with %s does NOT throw', (_label, config) => {
+      expect(() => new OsrmMatrixConnector(config)).not.toThrow();
     });
 
-    it('throws ConnectorError when baseUrl is empty string', () => {
-      expect(() => new OsrmMatrixConnector({ baseUrl: '' })).toThrow(
-        ConnectorError,
-      );
-    });
-
-    it('throws ConnectorError when config is null', () => {
-      expect(
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        () => new OsrmMatrixConnector(null as any),
-      ).toThrow(ConnectorError);
-    });
-
-    it('sets providerCode invalid_request + statusCode null on baseUrl throw', () => {
+    it.each([
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ['a missing baseUrl', {} as any],
+      ['an empty baseUrl', { baseUrl: '' }],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ['a null config', null as any],
+    ])('rejects on matrix() with %s', async (_label, config) => {
+      const connector = new OsrmMatrixConnector(config);
       try {
-        new OsrmMatrixConnector({ baseUrl: '' });
+        await connector.matrix({ origins: TWO_ORIGINS, destinations: THREE_DESTS });
         expect.fail('expected throw');
       } catch (err) {
         expect(err).toBeInstanceOf(ConnectorError);
@@ -105,11 +104,51 @@ describe('OsrmMatrixConnector', () => {
         expect(ce.statusCode).toBeNull();
         expect(ce.providerMessage).toBe('baseUrl is required for OSRM');
       }
+      expect(mockFetch).not.toHaveBeenCalled();
     });
 
-    it('does not perform any HTTP call on baseUrl throw', () => {
-      expect(() => new OsrmMatrixConnector({ baseUrl: '' })).toThrow();
+    it.each([
+      ['a bare host', 'router.example.com'],
+      ['a protocol-relative URL', '//router.example.com'],
+      ['an unsupported scheme', 'ftp://router.example.com'],
+    ])('rejects %s with the typed error', async (_label, baseUrl) => {
+      const connector = new OsrmMatrixConnector({ baseUrl });
+      try {
+        await connector.matrix({ origins: TWO_ORIGINS, destinations: THREE_DESTS });
+        expect.fail('expected throw');
+      } catch (err) {
+        expect(err).toBeInstanceOf(ConnectorError);
+        const ce = err as ConnectorError;
+        expect(ce.providerCode).toBe('invalid_request');
+        expect(ce.statusCode).toBeNull();
+        expect(ce.providerMessage).toBe(
+          'OSRM baseUrl must start with http:// or https://',
+        );
+      }
       expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('accepts a path-prefixed baseUrl and keeps the prefix in the URL', async () => {
+      const connector = new OsrmMatrixConnector({
+        baseUrl: 'https://router.example.com/osrm',
+      });
+      mockFetch.mockResolvedValueOnce(buildTableResponse());
+
+      await connector.matrix({ origins: TWO_ORIGINS, destinations: THREE_DESTS });
+
+      expect(urlOf()).toContain('https://router.example.com/osrm/table/v1/');
+    });
+
+    it('strips trailing slashes from baseUrl', async () => {
+      const connector = new OsrmMatrixConnector({
+        baseUrl: 'https://router.example.com/',
+      });
+      mockFetch.mockResolvedValueOnce(buildTableResponse());
+
+      await connector.matrix({ origins: TWO_ORIGINS, destinations: THREE_DESTS });
+
+      expect(urlOf()).toContain('https://router.example.com/table/v1/');
+      expect(urlOf()).not.toContain('//table/v1');
     });
   });
 

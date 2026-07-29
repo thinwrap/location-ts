@@ -367,6 +367,63 @@ describe('TomTomRoutingConnector', () => {
       expect(result.waypointOrder).toEqual([0, 3, 1, 2, 4]);
     });
 
+    // TomTom projects `providedIndex + 1` the same way Google projects its
+    // intermediate indices, so it carries the same corruption risk: any
+    // ordering that is not a complete permutation of the input indices must be
+    // omitted rather than emitted with a dropped or repeated waypoint.
+    it.each([
+      ['a short intermediate list', [{ providedIndex: 0, optimizedIndex: 0 }]],
+      [
+        'duplicate providedIndex values',
+        [
+          { providedIndex: 0, optimizedIndex: 0 },
+          { providedIndex: 0, optimizedIndex: 1 },
+        ],
+      ],
+      [
+        'an out-of-range providedIndex',
+        [
+          { providedIndex: 9, optimizedIndex: 0 },
+          { providedIndex: 0, optimizedIndex: 1 },
+        ],
+      ],
+      [
+        'a -1 sentinel providedIndex',
+        [
+          { providedIndex: -1, optimizedIndex: 0 },
+          { providedIndex: 0, optimizedIndex: 1 },
+        ],
+      ],
+      [
+        'a providedIndex colliding with the destination',
+        [
+          { providedIndex: 2, optimizedIndex: 0 },
+          { providedIndex: 0, optimizedIndex: 1 },
+        ],
+      ],
+    ])('omits waypointOrder for %s', async (_label, optimizedWaypoints) => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ ...buildRouteBody(), optimizedWaypoints }),
+          { status: 200 },
+        ),
+      );
+
+      const result = await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+          { lat: 2, lng: 2 },
+          { lat: 3, lng: 3 },
+        ],
+        optimize: true,
+      });
+
+      expect(result.waypointOrder).toBeUndefined();
+      // The route itself is still returned.
+      expect(result.totalDistanceMeters).toBe(8000);
+    });
+
     it('omits computeBestOrder when optimize is set but only two waypoints', async () => {
       mockFetch.mockResolvedValueOnce(buildRouteResponse());
 
@@ -502,7 +559,7 @@ describe('TomTomRoutingConnector', () => {
       expect(mockFetch).not.toHaveBeenCalled();
     });
 
-    it('throws unknown when 2xx returns no routes', async () => {
+    it('throws no_route when 2xx returns no routes', async () => {
       mockFetch.mockResolvedValueOnce(
         new Response(JSON.stringify({ routes: [] }), { status: 200 }),
       );
@@ -519,7 +576,7 @@ describe('TomTomRoutingConnector', () => {
         thrown = err as ConnectorError;
       }
       expect(thrown).toBeInstanceOf(ConnectorError);
-      expect(thrown!.providerCode).toBe('unknown');
+      expect(thrown!.providerCode).toBe('no_route');
       expect(thrown!.providerMessage).toBe('TomTom Routing returned no routes');
     });
   });

@@ -1,3 +1,12 @@
+// Per-provider input augmentations (`RoutingOptionsMap`, `IsochroneOptionsMap`,
+// `AutocompleteOptionsMap`, …) are declared in each provider's `<id>.config.ts`. A
+// `declare module` block only applies if the file declaring it is part of the
+// consumer's compilation, and config types are re-exported below — which is what
+// makes those files reachable. Declaring an augmentation in a `<id>.types.ts`
+// instead typechecks in-repo and is INVISIBLE to consumers; that is how Mapbox's
+// `sessionToken` shipped unusable. `check:dist` gates this by typechecking a real
+// consumer against the built package.
+
 // === Unified facades (preferred API) ===
 export { Routing } from './facades/routing.facade';
 export { Matrix } from './facades/matrix.facade';
@@ -18,7 +27,7 @@ export type { EsriPathsGeometry } from './utils';
 
 // === Per-provider connector classes (direct import when bypassing facade) ===
 export { OsrmRoutingConnector, OsrmMatrixConnector } from './providers/osrm';
-export type { OsrmConfig } from './providers/osrm';
+export type { OsrmConfig, OsrmExcludeClass } from './providers/osrm';
 export { GoogleRoutingConnector, GoogleMatrixConnector, GoogleGeocodingConnector } from './providers/google';
 export type { GoogleConfig } from './providers/google';
 export { MapboxRoutingConnector, MapboxMatrixConnector, MapboxGeocodingConnector, MapboxIsochroneConnector } from './providers/mapbox';

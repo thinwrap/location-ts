@@ -95,35 +95,35 @@ const THREE_WAYPOINTS = [
 ];
 
 describe('OsrmRoutingConnector', () => {
-  describe('Constructor — baseUrl validation', () => {
+  // baseUrl is validated at CALL time, not construction time: building a facade
+  // at module load from environment config must not throw at import. Matches the
+  // location-go / location-py siblings.
+  describe('baseUrl validation (at call time)', () => {
     it('exposes providerId "osrm"', () => {
       const connector = new OsrmRoutingConnector(defaultConfig);
       expect(connector.providerId).toBe('osrm');
     });
 
-    it('throws ConnectorError when baseUrl is missing', () => {
-      expect(
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        () => new OsrmRoutingConnector({} as any),
-      ).toThrow(ConnectorError);
+    it.each([
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ['a missing baseUrl', {} as any],
+      ['an empty baseUrl', { baseUrl: '' }],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ['a null config', null as any],
+    ])('constructing with %s does NOT throw', (_label, config) => {
+      expect(() => new OsrmRoutingConnector(config)).not.toThrow();
     });
 
-    it('throws ConnectorError when baseUrl is empty string', () => {
-      expect(() => new OsrmRoutingConnector({ baseUrl: '' })).toThrow(
-        ConnectorError,
-      );
-    });
-
-    it('throws ConnectorError when config is null', () => {
-      expect(
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        () => new OsrmRoutingConnector(null as any),
-      ).toThrow(ConnectorError);
-    });
-
-    it('sets providerCode invalid_request + statusCode null on baseUrl throw', () => {
+    it.each([
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ['a missing baseUrl', {} as any],
+      ['an empty baseUrl', { baseUrl: '' }],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ['a null config', null as any],
+    ])('rejects on route() with %s', async (_label, config) => {
+      const connector = new OsrmRoutingConnector(config);
       try {
-        new OsrmRoutingConnector({ baseUrl: '' });
+        await connector.route({ waypoints: TWO_WAYPOINTS });
         expect.fail('expected throw');
       } catch (err) {
         expect(err).toBeInstanceOf(ConnectorError);
@@ -132,11 +132,71 @@ describe('OsrmRoutingConnector', () => {
         expect(ce.statusCode).toBeNull();
         expect(ce.providerMessage).toBe('baseUrl is required for OSRM');
       }
+      expect(mockFetch).not.toHaveBeenCalled();
     });
 
-    it('does not perform any HTTP call on baseUrl throw', () => {
-      expect(() => new OsrmRoutingConnector({ baseUrl: '' })).toThrow();
+    // Without a scheme the concatenated URL reaches fetch() as a relative URL
+    // and surfaces as an untyped platform `TypeError: Invalid URL`, bypassing
+    // ConnectorError. Reject it up front with the typed error instead.
+    it.each([
+      ['a bare host', 'router.example.com'],
+      ['a protocol-relative URL', '//router.example.com'],
+      ['an unsupported scheme', 'ftp://router.example.com'],
+      ['a path-only value', '/osrm'],
+    ])('rejects %s with the typed error', async (_label, baseUrl) => {
+      const connector = new OsrmRoutingConnector({ baseUrl });
+      try {
+        await connector.route({ waypoints: TWO_WAYPOINTS });
+        expect.fail('expected throw');
+      } catch (err) {
+        expect(err).toBeInstanceOf(ConnectorError);
+        const ce = err as ConnectorError;
+        expect(ce.providerCode).toBe('invalid_request');
+        expect(ce.statusCode).toBeNull();
+        expect(ce.providerMessage).toBe(
+          'OSRM baseUrl must start with http:// or https://',
+        );
+      }
       expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['http', 'http://router.example.com'],
+      ['https', 'https://router.example.com'],
+      ['an uppercase scheme', 'HTTPS://router.example.com'],
+    ])('accepts %s', async (_label, baseUrl) => {
+      mockFetch.mockResolvedValueOnce(buildRouteResponse());
+      const connector = new OsrmRoutingConnector({ baseUrl });
+      await expect(
+        connector.route({ waypoints: THREE_WAYPOINTS }),
+      ).resolves.toBeDefined();
+    });
+
+    // A reverse-proxied OSRM under a path prefix is a normal deployment, so a
+    // path is allowed; only trailing slashes are normalized away so the
+    // `${baseUrl}/route/v1/...` concatenation cannot emit `//route`.
+    it('accepts a path-prefixed baseUrl and keeps the prefix in the URL', async () => {
+      const connector = new OsrmRoutingConnector({
+        baseUrl: 'https://router.example.com/osrm',
+      });
+      mockFetch.mockResolvedValueOnce(buildRouteResponse());
+
+      await connector.route({ waypoints: THREE_WAYPOINTS });
+
+      expect(urlOf()).toContain('https://router.example.com/osrm/route/v1/');
+    });
+
+    it.each([
+      ['one trailing slash', 'https://router.example.com/'],
+      ['several trailing slashes', 'https://router.example.com///'],
+    ])('strips %s', async (_label, baseUrl) => {
+      const connector = new OsrmRoutingConnector({ baseUrl });
+      mockFetch.mockResolvedValueOnce(buildRouteResponse());
+
+      await connector.route({ waypoints: THREE_WAYPOINTS });
+
+      expect(urlOf()).toContain('https://router.example.com/route/v1/');
+      expect(urlOf()).not.toContain('//route/v1');
     });
   });
 
@@ -275,10 +335,15 @@ describe('OsrmRoutingConnector', () => {
       expect(initOf().method).toBe('GET');
 
       const q = queryOf();
-      expect(q.get('overview')).toBe('full');
+      // Default fidelity is `simplified` — a 31x smaller geometry than `full`
+      // with identical distances/durations.
+      expect(q.get('overview')).toBe('simplified');
       expect(q.get('geometries')).toBe('polyline');
-      expect(q.get('steps')).toBe('true');
-      expect(q.get('annotations')).toBe('duration,distance');
+      // Nothing normalized reads steps, and leg distance/duration are present
+      // regardless of `annotations`, so /route requests neither. (The Table
+      // service still forces annotations — that IS what populates its cells.)
+      expect(q.has('steps')).toBe(false);
+      expect(q.has('annotations')).toBe(false);
       // Standard /route dispatch — no trip-only params.
       expect(q.get('source')).toBeNull();
       expect(q.get('destination')).toBeNull();
@@ -367,6 +432,64 @@ describe('OsrmRoutingConnector', () => {
       // Vendor waypoints (input order) carry waypoint_index = visit position
       // [0, 2, 1]; inverting yields visiting-order-of-input-indices [0, 2, 1].
       expect(result.waypointOrder).toEqual([0, 2, 1]);
+    });
+
+    // The inversion is validated against the INPUT waypoint count and tracks
+    // which visit positions have been filled. Before that, a duplicate
+    // `waypoint_index` overwrote one slot and left another unwritten — an
+    // `undefined` hole in an array still typed `number[]`.
+    it.each([
+      [
+        'duplicate waypoint_index values',
+        [{ waypoint_index: 0 }, { waypoint_index: 0 }, { waypoint_index: 2 }],
+      ],
+      [
+        'a truncated waypoints array',
+        [{ waypoint_index: 0 }, { waypoint_index: 1 }],
+      ],
+      [
+        'an out-of-range waypoint_index',
+        [{ waypoint_index: 0 }, { waypoint_index: 1 }, { waypoint_index: 7 }],
+      ],
+      [
+        'a negative waypoint_index',
+        [{ waypoint_index: 0 }, { waypoint_index: -1 }, { waypoint_index: 2 }],
+      ],
+      [
+        'a null waypoint_index',
+        [{ waypoint_index: 0 }, { waypoint_index: null }, { waypoint_index: 2 }],
+      ],
+      [
+        'a missing waypoint_index',
+        [{ waypoint_index: 0 }, {}, { waypoint_index: 2 }],
+      ],
+    ])('omits waypointOrder for %s', async (_label, waypoints) => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            code: 'Ok',
+            trips: [
+              {
+                geometry: 'abc',
+                legs: [{ distance: 1500, duration: 90 }],
+                distance: 4000,
+                duration: 240,
+              },
+            ],
+            waypoints,
+          }),
+          { status: 200 },
+        ),
+      );
+
+      const result = await connector.route({
+        waypoints: THREE_WAYPOINTS,
+        optimize: true,
+      });
+
+      expect(result.waypointOrder).toBeUndefined();
+      // The trip itself is still returned.
+      expect(result.totalDistanceMeters).toBe(4000);
     });
 
     it('uses source=first when optimizeFixedOrigin=true', async () => {
@@ -562,26 +685,31 @@ describe('OsrmRoutingConnector', () => {
       );
     }
 
-    it('maps NoRoute → invalid_request', async () => {
+    // `no_route`, not `invalid_request`: the request was well-formed and OSRM
+    // answered — there is simply no connecting route. A consumer branches on
+    // this as a business outcome rather than treating it as a client bug.
+    it('maps NoRoute → no_route', async () => {
       mockFetch.mockResolvedValueOnce(buildInBodyError('NoRoute', 'No route'));
       try {
         await connector.route({ waypoints: TWO_WAYPOINTS });
         expect.fail('expected throw');
       } catch (err) {
         const ce = err as ConnectorError;
-        expect(ce.providerCode).toBe('invalid_request');
+        expect(ce.providerCode).toBe('no_route');
         expect(ce.providerMessage).toBe('No route');
       }
     });
 
-    it('maps NoSegment → invalid_request', async () => {
+    // NoSegment = no road near a coordinate to snap to, i.e. still "no usable
+    // route from here", not a malformed request.
+    it('maps NoSegment → no_route', async () => {
       mockFetch.mockResolvedValueOnce(buildInBodyError('NoSegment'));
       try {
         await connector.route({ waypoints: TWO_WAYPOINTS });
         expect.fail('expected throw');
       } catch (err) {
         const ce = err as ConnectorError;
-        expect(ce.providerCode).toBe('invalid_request');
+        expect(ce.providerCode).toBe('no_route');
       }
     });
 
@@ -607,7 +735,7 @@ describe('OsrmRoutingConnector', () => {
       }
     });
 
-    it('maps NoTrips (trip endpoint) → invalid_request', async () => {
+    it('maps NoTrips (trip endpoint) → no_route', async () => {
       mockFetch.mockResolvedValueOnce(buildInBodyError('NoTrips'));
       try {
         await connector.route({
@@ -617,7 +745,20 @@ describe('OsrmRoutingConnector', () => {
         expect.fail('expected throw');
       } catch (err) {
         const ce = err as ConnectorError;
-        expect(ce.providerCode).toBe('invalid_request');
+        expect(ce.providerCode).toBe('no_route');
+      }
+    });
+
+    // On a plain /route dispatch NoTrips should never occur, so it stays
+    // unclassified rather than being reported as a routing outcome.
+    it('maps NoTrips on a non-trip dispatch → unknown', async () => {
+      mockFetch.mockResolvedValueOnce(buildInBodyError('NoTrips'));
+      try {
+        await connector.route({ waypoints: TWO_WAYPOINTS });
+        expect.fail('expected throw');
+      } catch (err) {
+        const ce = err as ConnectorError;
+        expect(ce.providerCode).toBe('unknown');
       }
     });
 
@@ -648,6 +789,9 @@ describe('OsrmRoutingConnector', () => {
       }
     });
 
+    // A generic NoRoute on a non-default travel mode is still just "no route" —
+    // a missing profile is never inferred from it (too brittle), it must be
+    // stated in the vendor message.
     it('does NOT auto-classify NoRoute as profile_not_configured without explicit signal', async () => {
       mockFetch.mockResolvedValueOnce(
         buildInBodyError('NoRoute', 'no route found'),
@@ -660,7 +804,7 @@ describe('OsrmRoutingConnector', () => {
         expect.fail('expected throw');
       } catch (err) {
         const ce = err as ConnectorError;
-        expect(ce.providerCode).toBe('invalid_request');
+        expect(ce.providerCode).toBe('no_route');
       }
     });
   });
@@ -669,6 +813,72 @@ describe('OsrmRoutingConnector', () => {
     let connector: OsrmRoutingConnector;
     beforeEach(() => {
       connector = new OsrmRoutingConnector(defaultConfig);
+    });
+
+    // THE path that actually fires in production. Live-probed against both the
+    // public demo build and a self-hosted instance: OSRM serves every non-Ok
+    // envelope code with a 4xx, so the 200-with-envelope path above is nearly
+    // unreachable and the envelope code must be read here too. Classifying on
+    // status alone reported `invalid_request` for a route that simply does not
+    // exist, which is why consumers had to sniff the raw body.
+    it.each([
+      ['NoRoute', 400, 'no_route'],
+      ['NoSegment', 400, 'no_route'],
+      ['NoRoute', 422, 'no_route'],
+      ['InvalidOptions', 400, 'invalid_request'],
+      ['InvalidValue', 400, 'invalid_request'],
+      ['InvalidQuery', 400, 'invalid_request'],
+    ])(
+      'maps HTTP %i-with-%s envelope → %s',
+      async (code, status, expected) => {
+        mockFetch.mockResolvedValueOnce(
+          new Response(JSON.stringify({ code, message: 'vendor text' }), {
+            status: status as number,
+          }),
+        );
+        try {
+          await connector.route({ waypoints: TWO_WAYPOINTS });
+          expect.fail('expected throw');
+        } catch (err) {
+          const ce = err as ConnectorError;
+          expect(ce.providerCode).toBe(expected);
+          // The real HTTP status is preserved either way.
+          expect(ce.statusCode).toBe(status);
+        }
+      },
+    );
+
+    // A proxy-layer status has no OSRM envelope to read and must win.
+    it.each([
+      [401, 'auth_failed'],
+      [403, 'auth_failed'],
+      [429, 'rate_limited'],
+      [503, 'provider_unavailable'],
+    ])('maps a proxy-layer HTTP %i → %s', async (status, expected) => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({ code: 'NoRoute' }), { status }),
+      );
+      try {
+        await connector.route({ waypoints: TWO_WAYPOINTS });
+        expect.fail('expected throw');
+      } catch (err) {
+        expect((err as ConnectorError).providerCode).toBe(expected);
+      }
+    });
+
+    it('maps HTTP 400 + "profile not found" → profile_not_configured', async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ code: 'NoRoute', message: 'profile not found' }),
+          { status: 400 },
+        ),
+      );
+      try {
+        await connector.route({ waypoints: TWO_WAYPOINTS, travelMode: 'cycling' });
+        expect.fail('expected throw');
+      } catch (err) {
+        expect((err as ConnectorError).providerCode).toBe('profile_not_configured');
+      }
     });
 
     it('maps HTTP 404 → invalid_request', async () => {

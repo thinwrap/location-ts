@@ -142,6 +142,127 @@ describe('BaseConnector', () => {
     });
   });
 
+  describe('request timeout', () => {
+    it('passes an AbortSignal on every request', async () => {
+      mockFetch.mockResolvedValueOnce(new Response('ok'));
+      const c = new TestConnector();
+      await c.callGet('https://api.example.com/x');
+      const [, init] = mockFetch.mock.calls[0]!;
+      expect((init as RequestInit).signal).toBeInstanceOf(AbortSignal);
+      expect((init as RequestInit).signal?.aborted).toBe(false);
+    });
+
+    it.each([
+      ['sendGet', (c: TestConnector) => c.callGet('https://api.example.com/x')],
+      ['sendPostJson', (c: TestConnector) => c.callPostJson('https://api.example.com/x', {})],
+      ['sendPostForm', (c: TestConnector) => c.callPostForm('https://api.example.com/x', {})],
+    ])('applies the signal on %s', async (_label, run) => {
+      mockFetch.mockResolvedValueOnce(new Response('ok'));
+      await run(new TestConnector());
+      const [, init] = mockFetch.mock.calls[0]!;
+      expect((init as RequestInit).signal).toBeInstanceOf(AbortSignal);
+    });
+
+    // A timed-out request must be distinguishable from any other transport
+    // failure: the cause is deliberately sanitized, so before `timeout` existed
+    // a consumer had to sniff `cause.raw.name` to tell them apart.
+    it('classifies an aborted request as timeout, not provider_unavailable', async () => {
+      const c = new TestConnector();
+      mockFetch.mockImplementationOnce(async (_url: string, init: RequestInit) => {
+        // Simulate the runtime aborting: fire the caller's own signal, then
+        // reject the way undici does.
+        const signal = init.signal as AbortSignal & { onabort?: unknown };
+        Object.defineProperty(signal, 'aborted', { value: true, configurable: true });
+        throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+      });
+
+      let thrown: unknown;
+      try {
+        await c.callGet('https://api.example.com/x');
+      } catch (e) {
+        thrown = e;
+      }
+      const err = thrown as ConnectorError;
+      expect(err).toBeInstanceOf(ConnectorError);
+      expect(err.providerCode).toBe('timeout');
+      expect(err.statusCode).toBeNull();
+      expect(err.message).toBe('Network request timed out');
+      // Still sanitized — no vendor URL or message leaks through.
+      expect(err.cause).toEqual({ raw: { name: 'TimeoutError' } });
+    });
+
+    it('still classifies a non-abort rejection as provider_unavailable', async () => {
+      mockFetch.mockRejectedValueOnce(new TypeError('fetch failed'));
+      const c = new TestConnector();
+      let thrown: unknown;
+      try {
+        await c.callGet('https://api.example.com/x');
+      } catch (e) {
+        thrown = e;
+      }
+      const err = thrown as ConnectorError;
+      expect(err.providerCode).toBe('provider_unavailable');
+      expect(err.message).toBe('Network request failed');
+    });
+
+    // A fetchImpl with a tighter bound combines signals with `AbortSignal.any`,
+    // which leaves the library's own signal un-aborted — so classification cannot
+    // rely on that signal alone.
+    it("classifies a BYO transport's own timeout as timeout", async () => {
+      // Shape of a caller's wrapper: combine, then let ours lose.
+      const tightFetch = vi.fn(async (_url: string, init: RequestInit) => {
+        const own = AbortSignal.timeout(1);
+        const combined = init.signal ? AbortSignal.any([init.signal, own]) : own;
+        await new Promise<void>(resolve => {
+          combined.addEventListener('abort', () => resolve(), { once: true });
+        });
+        // The library's 30s signal is untouched.
+        expect(init.signal?.aborted).toBe(false);
+        throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+      });
+
+      const c = new TestConnector(tightFetch as unknown as typeof fetch);
+      let thrown: unknown;
+      try {
+        await c.callGet('https://api.example.com/x');
+      } catch (e) {
+        thrown = e;
+      }
+      const err = thrown as ConnectorError;
+      expect(err).toBeInstanceOf(ConnectorError);
+      expect(err.providerCode).toBe('timeout');
+      expect(err.message).toBe('Network request timed out');
+      expect(err.cause).toEqual({ raw: { name: 'TimeoutError' } });
+    });
+
+    // A deliberate cancellation is not a timeout.
+    it('keeps a deliberate AbortError as provider_unavailable', async () => {
+      const cancellingFetch = vi.fn(async () => {
+        throw new DOMException('The operation was aborted', 'AbortError');
+      });
+      const c = new TestConnector(cancellingFetch as unknown as typeof fetch);
+      let thrown: unknown;
+      try {
+        await c.callGet('https://api.example.com/x');
+      } catch (e) {
+        thrown = e;
+      }
+      const err = thrown as ConnectorError;
+      expect(err.providerCode).toBe('provider_unavailable');
+      expect(err.cause).toEqual({ raw: { name: 'AbortError' } });
+    });
+
+    // The BYO transport seam stays the way to change timeout policy: an injected
+    // fetchImpl receives the signal and may ignore it entirely.
+    it('lets an injected fetchImpl ignore the signal', async () => {
+      const customFetch = vi.fn().mockResolvedValue(new Response('custom'));
+      const c = new TestConnector(customFetch);
+      await c.callGet('https://api.example.com/x');
+      const [, init] = customFetch.mock.calls[0]!;
+      expect((init as RequestInit).signal).toBeInstanceOf(AbortSignal);
+    });
+  });
+
   describe('fetchImpl injection', () => {
     it('uses injected fetchImpl when provided', async () => {
       const customFetch = vi.fn().mockResolvedValue(new Response('custom'));

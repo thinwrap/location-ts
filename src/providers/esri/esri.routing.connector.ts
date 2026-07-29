@@ -8,13 +8,16 @@ import type {
   ProviderCode,
 } from '../../types';
 import { ConnectorError } from '../../types';
-import { encodePolyline, mergePassthrough } from '../../utils';
+import {
+  encodePolyline,
+  invertWaypointPositions,
+  mergePassthrough,
+} from '../../utils';
 import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { EsriConfig } from './esri.config';
 import { resolveEsriBearerToken } from './esri.config';
-import { mapEsriTravelMode } from './esri.travel-modes';
+import { mapEsriTravelMode, esriTimeAttributeFor } from './esri.travel-modes';
 import type {
-  EsriDirectionStepAttributes,
   EsriRouteFeatureAttributes,
   EsriRouteResponse,
   EsriStopFeatureAttributes,
@@ -23,10 +26,11 @@ import type {
 const ROUTE_URL =
   'https://route-api.arcgis.com/arcgis/rest/services/World/Route/NAServer/Route_World/solve';
 const MINUTES_TO_SECONDS = 60;
-const STOP_MANEUVER = 'esriDMTStop';
+/** Only reached if a service reports distance in miles rather than kilometers. */
+const METERS_PER_MILE = 1609.344;
 
 /**
- * ESRI (ArcGIS) Route NAServer connector — per-connector template.
+ * ESRI (ArcGIS) Route NAServer connector.
  *
  * POSTs form-encoded data to the World Route solve endpoint with an ESRI
  * FeatureSet `stops` payload (`{ features: [{ geometry: { x: lng, y: lat,
@@ -73,15 +77,23 @@ export class EsriRoutingConnector
 
     const stopsFeatureSet = buildStopsFeatureSet(waypoints);
 
+    // Legs come from the `stops` cumulative costs rather than the `directions`
+    // output: Esri documents that output as superseded, and its `esriDMT*` maneuver
+    // values are not enumerated in the REST reference at all.
+    const timeAttribute = esriTimeAttributeFor(options.travelMode);
     const form: Record<string, string> = {
       f: 'json',
       token: resolveEsriBearerToken(this.config),
       stops: JSON.stringify(stopsFeatureSet),
       returnRoutes: 'true',
-      returnDirections: 'true',
-      directionsLengthUnits: 'esriNAUMeters',
-      directionsOutputType: 'esriDOTComplete',
-      outputLines: 'esriNAOutputLineTrueShapeWithMeasure',
+      returnStops: 'true',
+      // Explicit because the service default is `true`, so omitting this still
+      // ships the whole turn-by-turn payload.
+      returnDirections: 'false',
+      // Produces the `Cumul_<attr>` fields; no `impedanceAttributeName` required.
+      accumulateAttributeNames: `${timeAttribute},Kilometers`,
+      // Only `paths` is read; the `...WithMeasure` variant adds an m-value per point.
+      outputLines: 'esriNAOutputLineTrueShape',
       outSR: '4326',
     };
 
@@ -100,10 +112,6 @@ export class EsriRoutingConnector
 
     if (options.optimize === true) {
       form.findBestSequence = 'true';
-      // Needed to recover the optimized visiting order: the `stops` FeatureSet
-      // carries each stop's 1-based `Sequence` (there is no `Stops` route
-      // attribute).
-      form.returnStops = 'true';
       if (options.optimizeFixedOrigin === true) {
         form.preserveFirstStop = 'true';
       }
@@ -175,27 +183,31 @@ export class EsriRoutingConnector
       });
     }
 
-    return this.normalizeSuccess(data, waypoints, response.status);
+    return this.normalizeSuccess(data, waypoints, response.status, options);
   }
 
   /**
-   * Normalize a 2xx ESRI response into an {@link IRoutingResult}. Resolves
-   * `routes.features[0]` (the chosen route), extracts totals from the directions
-   * summary (travel-mode-independent), reconstructs per-leg distance/duration
-   * from the directions FeatureSet, and re-encodes the geometry paths as a
-   * precision-5 polyline.
+   * Normalize a 2xx ESRI response into an {@link IRoutingResult}: the chosen route
+   * is `routes.features[0]`, legs and totals come from the per-stop cumulative
+   * costs, and the geometry paths are re-encoded as a precision-5 polyline.
    */
   private normalizeSuccess(
     data: EsriRouteResponse,
     waypoints: LatLng[],
     status: number,
+    options: IRoutingOptions,
   ): IRoutingResult {
     const feature = data.routes?.features?.[0];
     if (!feature) {
+      // ESRI's OBSERVED no-route path is the in-body `error` envelope handled in
+      // `route()` (an unlocated stop), not an empty featureset. This branch is
+      // therefore a shape ESRI has not been seen to produce — classify it with
+      // the same code as the other five providers so a consumer has exactly one
+      // "provider answered, no route" case to branch on.
       throw new ConnectorError({
         message: 'ESRI Routing returned no routes',
         statusCode: status,
-        providerCode: 'unknown',
+        providerCode: 'no_route',
         providerMessage: 'ESRI Routing returned no routes',
         cause: data,
       });
@@ -203,43 +215,19 @@ export class EsriRoutingConnector
 
     const attrs: EsriRouteFeatureAttributes = feature.attributes ?? {};
 
-    // Totals come from the directions summary, which is travel-mode-independent
-    // (`totalLength` in meters via directionsLengthUnits=esriNAUMeters,
-    // `totalTime` in minutes). The route feature's `Total_*` attributes are
-    // named after the active impedance — driving reports `Total_TravelTime`,
-    // walking reports `Total_WalkTime`, and neither `Total_Length` nor
-    // `Total_Time` is emitted at all — so reading them directly silently yields
-    // 0 for any non-driving mode. Fall back to the attributes only when the
-    // summary is absent (verified live against route-api.arcgis.com 2026-07-21).
-    const summary = data.directions?.[0]?.summary;
+    // Legs and totals share one source, so they always reconcile.
+    const cumulative = readCumulativeStopCosts(data.stops?.features);
 
+    // Fallback: a stop that failed to locate carries no cumulative cost, and a
+    // service configured without the accumulate attributes returns none at all.
     const totalDistanceMeters =
-      typeof summary?.totalLength === 'number'
-        ? summary.totalLength
-        : typeof attrs.Total_Length === 'number'
-          ? attrs.Total_Length
-          : typeof attrs.Total_Kilometers === 'number'
-            ? attrs.Total_Kilometers * 1000
-            : 0;
+      cumulative?.totalDistanceMeters ?? readRouteTotalDistanceMeters(attrs);
+    const totalDurationSeconds =
+      cumulative?.totalDurationSeconds ?? readRouteTotalDurationSeconds(attrs);
 
-    const totalTimeMinutes =
-      typeof summary?.totalTime === 'number'
-        ? summary.totalTime
-        : typeof attrs.Total_Time === 'number'
-          ? attrs.Total_Time
-          : typeof attrs.Total_TravelTime === 'number'
-            ? attrs.Total_TravelTime
-            : typeof attrs.Total_WalkTime === 'number'
-              ? attrs.Total_WalkTime
-              : 0;
-    const totalDurationSeconds = totalTimeMinutes * MINUTES_TO_SECONDS;
-
-    const legs = reconstructLegs(
-      data.directions,
-      waypoints,
-      totalDistanceMeters,
-      totalDurationSeconds,
-    );
+    const legs =
+      cumulative?.legs ??
+      evenSplitLegs(waypoints.length, totalDistanceMeters, totalDurationSeconds);
 
     // Inline paths → LatLng[] → precision-5 polyline (inline
     // replacement). ESRI `paths` is `[[[lng, lat], ...]]`.
@@ -254,10 +242,13 @@ export class EsriRoutingConnector
     );
     const polyline = encodePolyline(allPoints);
 
-    const waypointOrder = extractWaypointOrder(
-      data.stops?.features,
-      waypoints.length,
-    );
+    // Optimized routes only. Stops are always fetched now, so without this gate an
+    // unoptimized route would report a useless identity permutation. Emitting an
+    // ordering for unoptimized calls is a separate decision, for all six providers.
+    const waypointOrder =
+      options.optimize === true
+        ? extractWaypointOrder(data.stops?.features, waypoints.length)
+        : undefined;
 
     return {
       legs,
@@ -292,9 +283,11 @@ export class EsriRoutingConnector
   }
 
   /**
-   * Map ESRI (HTTP status, decoded body) → canonical {@link ProviderCode}
-   * Handles both HTTP-level codes and ESRI's 200-with-error-body
-   * case via `body.error.code`. */
+   * Map ESRI (HTTP status, decoded body) → canonical {@link ProviderCode}.
+   *
+   * Handles both HTTP-level codes and ESRI's 200-with-error-body case, which
+   * arrives via `body.error.code`.
+   */
   private mapVendorError(
     httpStatus: number,
     body: Record<string, unknown> | null,
@@ -313,7 +306,13 @@ export class EsriRoutingConnector
         return 'auth_failed';
       }
       if (bodyErrorCode === 400 || bodyErrorCode === 404) {
-        return 'invalid_request';
+        // ESRI has no distinct code for "no route": an unroutable stop comes back
+        // as HTTP 200 with `error.code: 400` and a `details[]` entry naming the
+        // stop as **unlocated** (live-verified). `unlocated` is ESRI's own term
+        // for a stop it could not snap to the network, so matching it is reading
+        // a stated condition, not inferring one — the same bar the OSRM
+        // `profile not found` match already meets.
+        return hasEsriUnlocatedStop(body) ? 'no_route' : 'invalid_request';
       }
       if (bodyErrorCode === 500) {
         return 'provider_unavailable';
@@ -404,81 +403,113 @@ function stringifyFormValue(value: unknown): string {
 }
 
 /**
- * Reconstruct per-leg distances/durations from the ESRI directions FeatureSet
- * Each direction step carries `length` (meters when
- * `directionsLengthUnits=esriNAUMeters`) and `time` (minutes). Legs are
- * delimited by `maneuverType=esriDMTStop` steps.
+ * Per-leg distances/durations and the route totals, from the per-stop cumulative
+ * costs. `Cumul_<attribute>` is the cost from the origin *to and including* that
+ * stop, so a leg is the difference between consecutive stops and the total is the
+ * last value — which is why legs always sum to the totals here.
  *
- * Falls back to even-split of totals when directions are absent (parity with
- * the PHP sibling).
+ * Two things are easy to get wrong:
+ *
+ * 1. Stops arrive in INPUT order while cumulative costs run along the route, so
+ *    they must be sorted by `Sequence`. Without it an optimized route yields
+ *    negative legs.
+ * 2. The field name carries the active impedance — `Cumul_TravelTime` driving,
+ *    `Cumul_WalkTime` walking — so the keys are discovered, not hardcoded.
+ *
+ * Returns `null` when the values are unusable: fewer than two stops, a stop that
+ * failed to locate (`Status != 0` carries no cumulative cost), a non-monotonic
+ * sequence, or a service configured without the accumulate attributes.
  */
-function reconstructLegs(
-  directions: EsriRouteResponse['directions'] | undefined,
-  waypoints: LatLng[],
-  totalDistance: number,
-  totalDuration: number,
-): IRoutingLeg[] {
-  const numLegs = Math.max(1, waypoints.length - 1);
-  const directionSet = directions?.[0]?.features;
+function readCumulativeStopCosts(
+  features: Array<{ attributes: EsriStopFeatureAttributes }> | undefined,
+):
+  | { legs: IRoutingLeg[]; totalDistanceMeters: number; totalDurationSeconds: number }
+  | null {
+  if (!Array.isArray(features) || features.length < 2) return null;
 
-  if (!Array.isArray(directionSet) || directionSet.length === 0) {
-    return Array.from({ length: numLegs }, () => ({
-      distanceMeters: totalDistance / numLegs,
-      durationSeconds: totalDuration / numLegs,
-    }));
+  // Sequence is 1-based; sorting by it puts the stops in route order.
+  const ordered = features
+    .map((f) => f.attributes ?? {})
+    .filter((a) => typeof a.Sequence === 'number')
+    .sort((a, b) => (a.Sequence as number) - (b.Sequence as number));
+  if (ordered.length !== features.length || ordered.length < 2) return null;
+
+  const keys = Object.keys(ordered[0]!).filter((k) => k.startsWith('Cumul_'));
+  const distanceKey = keys.find((k) => /Kilometers|Miles$/.test(k));
+  const timeKey = keys.find((k) => k !== distanceKey);
+  if (distanceKey === undefined || timeKey === undefined) return null;
+
+  const toMeters = distanceKey.endsWith('Miles') ? METERS_PER_MILE : 1000;
+
+  const distances: number[] = [];
+  const times: number[] = [];
+  for (const a of ordered) {
+    const d = a[distanceKey as `Cumul_${string}`];
+    const t = a[timeKey as `Cumul_${string}`];
+    // Not located / not reached: no cumulative cost, so every later diff is wrong.
+    if (typeof d !== 'number' || typeof t !== 'number') return null;
+    if (a.Status !== undefined && a.Status !== 0) return null;
+    distances.push(d * toMeters);
+    times.push(t * MINUTES_TO_SECONDS);
   }
 
   const legs: IRoutingLeg[] = [];
-  let accDist = 0;
-  let accTime = 0;
-  let passedFirstStop = false;
-
-  for (const step of directionSet) {
-    const stepAttrs: EsriDirectionStepAttributes = step.attributes ?? {
-      length: 0,
-      time: 0,
-    };
-    const isStop = stepAttrs.maneuverType === STOP_MANEUVER;
-
-    if (isStop) {
-      if (!passedFirstStop) {
-        // First esriDMTStop is the route origin — start accumulating after it.
-        passedFirstStop = true;
-        accDist = 0;
-        accTime = 0;
-        continue;
-      }
-      legs.push({
-        distanceMeters: accDist,
-        durationSeconds: accTime * MINUTES_TO_SECONDS,
-      });
-      accDist = 0;
-      accTime = 0;
-      continue;
-    }
-
-    if (!passedFirstStop) continue;
-
-    accDist += typeof stepAttrs.length === 'number' ? stepAttrs.length : 0;
-    accTime += typeof stepAttrs.time === 'number' ? stepAttrs.time : 0;
+  for (let i = 1; i < ordered.length; i++) {
+    const distanceMeters = distances[i]! - distances[i - 1]!;
+    const durationSeconds = times[i]! - times[i - 1]!;
+    // Cumulative costs never decrease, so a negative diff means the order is wrong.
+    if (distanceMeters < 0 || durationSeconds < 0) return null;
+    legs.push({ distanceMeters, durationSeconds });
   }
 
-  // Flush remainder when the directions stream did not end on a stop step.
-  if (accDist > 0 || accTime > 0) {
-    legs.push({
-      distanceMeters: accDist,
-      durationSeconds: accTime * MINUTES_TO_SECONDS,
-    });
-  }
+  return {
+    legs,
+    totalDistanceMeters: distances[distances.length - 1]!,
+    totalDurationSeconds: times[times.length - 1]!,
+  };
+}
 
-  if (legs.length === 0) {
-    return Array.from({ length: numLegs }, () => ({
-      distanceMeters: totalDistance / numLegs,
-      durationSeconds: totalDuration / numLegs,
-    }));
-  }
+/**
+ * The route's total distance in meters. Matched by shape, because the attribute is
+ * suffixed with the active distance attribute (`Total_Kilometers` / `Total_Miles`)
+ * and this service emits no `Total_Length`.
+ */
+function readRouteTotalDistanceMeters(attrs: EsriRouteFeatureAttributes): number {
+  if (typeof attrs.Total_Length === 'number') return attrs.Total_Length;
+  if (typeof attrs.Total_Kilometers === 'number') return attrs.Total_Kilometers * 1000;
+  const record = attrs as Record<string, unknown>;
+  const miles = record.Total_Miles;
+  if (typeof miles === 'number') return miles * METERS_PER_MILE;
+  return 0;
+}
 
-  return legs;
+/**
+ * The route's total duration in seconds. Same shape-based match: any `Total_*` that
+ * is not a distance attribute is the time one, in minutes (`Total_TravelTime`
+ * driving, `Total_WalkTime` walking, `Total_TruckTravelTime` for a truck mode).
+ */
+function readRouteTotalDurationSeconds(attrs: EsriRouteFeatureAttributes): number {
+  if (typeof attrs.Total_Time === 'number') return attrs.Total_Time * MINUTES_TO_SECONDS;
+  const record = attrs as Record<string, unknown>;
+  for (const [key, value] of Object.entries(record)) {
+    if (!key.startsWith('Total_')) continue;
+    if (/Kilometers|Miles|Length/.test(key)) continue;
+    if (typeof value === 'number') return value * MINUTES_TO_SECONDS;
+  }
+  return 0;
+}
+
+/** Even split of the totals, used when per-stop cumulative costs are unavailable. */
+function evenSplitLegs(
+  waypointCount: number,
+  totalDistanceMeters: number,
+  totalDurationSeconds: number,
+): IRoutingLeg[] {
+  const numLegs = Math.max(1, waypointCount - 1);
+  return Array.from({ length: numLegs }, () => ({
+    distanceMeters: totalDistanceMeters / numLegs,
+    durationSeconds: totalDurationSeconds / numLegs,
+  }));
 }
 
 /**
@@ -493,26 +524,36 @@ function extractWaypointOrder(
   stops: Array<{ attributes: EsriStopFeatureAttributes }> | undefined,
   totalStops: number,
 ): number[] | undefined {
-  if (!stops || stops.length !== totalStops) return undefined;
+  if (!stops) return undefined;
 
-  const order = new Array<number>(totalStops);
-  const filled = new Array<boolean>(totalStops).fill(false);
-  for (let inputIdx = 0; inputIdx < stops.length; inputIdx++) {
-    const seq = stops[inputIdx]?.attributes?.Sequence;
-    if (
-      typeof seq !== 'number' ||
-      !Number.isInteger(seq) ||
-      seq < 1 ||
-      seq > totalStops ||
-      filled[seq - 1]
-    ) {
-      return undefined;
-    }
-    filled[seq - 1] = true;
-    order[seq - 1] = inputIdx;
-  }
+  // ESRI `Sequence` is 1-based; the shared helper expects 0-based visit
+  // positions. Non-numeric values are forwarded verbatim so the helper rejects
+  // them (it also enforces the length, range, and no-duplicates checks).
+  const positions = stops.map((stop) => {
+    const seq = stop?.attributes?.Sequence;
+    return typeof seq === 'number' ? seq - 1 : seq;
+  });
 
-  return order;
+  return invertWaypointPositions(positions, totalStops);
+}
+
+/**
+ * Whether an ESRI error body reports a stop it could not locate on the network.
+ *
+ * Live-verified shape: HTTP 200 with
+ * `{ error: { code: 400, message: 'Unable to complete operation.',
+ *   details: ['Location "Location 1" in "Stops" is unlocated. …'] } }`.
+ * The `details[]` array is the only place the cause appears.
+ */
+function hasEsriUnlocatedStop(body: Record<string, unknown> | null): boolean {
+  if (body === null) return false;
+  const errorField = body.error;
+  if (errorField === null || typeof errorField !== 'object') return false;
+  const details = (errorField as { details?: unknown }).details;
+  if (!Array.isArray(details)) return false;
+  return details.some(
+    (detail) => typeof detail === 'string' && /unlocated/i.test(detail),
+  );
 }
 
 function readBodyErrorCode(body: Record<string, unknown> | null): number | null {

@@ -70,5 +70,5 @@ Full reasoning lives in [`ARCHITECTURE.md`](./ARCHITECTURE.md); the short list:
 - **≥90% baseline-coverage rule.** A field belongs on the base operation input only if ≥90% of that operation's providers support it; everything else goes to `_passthrough` (input) / `raw` (output) or a narrowed type.
 - **Normalize at the wire layer.** Distance → meters, duration → seconds, coordinates → `{ lat, lng }`, geometry → Google precision-5 polyline. The four `Polyline` utilities are locked at v1.0.
 - **Per-connector locality.** `mapVendorError` and any outlier translation live inside `src/providers/<id>/` — never in `BaseConnector`. No casing-transform layer; keys are forwarded verbatim.
-- **`ProviderCode`**: 6 canonical + 5 location-extended values, surfaced via `ConnectorError`; the raw `Retry-After` rides in `e.cause` (no top-level `retryAfterSeconds`).
-- **OSRM** requires an explicit `baseUrl` and validates it pre-flight.
+- **`ProviderCode`**: 6 canonical + 7 location-extended values, surfaced via `ConnectorError`; the raw `Retry-After` rides in `e.cause` (no top-level `retryAfterSeconds`).
+- **OSRM** requires an explicit `baseUrl` and validates it at the top of each operation (not in the constructor).

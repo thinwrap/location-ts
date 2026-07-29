@@ -62,12 +62,24 @@ The public utility surface is fixed at four functions for v1.0. Adding a fifth u
 
 ### 4. OSRM self-host invariants
 
-OSRM is the only connector requiring an explicit `baseUrl` and shipping zero auth. The
-`OsrmRoutingConnector` / `OsrmMatrixConnector` constructors pre-flight-validate
-`baseUrl` (`http(s)://`, no trailing path) and throw typed `ConnectorError` with
-`providerCode: 'invalid_request'` before any HTTP call. The Table service forces
-`annotations=duration,distance` post-passthrough-merge to guarantee both fields on
-every cell.
+OSRM is the only connector requiring an explicit `baseUrl` and shipping zero auth.
+`OsrmRoutingConnector` / `OsrmMatrixConnector` validate `baseUrl` through the shared
+`validateOsrmBaseUrl` helper at the **top of each operation method** — not in the
+constructor, so a facade built at module load from environment config does not throw at
+import — and raise a typed `ConnectorError` with `providerCode: 'invalid_request'` before
+any HTTP call. It enforces exactly two rules — **present and non-empty**, and an
+**`http://` or `https://` scheme**. Without a scheme the concatenated URL reaches `fetch()`
+as a relative URL and rejects with `TypeError: Invalid URL`; `BaseConnector` then reports it
+as `provider_unavailable` behind a sanitized message, making a config typo look exactly
+like an outage.
+
+A **path prefix is explicitly allowed** — reverse-proxying OSRM at `https://host/osrm` is a
+normal deployment — and trailing slashes are stripped so the `${baseUrl}/route/v1/…`
+concatenation cannot emit a double slash. Do not add a "no trailing path" rule: it would
+reject valid self-hosts.
+
+The Table service forces `annotations=duration,distance` post-passthrough-merge to guarantee
+both fields on every cell.
 
 ### 5. Normalization invariants
 
@@ -83,7 +95,7 @@ convert at the wire layer before populating the result DTO.
 
 ### 6. Location-extended `ProviderCode` enum
 
-11 values: 6 notifications-canonical + 5 location-extended.
+13 values: 6 notifications-canonical + 7 location-extended.
 
 - Canonical: `rate_limited`, `auth_failed`, `invalid_request`, `invalid_recipient`,
   `provider_unavailable`, `unknown`.
@@ -91,7 +103,20 @@ convert at the wire layer before populating the result DTO.
   `unsupported_option` (e.g. OSRM rejecting `avoidTolls`),
   `unsupported_travel_mode` (e.g. ESRI/TomTom Matrix rejecting cycling),
   `profile_not_configured` (OSRM missing compiled travel-mode profile),
-  `matrix_polling_timeout` (HERE/TomTom Matrix exceeded 60s deadline).
+  `matrix_polling_timeout` (HERE/TomTom Matrix exceeded 60s deadline),
+  `no_route` (the provider answered but no route exists between the waypoints),
+  `timeout` (the request exceeded the transport's timeout).
+
+`no_route` exists because the vendors agree on nothing here — Google answers HTTP 200 with
+the `routes` key absent, HERE 200 with `routes: []` plus a `notices[]` code, Mapbox
+`code: "NoRoute"` on either 200 or 422, OSRM the same codes on a 400, TomTom a 400 with
+`detailedError.code`, Esri a 200 with an in-body `error.code: 400` whose `details[]` name an
+*unlocated* stop. All six were live-captured from the real APIs and are pinned as fixtures
+in `src/providers/no-route.spec.ts` — change one only against a fresh live capture, never
+against the vendor's documentation, which was wrong for three of the six.
+Note it means "the provider could not use these coordinates", which in practice is almost
+always an unsnappable waypoint: every provider tested happily routes Reykjavik→Oslo via
+ferry, so "genuinely disconnected road network" is close to unreachable in the real graph.
 
 ## Per-connector locality
 

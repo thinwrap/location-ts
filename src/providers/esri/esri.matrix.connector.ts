@@ -313,9 +313,11 @@ export class EsriMatrixConnector
   }
 
   /**
-   * Map ESRI (HTTP status, decoded body) → canonical {@link ProviderCode}
-   * Handles both HTTP-level codes and ESRI's 200-with-error-body
-   * case via `body.error.code`. */
+   * Map ESRI (HTTP status, decoded body) → canonical {@link ProviderCode}.
+   *
+   * Handles both HTTP-level codes and ESRI's 200-with-error-body case, which
+   * arrives via `body.error.code`.
+   */
   private mapVendorError(
     httpStatus: number,
     body: Record<string, unknown> | null,

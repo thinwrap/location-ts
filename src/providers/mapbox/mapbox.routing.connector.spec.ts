@@ -149,9 +149,13 @@ describe('MapboxRoutingConnector', () => {
       const params = parseUrlParams(url as string);
       expect(params.get('access_token')).toBe('pk.test123');
       expect(params.get('geometries')).toBe('polyline6');
-      expect(params.get('overview')).toBe('full');
-      expect(params.get('steps')).toBe('true');
-      expect(params.get('annotations')).toBe('duration,distance');
+      // Default fidelity is `simplified` — a 30x smaller geometry than `full`
+      // with identical distances/durations.
+      expect(params.get('overview')).toBe('simplified');
+      // Neither is read by any normalized field, and steps are the largest part
+      // of a Mapbox response — so neither is requested.
+      expect(params.has('steps')).toBe(false);
+      expect(params.has('annotations')).toBe(false);
       expect(result.totalDistanceMeters).toBe(5000);
       expect(result.totalDurationSeconds).toBe(300);
     });
@@ -354,6 +358,59 @@ describe('MapboxRoutingConnector', () => {
       // Canonical inverse of [1,2,0] is [2,0,1] (NOT the raw [1,2,0]).
       expect(result.waypointOrder).toEqual([2, 0, 1]);
     });
+
+    // The inversion is validated against the INPUT waypoint count and tracks
+    // which visit positions have been filled. Before that, a duplicate
+    // `waypoint_index` overwrote one slot and left another unwritten — an
+    // `undefined` hole in an array still typed `number[]`.
+    it.each([
+      [
+        'duplicate waypoint_index values',
+        [
+          { name: 'A', waypoint_index: 0 },
+          { name: 'B', waypoint_index: 0 },
+          { name: 'C', waypoint_index: 2 },
+        ],
+      ],
+      [
+        'a truncated waypoints array',
+        [
+          { name: 'A', waypoint_index: 0 },
+          { name: 'B', waypoint_index: 1 },
+        ],
+      ],
+      [
+        'an out-of-range waypoint_index',
+        [
+          { name: 'A', waypoint_index: 0 },
+          { name: 'B', waypoint_index: 1 },
+          { name: 'C', waypoint_index: 7 },
+        ],
+      ],
+      [
+        'a missing waypoint_index',
+        [
+          { name: 'A', waypoint_index: 0 },
+          { name: 'B' },
+          { name: 'C', waypoint_index: 2 },
+        ],
+      ],
+    ])('omits waypointOrder for %s', async (_label, waypoints) => {
+      mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse({ waypoints }));
+
+      const result = await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+          { lat: 2, lng: 2 },
+        ],
+        optimize: true,
+      });
+
+      expect(result.waypointOrder).toBeUndefined();
+      // The trip itself is still returned.
+      expect(result.totalDistanceMeters).toBe(7000);
+    });
   });
 
   describe('precision-6 to precision-5 polyline re-encoding', () => {
@@ -395,6 +452,127 @@ describe('MapboxRoutingConnector', () => {
         ],
       });
       expect(result.polyline).toBe('');
+    });
+  });
+
+  // `_passthrough` overriding connector-set query params is a documented escape
+  // hatch, but `geometries` is COUPLED to the decoder: a precision-5 `polyline`
+  // decoded at precision 6 divides every coordinate by 10 — a silent 10x
+  // position shift. The decoder therefore follows the effective request value.
+  describe('geometries / decoder coupling via _passthrough', () => {
+    const TWO_WAYPOINTS = [
+      { lat: 38.5, lng: -120.2 },
+      { lat: 43.252, lng: -126.453 },
+    ];
+
+    it('sends geometries=polyline6 by default', async () => {
+      mockFetch.mockResolvedValueOnce(buildDirectionsResponse());
+      await connector.route({ waypoints: TWO_WAYPOINTS });
+
+      const [url] = mockFetch.mock.calls[0]!;
+      expect(parseUrlParams(url as string).get('geometries')).toBe('polyline6');
+    });
+
+    it('treats an overridden geometries=polyline as already precision-5', async () => {
+      // A precision-5 polyline of the sample coordinates, served as-is.
+      const precision5 = encodePolyline(SAMPLE_LATLNGS);
+      mockFetch.mockResolvedValueOnce(
+        buildDirectionsResponse({ geometry: precision5 }),
+      );
+
+      const result = await connector.route({
+        waypoints: TWO_WAYPOINTS,
+        _passthrough: { query: { geometries: 'polyline' } },
+      });
+
+      // Emitted verbatim — NOT run through the precision-6 decoder.
+      expect(result.polyline).toBe(precision5);
+      const decoded = decodePolyline(result.polyline);
+      expect(decoded).toHaveLength(SAMPLE_LATLNGS.length);
+      for (let i = 0; i < SAMPLE_LATLNGS.length; i++) {
+        expect(Math.abs(decoded[i]!.lat - SAMPLE_LATLNGS[i]!.lat)).toBeLessThan(
+          5e-5,
+        );
+        expect(Math.abs(decoded[i]!.lng - SAMPLE_LATLNGS[i]!.lng)).toBeLessThan(
+          5e-5,
+        );
+      }
+    });
+
+    it('does not shift coordinates 10x when geometries is overridden', async () => {
+      const precision5 = encodePolyline(SAMPLE_LATLNGS);
+      mockFetch.mockResolvedValueOnce(
+        buildDirectionsResponse({ geometry: precision5 }),
+      );
+
+      const result = await connector.route({
+        waypoints: TWO_WAYPOINTS,
+        _passthrough: { query: { geometries: 'polyline' } },
+      });
+
+      // The regression this guards: decoding precision-5 at precision 6 yields
+      // ~3.85 instead of ~38.5.
+      const decoded = decodePolyline(result.polyline);
+      expect(decoded[0]!.lat).toBeCloseTo(38.5, 4);
+      expect(decoded[0]!.lat / 10).not.toBeCloseTo(38.5, 4);
+    });
+
+    it('encodes a GeoJSON LineString when geometries=geojson is requested', async () => {
+      mockFetch.mockResolvedValueOnce(
+        buildDirectionsResponse({
+          // GeoJSON is [lng, lat] order.
+          geometry: {
+            type: 'LineString',
+            coordinates: SAMPLE_LATLNGS.map((c) => [c.lng, c.lat]),
+          } as unknown as string,
+        }),
+      );
+
+      const result = await connector.route({
+        waypoints: TWO_WAYPOINTS,
+        _passthrough: { query: { geometries: 'geojson' } },
+      });
+
+      expect(result.polyline).toBe(encodePolyline(SAMPLE_LATLNGS));
+    });
+
+    it('emits an empty polyline for a malformed GeoJSON geometry', async () => {
+      mockFetch.mockResolvedValueOnce(
+        buildDirectionsResponse({
+          geometry: {
+            type: 'LineString',
+            coordinates: [['x', 'y']],
+          } as unknown as string,
+        }),
+      );
+
+      const result = await connector.route({
+        waypoints: TWO_WAYPOINTS,
+        _passthrough: { query: { geometries: 'geojson' } },
+      });
+
+      expect(result.polyline).toBe('');
+      // The route itself is still returned.
+      expect(result.totalDistanceMeters).toBe(5000);
+    });
+
+    it('honors the override on the optimized-trips dispatch too', async () => {
+      const precision5 = encodePolyline(SAMPLE_LATLNGS);
+      mockFetch.mockResolvedValueOnce(
+        buildOptimizedTripsResponse({ geometry: precision5 }),
+      );
+
+      const result = await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+          { lat: 2, lng: 2 },
+        ],
+        optimize: true,
+        _passthrough: { query: { geometries: 'polyline' } },
+      });
+
+      expect(result.polyline).toBe(precision5);
     });
   });
 
@@ -528,16 +706,16 @@ describe('MapboxRoutingConnector', () => {
       { label: 'HTTP 401 → auth_failed', status: 401, body: null, expected: 'auth_failed' },
       { label: 'HTTP 403 → auth_failed', status: 403, body: null, expected: 'auth_failed' },
       {
-        label: 'HTTP 422 NoRoute → invalid_request',
+        label: 'HTTP 422 NoRoute → no_route',
         status: 422,
         body: { code: 'NoRoute' },
-        expected: 'invalid_request',
+        expected: 'no_route',
       },
       {
-        label: 'HTTP 422 NoTrips → invalid_request',
+        label: 'HTTP 422 NoTrips → no_route',
         status: 422,
         body: { code: 'NoTrips' },
-        expected: 'invalid_request',
+        expected: 'no_route',
       },
       {
         label: 'HTTP 422 ProcessingError → unknown',
@@ -600,7 +778,10 @@ describe('MapboxRoutingConnector', () => {
         thrown = err;
       }
       expect(thrown).toBeInstanceOf(ConnectorError);
-      expect((thrown as ConnectorError).providerCode).toBe('invalid_request');
+      // Live-verified: Mapbox serves its no-route envelope with HTTP **200**
+      // (`{ code: 'NoRoute', routes: [] }`) as well as with 422 — the envelope
+      // code, not the status, is the signal.
+      expect((thrown as ConnectorError).providerCode).toBe('no_route');
     });
 
     // Success-path malformed body: a 200 OK whose JSON fails to parse yields

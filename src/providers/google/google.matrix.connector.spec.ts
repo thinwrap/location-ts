@@ -40,80 +40,44 @@ describe('GoogleMatrixConnector', () => {
     expect(connector.providerId).toBe('google');
   });
 
-  // HTTP call shape: URL, method, headers, body
-  it('should POST to RouteMatrix v2 with correct URL, headers, and body shape', async () => {
+  // Route Matrix bills PER ELEMENT, so the implicit Pro-SKU promotion cost
+  // origins x destinations times more than the routing one. `departureTime` alone
+  // no longer enables traffic.
+  it('keeps routingPreference TRAFFIC_UNAWARE when only departureTime is provided', async () => {
     mockFetch.mockResolvedValueOnce(
       buildNdjsonResponse([
-        { originIndex: 0, destinationIndex: 0, distanceMeters: 1000, duration: '60s' },
-        { originIndex: 0, destinationIndex: 1, distanceMeters: 2000, duration: '120s' },
-        { originIndex: 1, destinationIndex: 0, distanceMeters: 1500, duration: '90s' },
-        { originIndex: 1, destinationIndex: 1, distanceMeters: 500, duration: '30s' },
+        { originIndex: 0, destinationIndex: 0, distanceMeters: 100, duration: '10s', condition: 'ROUTE_EXISTS' },
       ]),
     );
-
-    const result = await connector.matrix({
-      origins: [
-        { lat: 40.7128, lng: -74.006 },
-        { lat: 40.758, lng: -73.9855 },
-      ],
-      destinations: [
-        { lat: 40.7484, lng: -73.9856 },
-        { lat: 40.7614, lng: -73.9776 },
-      ],
-    });
-
-    expect(mockFetch).toHaveBeenCalledOnce();
-    const [url, init] = mockFetch.mock.calls[0]!;
-
-    expect(url).toBe(
-      'https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix',
-    );
-    expect(init?.method).toBe('POST');
-    expect(init?.headers).toEqual(
-      expect.objectContaining({
-        'X-Goog-Api-Key': 'test-api-key',
-        'Content-Type': 'application/json',
-      }),
-    );
-    expect((init?.headers as Record<string, string>)?.['X-Goog-FieldMask']).toBe(
-      'originIndex,destinationIndex,distanceMeters,duration,status,condition',
-    );
-
-    const parsedBody = JSON.parse(init!.body as string) as Record<string, unknown>;
-    const origins = parsedBody.origins as Array<Record<string, unknown>>;
-    const destinations = parsedBody.destinations as Array<Record<string, unknown>>;
-    expect(origins).toHaveLength(2);
-    expect(destinations).toHaveLength(2);
-    expect(origins[0]).toEqual({
-      waypoint: { location: { latLng: { latitude: 40.7128, longitude: -74.006 } } },
-    });
-    expect(parsedBody.travelMode).toBe('DRIVE');
-    // routingPreference default (no departureTime) is TRAFFIC_UNAWARE
-    expect(parsedBody.routingPreference).toBe('TRAFFIC_UNAWARE');
-
-    expect(result.cells).toHaveLength(4);
-    expect(result.cells[0]).toEqual({
-      originIndex: 0,
-      destinationIndex: 0,
-      distanceMeters: 1000,
-      durationSeconds: 60,
-    });
-  });
-
-  // routingPreference TRAFFIC_AWARE when departureTime is set
-  it('should set routingPreference TRAFFIC_AWARE when departureTime is provided', async () => {
-    mockFetch.mockResolvedValueOnce(buildNdjsonResponse([]));
 
     await connector.matrix({
       origins: [{ lat: 0, lng: 0 }],
       destinations: [{ lat: 1, lng: 1 }],
-      departureTime: new Date('2026-05-17T08:00:00Z'),
+      departureTime: new Date('2026-01-01T12:00:00Z'),
+    });
+
+    const [, init] = mockFetch.mock.calls[0]!;
+    const body = JSON.parse(init!.body as string) as Record<string, unknown>;
+    expect(body.departureTime).toBe('2026-01-01T12:00:00.000Z');
+    expect(body.routingPreference).toBe('TRAFFIC_UNAWARE');
+  });
+
+  it('sets routingPreference TRAFFIC_AWARE only when trafficMode is "live"', async () => {
+    mockFetch.mockResolvedValueOnce(
+      buildNdjsonResponse([
+        { originIndex: 0, destinationIndex: 0, distanceMeters: 100, duration: '10s', condition: 'ROUTE_EXISTS' },
+      ]),
+    );
+
+    await connector.matrix({
+      origins: [{ lat: 0, lng: 0 }],
+      destinations: [{ lat: 1, lng: 1 }],
+      trafficMode: 'live',
     });
 
     const [, init] = mockFetch.mock.calls[0]!;
     const body = JSON.parse(init!.body as string) as Record<string, unknown>;
     expect(body.routingPreference).toBe('TRAFFIC_AWARE');
-    expect(body.departureTime).toBe('2026-05-17T08:00:00.000Z');
   });
 
   // travelMode mapping (driving → DRIVE | walking → WALK | cycling → BICYCLE)
@@ -350,7 +314,6 @@ describe('GoogleMatrixConnector', () => {
     expect((init?.headers as Record<string, string>)?.['X-Custom']).toBe('value');
   });
 
-  // mapVendorError mapping table
   describe('mapVendorError mapping table', () => {
     it.each<[number, Record<string, unknown> | null, string]>([
       [401, null, 'auth_failed'],

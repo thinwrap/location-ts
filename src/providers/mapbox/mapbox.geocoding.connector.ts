@@ -8,6 +8,9 @@ import type {
   IReverseGeocodeOptions,
   IReverseGeocodeResult,
   IAutocompleteOptions,
+  IAutocompletePrediction,
+  IPlaceDetailsOptions,
+  IPlaceDetailsResult,
   IAutocompleteResult,
 } from '../../types';
 import { ConnectorError } from '../../types';
@@ -23,12 +26,13 @@ import type {
 
 const GEOCODE_FORWARD_URL = 'https://api.mapbox.com/search/geocode/v6/forward';
 const GEOCODE_REVERSE_URL = 'https://api.mapbox.com/search/geocode/v6/reverse';
+const SEARCHBOX_RETRIEVE_URL = 'https://api.mapbox.com/search/searchbox/v1/retrieve';
 const SEARCHBOX_SUGGEST_URL =
   'https://api.mapbox.com/search/searchbox/v1/suggest';
 
 /**
- * Mapbox Geocoding connector (per-connector template + Mapbox
- * outlier: split endpoints for forward/reverse vs autocomplete).
+ * Mapbox Geocoding connector. Mapbox is an outlier here: forward/reverse and
+ * autocomplete live on different endpoints.
  *
  * Forward and reverse geocoding hit Geocoding v6:
  *   - `GET https://api.mapbox.com/search/geocode/v6/forward?q=…`
@@ -88,7 +92,7 @@ export class MapboxGeocodingConnector
     if (options.language) baseQuery.language = options.language;
 
     // `countryFilter` (ISO 3166-1 alpha-2) → Mapbox `country=`
-    // (lowercase, comma-separated). Per.
+    // (lowercase, comma-separated).
     if (options.countryFilter && options.countryFilter.length > 0) {
       baseQuery.country = options.countryFilter
         .map((code) => code.toLowerCase())
@@ -189,6 +193,14 @@ export class MapboxGeocodingConnector
 
     if (options.language) baseQuery.language = options.language;
 
+    // `countryFilter` (ISO 3166-1 alpha-2) → Searchbox `country=`
+    // (lowercase, comma-separated), same translation as forward geocode.
+    if (options.countryFilter && options.countryFilter.length > 0) {
+      baseQuery.country = options.countryFilter
+        .map((code) => code.toLowerCase())
+        .join(',');
+    }
+
     // `radius` is a documented no-op for Searchbox (no first-class radius).
     // For proximity biasing the consumer passes `_passthrough.query.proximity`.
 
@@ -215,10 +227,23 @@ export class MapboxGeocodingConnector
       throw this.malformedBodyError('autocomplete', response.status);
     }
     return {
-      predictions: (data.suggestions ?? []).map((s) => ({
-        description: s.full_address ?? s.name ?? '',
-        ...(s.mapbox_id !== undefined ? { placeId: s.mapbox_id } : {}),
-      })),
+      predictions: (data.suggestions ?? []).map((s) => {
+        const prediction: IAutocompletePrediction = {
+          description: s.full_address ?? s.name ?? '',
+          ...(s.mapbox_id !== undefined ? { placeId: s.mapbox_id } : {}),
+        };
+        // Search Box returns `name` (the POI/street) and `place_formatted` (the
+        // rest of the address) as separate fields.
+        if (typeof s.name === 'string' && s.name !== '') {
+          prediction.structuredFormat = {
+            mainText: s.name,
+            ...(typeof s.place_formatted === 'string' && s.place_formatted !== ''
+              ? { secondaryText: s.place_formatted }
+              : {}),
+          };
+        }
+        return prediction;
+      }),
       raw: data,
     };
   }
@@ -227,6 +252,78 @@ export class MapboxGeocodingConnector
    * Build a typed ConnectorError for a 2xx response whose body failed to parse
    * (empty / non-JSON), so a raw SyntaxError never escapes the connector.
    */
+  /**
+   * Resolve a Mapbox `mapbox_id` to a full candidate.
+   *
+   * `GET https://api.mapbox.com/search/searchbox/v1/retrieve/{mapbox_id}`.
+   *
+   * Pass the SAME `sessionToken` used for the preceding `autocomplete()` call:
+   * Search Box bills per *session*, so a matching token makes suggest+retrieve one
+   * billable session and a missing or fresh one makes it two.
+   */
+  async placeDetails(
+    options: IPlaceDetailsOptions & { sessionToken?: string },
+  ): Promise<IPlaceDetailsResult> {
+    const query: Record<string, string> = {
+      access_token: this.config.accessToken,
+    };
+    if (options.sessionToken !== undefined) {
+      query.session_token = options.sessionToken;
+    }
+    if (options.language !== undefined) {
+      query.language = options.language;
+    }
+
+    const merged = mergePassthrough({}, {}, options._passthrough, query);
+    const response = await this.sendGet(
+      `${SEARCHBOX_RETRIEVE_URL}/${encodeURIComponent(options.placeId)}`,
+      { headers: merged.headers, query: merged.query },
+    );
+
+    if (!response.ok) {
+      const errBody = (await response.json().catch(() => null)) as Record<
+        string,
+        unknown
+      > | null;
+      throw new ConnectorError({
+        message: `Mapbox Place Details failed: ${response.status}`,
+        statusCode: response.status,
+        providerCode: this.mapVendorError(response.status),
+        providerMessage: `Mapbox Place Details failed: ${response.status}`,
+        cause: errBody,
+      });
+    }
+
+    const data = (await response.json().catch(() => null)) as
+      | MapboxGeocodingV6Response
+      | null;
+    if (data === null) {
+      throw this.malformedBodyError('place details', response.status);
+    }
+
+    // Retrieve returns a GeoJSON FeatureCollection, the same shape as v6 geocode —
+    // so it reuses the geocode normalizer rather than duplicating it.
+    const feature = data.features?.[0];
+    const candidate = feature !== undefined ? normalizeFeature(feature) : null;
+    if (candidate === null) {
+      throw new ConnectorError({
+        message: 'Mapbox Place Details returned no feature',
+        statusCode: response.status,
+        providerCode: 'no_route',
+        providerMessage: 'Mapbox Place Details returned no feature',
+        cause: data,
+      });
+    }
+
+    const wantsName = options.include?.includes('name') === true;
+    const name = feature?.properties?.name;
+    return {
+      candidate,
+      ...(wantsName && typeof name === 'string' && name !== '' ? { name } : {}),
+      raw: data,
+    };
+  }
+
   private malformedBodyError(
     operation: string,
     statusCode: number,

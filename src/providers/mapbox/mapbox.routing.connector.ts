@@ -7,7 +7,13 @@ import type {
   ProviderCode,
 } from '../../types';
 import { ConnectorError } from '../../types';
-import { encodePolyline, joinCoords, mergePassthrough } from '../../utils';
+import {
+  assertRouteHasLegs,
+  encodePolyline,
+  invertWaypointPositions,
+  joinCoords,
+  mergePassthrough,
+} from '../../utils';
 import type { MapboxConfig } from './mapbox.config';
 
 const DIRECTIONS_URL = 'https://api.mapbox.com/directions/v5/mapbox';
@@ -63,7 +69,7 @@ export class MapboxRoutingConnector
 
     const profile = this.mapProfile(options.travelMode);
 
-    const response = useOptimized
+    const { response, geometries } = useOptimized
       ? await this.dispatchOptimized(options, profile)
       : await this.dispatchDirections(options, profile);
 
@@ -109,7 +115,9 @@ export class MapboxRoutingConnector
       throw new ConnectorError({
         message: 'Mapbox returned no routes',
         statusCode: response.status,
-        providerCode: 'unknown',
+        // A 2xx with an empty routes/trips array is Mapbox saying "nothing
+        // found", not a malformed response.
+        providerCode: 'no_route',
         providerMessage: 'Mapbox returned no routes',
         cause: data,
       });
@@ -119,14 +127,12 @@ export class MapboxRoutingConnector
       distanceMeters: leg.distance ?? 0,
       durationSeconds: leg.duration ?? 0,
     }));
+    assertRouteHasLegs(legs.length, options.waypoints.length, 'Mapbox Routing', data);
 
-    // Re-encode precision-6 polyline geometry as precision-5. When
-    // Mapbox returns an empty/missing geometry we emit an empty string rather
-    // than throwing — the leg distance/duration fields are still meaningful.
-    const polyline =
-      typeof route.geometry === 'string' && route.geometry !== ''
-        ? encodePolyline(decodePrecision6(route.geometry))
-        : '';
+    // Normalize the geometry to precision-5, decoding according to the
+    // `geometries` value actually sent — NOT the connector's default, which
+    // `_passthrough.query` may have overridden.
+    const polyline = normalizeGeometry(route.geometry, geometries);
 
     let waypointOrder: number[] | undefined;
     if (useOptimized && Array.isArray(data.waypoints)) {
@@ -135,21 +141,13 @@ export class MapboxRoutingConnector
       // `waypoints[]` in INPUT order, where each `waypoint_index` is the
       // position that input waypoint occupies in the optimized trip — i.e. the
       // INVERSE of the canonical. Invert it: place each input index at its
-      // visit position.
-      const wps = data.waypoints;
-      const order = new Array<number>(wps.length);
-      let valid = true;
-      for (let inputIdx = 0; inputIdx < wps.length; inputIdx++) {
-        const pos = wps[inputIdx]?.waypoint_index;
-        if (typeof pos !== 'number' || pos < 0 || pos >= wps.length) {
-          valid = false;
-          break;
-        }
-        order[pos] = inputIdx;
-      }
-      if (valid) {
-        waypointOrder = order;
-      }
+      // visit position. Validated against the INPUT waypoint count, so a
+      // truncated or duplicate-index `waypoints[]` omits the ordering instead
+      // of yielding a permutation that silently drops or repeats a waypoint.
+      waypointOrder = invertWaypointPositions(
+        data.waypoints.map((wp) => wp?.waypoint_index),
+        options.waypoints.length,
+      );
     }
 
     return {
@@ -164,21 +162,21 @@ export class MapboxRoutingConnector
 
   /**
    * Plain `/directions/v5` GET dispatch. Asks Mapbox for `polyline6`
-   * geometry; we re-encode to precision-5 downstream.
+   * geometry; we re-encode to precision-5 downstream. Returns the effective
+   * `geometries` alongside the response so the caller decodes what was actually
+   * requested.
    */
   private async dispatchDirections(
     options: IRoutingOptions,
     profile: string,
-  ): Promise<Response> {
+  ): Promise<MapboxDispatch> {
     const coords = joinCoords(options.waypoints, 'lnglat', ';');
     const url = `${DIRECTIONS_URL}/${profile}/${coords}`;
 
     const baseQuery: Record<string, string> = {
       access_token: this.config.accessToken,
       geometries: 'polyline6',
-      overview: 'full',
-      steps: 'true',
-      annotations: 'duration,distance',
+      overview: mapboxOverview(options),
     };
 
     const excludes = buildExcludes(options);
@@ -195,7 +193,11 @@ export class MapboxRoutingConnector
       baseQuery,
     );
 
-    return this.sendGet(url, { headers: merged.headers, query: merged.query });
+    const response = await this.sendGet(url, {
+      headers: merged.headers,
+      query: merged.query,
+    });
+    return { response, geometries: readEffectiveGeometries(merged.query) };
   }
 
   /**
@@ -213,16 +215,14 @@ export class MapboxRoutingConnector
   private async dispatchOptimized(
     options: IRoutingOptions,
     profile: string,
-  ): Promise<Response> {
+  ): Promise<MapboxDispatch> {
     const coords = joinCoords(options.waypoints, 'lnglat', ';');
     const url = `${OPTIMIZED_TRIPS_URL}/${profile}/${coords}`;
 
     const baseQuery: Record<string, string> = {
       access_token: this.config.accessToken,
       geometries: 'polyline6',
-      overview: 'full',
-      steps: 'true',
-      annotations: 'duration,distance',
+      overview: mapboxOverview(options),
       roundtrip: options.isRoundTrip === true ? 'true' : 'false',
     };
 
@@ -263,7 +263,11 @@ export class MapboxRoutingConnector
       baseQuery,
     );
 
-    return this.sendGet(url, { headers: merged.headers, query: merged.query });
+    const response = await this.sendGet(url, {
+      headers: merged.headers,
+      query: merged.query,
+    });
+    return { response, geometries: readEffectiveGeometries(merged.query) };
   }
 
   /**
@@ -288,8 +292,11 @@ export class MapboxRoutingConnector
     } else if (status === 429) {
       providerCode = 'rate_limited';
     } else if (status === 422) {
-      if (code === 'NoRoute' || code === 'NoTrips') {
-        providerCode = 'invalid_request';
+      // Live-verified: Mapbox serves its no-route envelope with HTTP 422, so the
+      // envelope code — not the status — decides whether this is "no route" or a
+      // malformed request.
+      if (code === 'NoRoute' || code === 'NoTrips' || code === 'NoSegment') {
+        providerCode = 'no_route';
       } else if (code === 'ProcessingError') {
         providerCode = 'unknown';
       } else {
@@ -326,9 +333,13 @@ export class MapboxRoutingConnector
    */
   private mapBodyCode(code: string): ProviderCode {
     switch (code) {
+      // The request was well-formed and Mapbox answered — there is simply no
+      // connecting route (or no road near a coordinate to snap to). A business
+      // outcome to branch on, not a client bug.
       case 'NoRoute':
       case 'NoTrips':
       case 'NoSegment':
+        return 'no_route';
       case 'InvalidInput':
         return 'invalid_request';
       case 'ProcessingError':
@@ -360,10 +371,24 @@ interface MapboxRoutingLegRaw {
 }
 
 interface MapboxRoutingRouteRaw {
-  geometry?: string;
+  /**
+   * An encoded polyline (`geometries=polyline6` / `polyline`) or a GeoJSON
+   * LineString object (`geometries=geojson`). The shape follows the effective
+   * `geometries` request parameter, which `_passthrough.query` can override.
+   */
+  geometry?: string | { coordinates?: unknown };
   legs?: MapboxRoutingLegRaw[];
   distance?: number;
   duration?: number;
+}
+
+/**
+ * A dispatch result: the HTTP response plus the `geometries` value actually
+ * sent, which the geometry normalizer must match.
+ */
+interface MapboxDispatch {
+  response: Response;
+  geometries: string;
 }
 
 interface MapboxRoutingWaypointRaw {
@@ -378,12 +403,80 @@ interface MapboxRoutingResponse {
   waypoints?: MapboxRoutingWaypointRaw[];
 }
 
+/**
+ * Map the normalized `polylineQuality` onto Mapbox's `overview`.
+ *
+ * `simplified` is the default and the reason is measured, not aesthetic: on one
+ * ~140km route the simplified geometry was 203 characters against 6146 for
+ * `full` — a 30x payload for vertices most callers never look at, with identical
+ * distances and durations.
+ *
+ * `steps` and `annotations` are deliberately NOT sent. Nothing in
+ * `IRoutingResult` reads turn-by-turn steps or per-segment annotations, and
+ * steps are the single largest part of a Mapbox routing response — so requesting
+ * them inflated every response for data the wrapper then discarded. A consumer
+ * who wants them adds `_passthrough.query`.
+ */
+function mapboxOverview(options: IRoutingOptions): string {
+  return options.polylineQuality === 'detailed' ? 'full' : 'simplified';
+}
+
 function buildExcludes(options: IRoutingOptions): string {
   const excludes: string[] = [];
   if (options.avoidTolls) excludes.push('toll');
   if (options.avoidFerries) excludes.push('ferry');
   if (options.avoidHighways) excludes.push('motorway');
   return excludes.join(',');
+}
+
+/**
+ * The effective `geometries` value actually sent, after `_passthrough.query`
+ * has been merged over the connector's own `polyline6`.
+ *
+ * The geometry decoder MUST match what was requested. Decoding a precision-5
+ * `polyline` with the precision-6 decoder divides every coordinate by 10 — a
+ * silent 10x position shift, not an error — so the connector reads back its own
+ * effective query rather than assuming its default survived the override.
+ */
+function readEffectiveGeometries(query: Record<string, string>): string {
+  const value = query.geometries;
+  return typeof value === 'string' && value !== '' ? value : 'polyline6';
+}
+
+/**
+ * Normalize a Mapbox route geometry to the canonical Google-precision-5
+ * polyline, honoring the effective `geometries` parameter:
+ *
+ * - `polyline6` (connector default) — decode at precision 6, re-encode at 5.
+ * - `polyline` — already precision-5; emit verbatim (as the OSRM connector does).
+ * - `geojson` — encode the `[lng, lat]` coordinate pairs at precision 5.
+ *
+ * Returns an empty string for an absent, empty, or unparseable geometry rather
+ * than throwing — the leg distance/duration fields are still meaningful.
+ */
+function normalizeGeometry(
+  geometry: string | { coordinates?: unknown } | undefined,
+  geometries: string,
+): string {
+  if (geometries === 'geojson') {
+    const coordinates =
+      typeof geometry === 'object' && geometry !== null
+        ? geometry.coordinates
+        : undefined;
+    if (!Array.isArray(coordinates)) return '';
+    const points: LatLng[] = [];
+    for (const pair of coordinates) {
+      if (!Array.isArray(pair)) return '';
+      const [lng, lat] = pair as unknown[];
+      if (typeof lat !== 'number' || typeof lng !== 'number') return '';
+      points.push({ lat, lng });
+    }
+    return encodePolyline(points);
+  }
+
+  if (typeof geometry !== 'string' || geometry === '') return '';
+  if (geometries === 'polyline') return geometry;
+  return encodePolyline(decodePrecision6(geometry));
 }
 
 /**

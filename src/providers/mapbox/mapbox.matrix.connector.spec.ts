@@ -285,7 +285,6 @@ describe('MapboxMatrixConnector', () => {
     });
   });
 
-  // mapVendorError mapping
   describe('mapVendorError mapping table', () => {
     it.each<[number, Record<string, unknown> | null, string]>([
       [401, null, 'auth_failed'],

@@ -31,6 +31,10 @@ ArcGIS Enterprise on-prem deployments are supported by overriding endpoints in `
 ## Vendor docs
 
 - Route service: https://developers.arcgis.com/rest/routing/route-service-direct/
+- **Response fields (the one that is easy to miss):** https://doc.esri.com/en/arcgis-pro/latest/tool-reference/ready-to-use/output-findroutes.html
+  — the REST page above documents **parameters only**, and its "Types" link is *input*
+  data types. Every output FIELD (`Cumul_*`, `Status`, `DistanceToNetworkInMeters`,
+  `DirectionPointType`) is defined here, in the ArcGIS Pro tool reference.
 - OD Cost Matrix: https://developers.arcgis.com/rest/routing/travelCostMatrix-service-direct/
 - Geocoding service: https://developers.arcgis.com/rest/geocode/
 - Service Area: https://developers.arcgis.com/rest/routing/serviceArea-service-direct/
@@ -45,6 +49,39 @@ ArcGIS Enterprise on-prem deployments are supported by overriding endpoints in `
 
 Standard `IRoutingOptions`. `optimize: true` maps to `findBestSequence=true`. Path geometry returned as coordinate arrays `[[[lng,lat],...]]`; encoded to standard polyline.
 
+### Per-leg values come from the stops FeatureSet, not from directions
+
+Legs are differences of the per-stop **cumulative** costs
+(`Cumul_TravelTime` / `Cumul_Kilometers`), so the connector sends `returnStops=true` +
+`accumulateAttributeNames` and `returnDirections=false`. Esri documents the
+turn-by-turn output as **superseded** — *"Legacy: This output type has been superseded
+by the DirectionPoints and DirectionLines output classes, which should be used for all
+new scripts and workflows"* — and its `esriDMT*` maneuver values are not enumerated in
+the REST reference at all.
+
+Three consequences:
+
+- Legs sum to the totals exactly, since both come from the same cumulative series.
+- **`result.raw` contains no `directions`.** For turn-by-turn text, request it through
+  `_passthrough` (`returnDirections`, `directionsOutputType`) and prefer
+  `esriDOTFeatureSets`, whose `DirectionPointType` is a documented integer enum —
+  Arrive (50), Depart (51), Straight (52) … — over the legacy `esriDMT*` strings.
+- The cumulative field name follows the active impedance (`Cumul_TravelTime` driving,
+  `Cumul_WalkTime` walking). The connector discovers the key; this only matters if you
+  read `result.raw` yourself.
+
+### Out-of-network coordinates: read the snap distance
+
+Each stop in `result.raw` carries `DistanceToNetworkInMeters` — how far the coordinate was
+moved to reach a routable road — plus a `Status` code (`0` OK, `1` Not Located, `5` Not
+Reached, `7` Not located on closest).
+
+A coordinate far from any road still yields a well-formed route to wherever it snapped,
+so that distance is the only signal it happened. The acceptable threshold is application
+policy — a few hundred metres is normal for a rural pickup and disqualifying for a city
+address — so the library does not pick one. This is the Esri analogue of OSRM's
+`waypoints[].distance`.
+
 ### Error mapping
 
 | Vendor signal | `providerCode` |
@@ -58,6 +95,30 @@ Standard `IRoutingOptions`. `optimize: true` maps to `findBestSequence=true`. Pa
 ### Retry-After
 
 ESRI's API tier may or may not document `Retry-After` (depends on subscription). When present on HTTP 429, surfaced via `cause.retryAfter` + `providerMessage`.
+
+### Turn-by-turn instructions
+
+**Not normalized** — `IRoutingResult` has no `steps` field. Unlike the other five providers this
+is a *re-enable* rather than an opt-in: the service default is `returnDirections=true`, and the
+connector sends `false` explicitly so the payload is not shipped on every call.
+
+```typescript
+const res = await routing.route({
+  waypoints: [origin, destination],
+  _passthrough: { body: { returnDirections: 'true' } },
+});
+```
+
+Directions land at `raw.directions[].features[].attributes` — `text`, `maneuverType`, `length`,
+`time`. `returnDirections` is its own form field, so this merges additively (values are
+stringified, so `true` works as well as `'true'`).
+
+> **Esri documents this output as superseded**, in favour of the DirectionPoints and
+> DirectionLines output classes, which it recommends "for all new scripts and workflows". Its
+> `esriDMT*` `maneuverType` enumeration is not published in the REST reference at all — only in
+> the Runtime SDK references and legacy JS 3.x docs. Legs and totals in `IRoutingResult` come
+> from the `stops` cumulative costs (`Cumul_*`) precisely so the normalized path does not depend
+> on this surface.
 
 ## Matrix
 
@@ -76,6 +137,23 @@ Standard `IMatrixOptions`. `travelMode` cycling raises `ConnectorError` with `pr
 - Forward: `GET .../GeocodeServer/findAddressCandidates`
 - Reverse: `GET .../GeocodeServer/reverseGeocode`
 - Suggest: `GET .../GeocodeServer/suggest`
+
+### Country filter
+
+`countryFilter` (ISO 3166-1 alpha-2 — ESRI uses alpha-2 directly) is translated to
+`countryCode=<comma-csv>` on **forward geocode and suggest alike**.
+
+```typescript
+await geo.autocomplete({ input: 'Dizen', countryFilter: ['IL', 'PS'] });
+// → ...&countryCode=IL,PS
+```
+
+### `suggest` returns the least of the five
+
+A suggestion carries only `text` and `magicKey`. That is why ESRI is the one provider
+where `structuredFormat` is always absent (there is no distinct main part to split out),
+and it returns no match-highlighting offsets and no result types either — of the five
+geocoders only Google and HERE return offsets. `magicKey` becomes `placeId`.
 
 ## Isochrone
 

@@ -93,3 +93,23 @@ export function mapEsriTravelMode(
       return undefined;
   }
 }
+
+/**
+ * The time attribute to accumulate so the response carries `Cumul_<attr>` per stop.
+ *
+ * The cumulative field name is suffixed with the ATTRIBUTE name, and the attribute
+ * follows the travel mode's impedance — so driving yields `Cumul_TravelTime` and
+ * walking `Cumul_WalkTime` (both verified live). Requesting the wrong one produces
+ * no cumulative field at all rather than an error, which is why this mirrors
+ * {@link mapEsriTravelMode} exactly: any mode that sends the walking travel-mode
+ * JSON must accumulate `WalkTime`, and anything on the service default accumulates
+ * `TravelTime`.
+ *
+ * Keep this in step with `mapEsriTravelMode`. If a truck mode is ever added, its
+ * impedance is `TruckTravelTime`.
+ */
+export function esriTimeAttributeFor(
+  mode: 'driving' | 'walking' | 'cycling' | undefined,
+): string {
+  return mode === 'walking' ? 'WalkTime' : 'TravelTime';
+}

@@ -436,7 +436,6 @@ describe('HereMatrixConnector', () => {
     expect(caught?.message).toBe('HERE Matrix job failed');
   });
 
-  // mapVendorError mapping table at the submit step
   describe('mapVendorError mapping table (submit phase)', () => {
     it.each<[number, string]>([
       [401, 'auth_failed'],

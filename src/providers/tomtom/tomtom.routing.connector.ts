@@ -1,35 +1,31 @@
 import { BaseConnector } from '../../base/base.connector';
 import type {
   IRoutingConnector,
+  IRoutingLeg,
   IRoutingOptions,
   IRoutingResult,
   LatLng,
   ProviderCode,
 } from '../../types';
 import { ConnectorError } from '../../types';
-import { encodePolyline, joinCoords, mergePassthrough } from '../../utils';
+import {
+  encodePolyline,
+  isCompleteWaypointOrder,
+  joinCoords,
+  mergePassthrough,
+} from '../../utils';
 import type { TomTomConfig } from './tomtom.config';
 import type { TomTomRouteResponse } from './tomtom.types';
 
 const ROUTE_URL = 'https://api.tomtom.com/routing/1/calculateRoute';
 
 /**
- * TomTom Routing v1 connector — per-connector template.
+ * TomTom Routing v1 connector.
  *
  * GETs `https://api.tomtom.com/routing/1/calculateRoute/{locations}/json` with
  * the API key carried via the `key=` query parameter. `{locations}` is the
  * colon-separated `lat,lng:lat,lng:...` path-coords form unique to TomTom
  * (built via {@link joinCoords} with `'latlng'` + `':'`).
- *
- * Body shape follows the per-connector template:
- *   1. Build vendor query string.
- *   2. {@link mergePassthrough} body / headers / query (4-arg form).
- *   3. Call {@link BaseConnector.sendGet} with merged headers + query.
- *   4. On non-2xx, parse body + raise {@link ConnectorError} via
- *      {@link mapVendorError} with Retry-After surfaced in providerMessage +
- * `cause.retryAfter` by design
- *      (no structured `retryAfterSeconds` field).
- *   5. Normalize 2xx body into the operation result DTO.
  *
  * Travel mode mapping: `driving → car`, `walking → pedestrian`,
  * `cycling → bicycle`. Avoid flags collapse into a comma-joined
@@ -94,6 +90,20 @@ export class TomTomRoutingConnector
       baseQuery.departAt = options.departureTime.toISOString();
     }
 
+    // TomTom's `traffic` parameter defaults to ON at the vendor, so leaving it
+    // unset would contradict the normalized default of `trafficMode: 'none'`.
+    // Send it explicitly in both directions.
+    baseQuery.traffic = options.trafficMode === 'live' ? 'true' : 'false';
+
+    // `noTrafficTravelTimeInSeconds` only appears when `computeTravelTimeFor=all`
+    // is requested, and that asks TomTom for extra computed values — so unlike
+    // Google/HERE it is a real request change and stays strictly opt-in.
+    const wantsNoTrafficTime =
+      options.include?.includes('durationWithoutTraffic') === true;
+    if (wantsNoTrafficTime) {
+      baseQuery.computeTravelTimeFor = 'all';
+    }
+
     const avoids = buildAvoids(options);
     if (avoids !== '') {
       baseQuery.avoid = avoids;
@@ -134,16 +144,23 @@ export class TomTomRoutingConnector
       throw new ConnectorError({
         message: 'TomTom Routing returned no routes',
         statusCode: response.status,
-        providerCode: 'unknown',
+        providerCode: 'no_route',
         providerMessage: 'TomTom Routing returned no routes',
         cause: data,
       });
     }
 
-    const legs = (route.legs ?? []).map((leg) => ({
-      distanceMeters: leg.summary?.lengthInMeters ?? 0,
-      durationSeconds: leg.summary?.travelTimeInSeconds ?? 0,
-    }));
+    const legs = (route.legs ?? []).map((leg) => {
+      const normalized: IRoutingLeg = {
+        distanceMeters: leg.summary?.lengthInMeters ?? 0,
+        durationSeconds: leg.summary?.travelTimeInSeconds ?? 0,
+      };
+      const noTraffic = leg.summary?.noTrafficTravelTimeInSeconds;
+      if (wantsNoTrafficTime && typeof noTraffic === 'number') {
+        normalized.durationWithoutTrafficSeconds = noTraffic;
+      }
+      return normalized;
+    });
 
     // Flatten all leg points (TomTom uses { latitude, longitude } full-word
     // keys) into LatLng[] and re-encode to precision-5.
@@ -163,12 +180,26 @@ export class TomTomRoutingConnector
       // visiting sequence of INPUT indices, so project each intermediate to its
       // input index (+1) and bracket with the fixed origin (0) and
       // destination (waypoints.length - 1).
+      //
+      // The projection is only meaningful if it yields a complete permutation:
+      // a short, duplicated, or sentinel `providedIndex` list would otherwise
+      // produce an ordering that silently drops or repeats a waypoint. Validate
+      // and omit rather than emit a corrupt one.
       const intermediates = data.optimizedWaypoints
         .slice()
         .sort((a, b) => a.optimizedIndex - b.optimizedIndex)
-        .map((wp) => wp.providedIndex + 1);
-      waypointOrder = [0, ...intermediates, waypoints.length - 1];
+        .map((wp) =>
+          typeof wp.providedIndex === 'number'
+            ? wp.providedIndex + 1
+            : wp.providedIndex,
+        );
+      const candidate = [0, ...intermediates, waypoints.length - 1];
+      if (isCompleteWaypointOrder(candidate, waypoints.length)) {
+        waypointOrder = candidate;
+      }
     }
+
+    const totalNoTraffic = route.summary?.noTrafficTravelTimeInSeconds;
 
     return {
       legs,
@@ -176,6 +207,9 @@ export class TomTomRoutingConnector
       totalDurationSeconds: route.summary?.travelTimeInSeconds ?? 0,
       polyline,
       ...(waypointOrder !== undefined ? { waypointOrder } : {}),
+      ...(wantsNoTrafficTime && typeof totalNoTraffic === 'number'
+        ? { totalDurationWithoutTrafficSeconds: totalNoTraffic }
+        : {}),
       raw: data,
     };
   }
@@ -213,12 +247,21 @@ export class TomTomRoutingConnector
    */
   private mapVendorError(
     httpStatus: number,
-    _body: Record<string, unknown> | null,
+    body: Record<string, unknown> | null,
   ): ProviderCode {
     if (httpStatus === 401 || httpStatus === 403) return 'auth_failed';
     if (httpStatus === 429) return 'rate_limited';
-    if (httpStatus === 400 || httpStatus === 404) return 'invalid_request';
     if (httpStatus >= 500 && httpStatus < 600) return 'provider_unavailable';
+
+    // TomTom reports an unroutable request as HTTP 400 with a machine-readable
+    // `detailedError.code`, so the status alone cannot distinguish "no route"
+    // from "malformed request" — read the code.
+    const detailed = readTomTomErrorCode(body);
+    if (detailed === 'MAP_MATCHING_FAILURE' || detailed === 'NO_ROUTE_FOUND') {
+      return 'no_route';
+    }
+
+    if (httpStatus === 400 || httpStatus === 404) return 'invalid_request';
     return 'unknown';
   }
 
@@ -247,6 +290,24 @@ export class TomTomRoutingConnector
 // ---------------------------------------------------------------------------
 // Module-private helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Read `detailedError.code` from a TomTom error body.
+ *
+ * Live-verified: an unroutable request returns HTTP 400 with
+ * `{ detailedError: { code: 'MAP_MATCHING_FAILURE', message: '… Origin (40, -30)' } }`.
+ * `NO_ROUTE_FOUND` is TomTom's documented sibling code for the same class of
+ * outcome; it is mapped too, but note it is doc-sourced rather than reproduced
+ * live — every live attempt at a truly unreachable pair returned a route,
+ * because TomTom (like every other provider tested) routes via ferries.
+ */
+function readTomTomErrorCode(body: Record<string, unknown> | null): string | null {
+  if (body === null) return null;
+  const detailed = body.detailedError;
+  if (detailed === null || typeof detailed !== 'object') return null;
+  const code = (detailed as { code?: unknown }).code;
+  return typeof code === 'string' && code !== '' ? code : null;
+}
 
 function mapTravelMode(mode?: 'driving' | 'walking' | 'cycling'): string {
   switch (mode) {

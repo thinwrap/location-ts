@@ -7,7 +7,10 @@ import type {
   IReverseGeocodeOptions,
   IReverseGeocodeResult,
   IAutocompleteOptions,
+  IAutocompletePrediction,
   IAutocompleteResult,
+  IPlaceDetailsOptions,
+  IPlaceDetailsResult,
 } from '../../types';
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
@@ -20,12 +23,12 @@ import type {
 } from './google.types';
 
 const GEOCODE_URL = 'https://maps.googleapis.com/maps/api/geocode/json';
+const PLACE_DETAILS_URL = 'https://places.googleapis.com/v1/places';
 const PLACES_AUTOCOMPLETE_NEW_URL =
   'https://places.googleapis.com/v1/places:autocomplete';
 
 /**
- * Google Geocoding + Places Autocomplete NEW connector — per-connector template
- *
+ * Google Geocoding + Places Autocomplete NEW connector.
  *
  * - Forward/reverse geocode → `GET https://maps.googleapis.com/maps/api/geocode/json`
  *   with `key=` query auth. `countryFilter` translates mechanically into
@@ -103,7 +106,9 @@ export class GoogleGeocodingConnector
     this.enforceGoogleStatus(response, body);
 
     return {
-      candidates: (body?.results ?? []).map((r) => normalizeCandidate(r)),
+      candidates: (body?.results ?? [])
+        .map((r) => normalizeCandidate(r))
+        .filter((c): c is IGeocodeCandidate => c !== null),
       raw: body,
     };
   }
@@ -146,13 +151,60 @@ export class GoogleGeocodingConnector
 
     // reverse-geocode mirrors forward shape (`candidates[]`).
     return {
-      candidates: (body?.results ?? []).map((r) => normalizeCandidate(r)),
+      candidates: (body?.results ?? [])
+        .map((r) => normalizeCandidate(r))
+        .filter((c): c is IGeocodeCandidate => c !== null),
       raw: body,
     };
   }
 
+  /**
+   * `countryFilter` (ISO 3166-1 alpha-2) → Autocomplete's
+   * `includedRegionCodes`.
+   *
+   * Not the same translation as forward geocode's `components=country:`. This
+   * endpoint documents **ccTLD** two-character values, which diverge from ISO on
+   * the United Kingdom — ISO `GB` is ccTLD `uk` — so passing the ISO code
+   * through unchanged would silently return no UK predictions rather than
+   * erroring. Google also caps the list at 15; over that it rejects the whole
+   * request, so we say so locally instead of spending a round-trip to find out.
+   */
+  private toIncludedRegionCodes(
+    countryFilter: string[] | undefined,
+  ): string[] | undefined {
+    if (countryFilter === undefined || countryFilter.length === 0) {
+      return undefined;
+    }
+
+    const codes: string[] = [];
+    for (const code of countryFilter) {
+      if (typeof code !== 'string' || code.trim() === '') continue;
+      if (!/^[A-Za-z]{2}$/.test(code)) {
+        throw new ConnectorError({
+          message: `Invalid countryFilter entry: ${code} (expected ISO 3166-1 alpha-2)`,
+          statusCode: null,
+          providerCode: 'invalid_request',
+          providerMessage: `Invalid countryFilter entry: ${code} (expected ISO 3166-1 alpha-2)`,
+        });
+      }
+      const lower = code.toLowerCase();
+      codes.push(lower === 'gb' ? 'uk' : lower);
+    }
+
+    if (codes.length === 0) return undefined;
+    if (codes.length > 15) {
+      throw new ConnectorError({
+        message: `Google Autocomplete accepts at most 15 countryFilter entries (received ${codes.length})`,
+        statusCode: null,
+        providerCode: 'invalid_request',
+        providerMessage: `Google Autocomplete accepts at most 15 countryFilter entries (received ${codes.length})`,
+      });
+    }
+    return codes;
+  }
+
   async autocomplete(
-    options: IAutocompleteOptions,
+    options: IAutocompleteOptions & { sessionToken?: string },
   ): Promise<IAutocompleteResult> {
     // Places Autocomplete NEW: POST + JSON body + header auth. Different host
     // from the legacy `/place/autocomplete/json` API.
@@ -161,6 +213,20 @@ export class GoogleGeocodingConnector
     };
     if (options.language !== undefined) {
       body.languageCode = options.language;
+    }
+    const includedRegionCodes = this.toIncludedRegionCodes(
+      options.countryFilter,
+    );
+    if (includedRegionCodes !== undefined) {
+      body.includedRegionCodes = includedRegionCodes;
+    }
+    // Autocomplete is billed PER SESSION when a session token ties the keystroke
+    // requests to the `placeDetails` call that closes them; without one, every
+    // keystroke is billed as its own request. Verified live: `sessionToken` is a
+    // recognized BODY field here (a bogus name is rejected with
+    // INVALID_ARGUMENT), and a QUERY param on Place Details.
+    if (options.sessionToken !== undefined) {
+      body.sessionToken = options.sessionToken;
     }
     if (options.location !== undefined) {
       // Fail fast on NaN/non-finite coordinates before a network round-trip.
@@ -207,15 +273,28 @@ export class GoogleGeocodingConnector
       );
     }
 
-    const predictions: Array<{ description: string; placeId?: string }> = [];
+    const predictions: IAutocompletePrediction[] = [];
     for (const s of respBody?.suggestions ?? []) {
       const pred = s.placePrediction;
       if (!pred) continue;
-      const entry: { description: string; placeId?: string } = {
+      const entry: IAutocompletePrediction = {
         description: pred.text?.text ?? '',
       };
       if (pred.placeId !== undefined) {
         entry.placeId = pred.placeId;
+      }
+      // `structuredFormat` is default-on for Places Autocomplete, so surfacing it
+      // costs nothing. Only emitted when Google gives a non-empty main part —
+      // never reconstructed by splitting `text`.
+      const mainText = pred.structuredFormat?.mainText?.text;
+      if (typeof mainText === 'string' && mainText !== '') {
+        const secondaryText = pred.structuredFormat?.secondaryText?.text;
+        entry.structuredFormat = {
+          mainText,
+          ...(typeof secondaryText === 'string' && secondaryText !== ''
+            ? { secondaryText }
+            : {}),
+        };
       }
       predictions.push(entry);
     }
@@ -246,6 +325,132 @@ export class GoogleGeocodingConnector
   }
 
   /** Build a `ConnectorError` for a non-2xx HTTP response. */
+  /**
+   * Resolve a Google `placeId` to a full candidate.
+   *
+   * `GET https://places.googleapis.com/v1/places/{placeId}`.
+   *
+   * Google's Place Details field mask is MANDATORY *and* selects the SKU tier —
+   * `displayName` is a Pro-tier field, so it is requested only behind
+   * `include: ['name']`. Note this is the opposite of Compute Routes, whose SKU
+   * is driven by request *features*: the rule has to be checked per API rather
+   * than generalized.
+   *
+   * Pass the SAME `sessionToken` used for the preceding `autocomplete()` calls to
+   * close the session and be billed once for the interaction rather than per
+   * keystroke.
+   */
+  async placeDetails(
+    options: IPlaceDetailsOptions & { sessionToken?: string },
+  ): Promise<IPlaceDetailsResult> {
+    const wantsName = options.include?.includes('name') === true;
+
+    const fieldMask = [
+      'id',
+      'formattedAddress',
+      'location',
+      'viewport',
+      ...(wantsName ? ['displayName'] : []),
+    ].join(',');
+
+    const headers: Record<string, string> = {
+      'X-Goog-Api-Key': this.config.apiKey,
+      'X-Goog-FieldMask': fieldMask,
+    };
+
+    const query: Record<string, string> = {};
+    if (options.language !== undefined) {
+      query.languageCode = options.language;
+    }
+    // A query param here, unlike the autocomplete leg where it is a body field.
+    // Verified live on both; a bogus name is rejected either way.
+    if (options.sessionToken !== undefined) {
+      query.sessionToken = options.sessionToken;
+    }
+
+    const merged = mergePassthrough({}, headers, options._passthrough, query);
+
+    const response = await this.sendGet(
+      `${PLACE_DETAILS_URL}/${encodeURIComponent(options.placeId)}`,
+      { headers: merged.headers, query: merged.query },
+    );
+
+    const body = (await response.json().catch(() => null)) as Record<
+      string,
+      unknown
+    > | null;
+
+    if (!response.ok) {
+      throw this.toConnectorError(
+        response,
+        mapPlacesNewError(body),
+        'Google Place Details failed',
+      );
+    }
+    if (body === null) {
+      throw new ConnectorError({
+        message: 'Google Place Details returned a malformed response body',
+        statusCode: response.status,
+        providerCode: 'unknown',
+        providerMessage: 'Google Place Details returned a malformed response body',
+        cause: body,
+      });
+    }
+
+    const location = body.location as { latitude?: unknown; longitude?: unknown } | undefined;
+    const lat = location?.latitude;
+    const lng = location?.longitude;
+    if (typeof lat !== 'number' || typeof lng !== 'number') {
+      // Same rule as the geocode candidates: never fabricate a (0,0) location.
+      throw new ConnectorError({
+        message: 'Google Place Details returned no location',
+        statusCode: response.status,
+        providerCode: 'no_route',
+        providerMessage: 'Google Place Details returned no location',
+        cause: body,
+      });
+    }
+
+    const candidate: IGeocodeCandidate = {
+      formattedAddress:
+        typeof body.formattedAddress === 'string' ? body.formattedAddress : '',
+      location: { lat, lng },
+    };
+    if (typeof body.id === 'string') {
+      candidate.placeId = body.id;
+    }
+    const viewport = body.viewport as
+      | { low?: { latitude?: unknown; longitude?: unknown }; high?: { latitude?: unknown; longitude?: unknown } }
+      | undefined;
+    if (viewport !== undefined) {
+      const swLat = viewport.low?.latitude;
+      const swLng = viewport.low?.longitude;
+      const neLat = viewport.high?.latitude;
+      const neLng = viewport.high?.longitude;
+      if (
+        typeof swLat === 'number' &&
+        typeof swLng === 'number' &&
+        typeof neLat === 'number' &&
+        typeof neLng === 'number'
+      ) {
+        candidate.viewport = {
+          southwest: { lat: swLat, lng: swLng },
+          northeast: { lat: neLat, lng: neLng },
+        };
+      }
+    }
+
+    const displayName = (body.displayName as { text?: unknown } | undefined)?.text;
+
+    return {
+      candidate,
+      ...(wantsName && typeof displayName === 'string' && displayName !== ''
+        ? { name: displayName }
+        : {}),
+      raw: body,
+    };
+  }
+
   private toConnectorError(
     response: Response,
     body: { error_message?: string; status?: string } | null,
@@ -311,29 +516,52 @@ export class GoogleGeocodingConnector
 /**
  * Normalize one Google geocode result row into a unified {@link IGeocodeCandidate}.
  * `viewport` is populated when Google returns one (5/5 native).
+ *
+ * Returns `null` (the caller skips the row) when `geometry.location.lat`/`lng`
+ * are absent or non-numeric — never fabricate a Null-Island (0,0) candidate,
+ * and never let a missing node surface as a raw `TypeError`. Mirrors the
+ * null-skip idiom of the other four geocoding connectors and the location-php
+ * sibling.
  */
 function normalizeCandidate(
   r: GoogleGeocodeResponse['results'][number],
-): IGeocodeCandidate {
+): IGeocodeCandidate | null {
+  const lat = r.geometry?.location?.lat;
+  const lng = r.geometry?.location?.lng;
+  if (typeof lat !== 'number' || typeof lng !== 'number') {
+    return null;
+  }
+
   const candidate: IGeocodeCandidate = {
-    formattedAddress: r.formatted_address,
-    location: { lat: r.geometry.location.lat, lng: r.geometry.location.lng },
+    formattedAddress:
+      typeof r.formatted_address === 'string' ? r.formatted_address : '',
+    location: { lat, lng },
   };
   if (r.place_id !== undefined) {
     candidate.placeId = r.place_id;
   }
-  if (r.geometry.viewport !== undefined) {
-    candidate.viewport = {
-      southwest: {
-        lat: r.geometry.viewport.southwest.lat,
-        lng: r.geometry.viewport.southwest.lng,
-      },
-      northeast: {
-        lat: r.geometry.viewport.northeast.lat,
-        lng: r.geometry.viewport.northeast.lng,
-      },
-    };
+
+  // A partially-populated viewport is dropped whole rather than filled with
+  // defaults — a (0,0) corner would silently distort a consumer's map bounds.
+  const viewport = r.geometry?.viewport;
+  if (viewport !== undefined) {
+    const swLat = viewport.southwest?.lat;
+    const swLng = viewport.southwest?.lng;
+    const neLat = viewport.northeast?.lat;
+    const neLng = viewport.northeast?.lng;
+    if (
+      typeof swLat === 'number' &&
+      typeof swLng === 'number' &&
+      typeof neLat === 'number' &&
+      typeof neLng === 'number'
+    ) {
+      candidate.viewport = {
+        southwest: { lat: swLat, lng: swLng },
+        northeast: { lat: neLat, lng: neLng },
+      };
+    }
   }
+
   return candidate;
 }
 

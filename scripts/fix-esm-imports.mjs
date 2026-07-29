@@ -48,20 +48,44 @@ for (const file of walk(ESM)) {
       // Skip comment lines — JSDoc example snippets carry specifiers that
       // are documentation, not resolvable imports.
       if (/^\s*(\*|\/\/)/.test(line)) return line;
-      return line.replace(
-        // static `import`/`export ... from '...'` and side-effect `import '...'`
-        /(\b(?:from|import)\s*)(['"])(\.\.?\/[^'"]+)\2/g,
-        (full, kw, q, spec) => {
-          const fixed = fixSpecifier(spec, fileDir, isDts);
-          if (fixed === null) {
-            unresolved.push(`${file}: ${spec}`);
-            return full;
-          }
-          if (fixed === spec) return full;
-          changed = true;
-          rewrites++;
-          return `${kw}${q}${fixed}${q}`;
-        },
+      const rewrite = (full, kw, q, spec, close = '') => {
+        const fixed = fixSpecifier(spec, fileDir, isDts);
+        if (fixed === null) {
+          unresolved.push(`${file}: ${spec}`);
+          return full;
+        }
+        if (fixed === spec) return full;
+        changed = true;
+        rewrites++;
+        return `${kw}${q}${fixed}${q}${close}`;
+      };
+
+      return (
+        line
+          .replace(
+            // static `import`/`export ... from '...'` and side-effect `import '...'`
+            /(\b(?:from|import)\s*)(['"])(\.\.?\/[^'"]+)\2/g,
+            (full, kw, q, spec) => rewrite(full, kw, q, spec),
+          )
+          // INLINE IMPORT TYPES — `import('./x').Foo`. Missed by the pattern above
+          // because a `(` sits between the keyword and the quote, so these shipped
+          // extensionless and broke any consumer on moduleResolution node16/nodenext
+          // with TS2834. They appear wherever a `declare module` augmentation
+          // references a type, since a top-level `import type` used only inside such
+          // a block is elided from the emit.
+          .replace(
+            /(\bimport\s*\(\s*)(['"])(\.\.?\/[^'"]+)\2(\s*\))/g,
+            (full, kw, q, spec, close) => rewrite(full, kw, q, spec, close),
+          )
+          // MODULE AUGMENTATION TARGETS — `declare module './x' { … }`. Also missed
+          // above (no `from`/`import` keyword), and the consequence is silent rather
+          // than loud: an unresolvable augmentation target is not an error, the
+          // augmentation is simply DROPPED, so the narrowed input types vanish from
+          // the published package while every in-repo check stays green.
+          .replace(
+            /(\bdeclare\s+module\s+)(['"])(\.\.?\/[^'"]+)\2/g,
+            (full, kw, q, spec) => rewrite(full, kw, q, spec),
+          )
       );
     })
     .join('\n');

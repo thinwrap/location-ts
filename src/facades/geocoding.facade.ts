@@ -9,9 +9,14 @@ import type {
   GeocodeOptionsFor,
   ReverseGeocodeOptionsFor,
   AutocompleteOptionsFor,
+  IPlaceDetailsOptions,
+  IPlaceDetailsResult,
+  PlaceDetailsOptionsFor,
+  PlaceDetailsProvider,
   ProviderConfigMap,
   GeocodingProvider,
 } from '../types';
+import { ConnectorError } from '../types';
 import { GoogleGeocodingConnector } from '../providers/google';
 import { MapboxGeocodingConnector } from '../providers/mapbox';
 import { HereGeocodingConnector } from '../providers/here';
@@ -42,6 +47,35 @@ export class Geocoding<P extends GeocodingProvider> implements IGeocodingConnect
   // Per-provider input narrowing via `AutocompleteOptionsMap` augmentation.
   autocomplete(options: AutocompleteOptionsFor<P>): Promise<IAutocompleteResult> {
     return this.connector.autocomplete(options as IAutocompleteOptions);
+  }
+
+  /**
+   * Resolve a `placeId` from `autocomplete()` into a full candidate.
+   *
+   * The `P extends PlaceDetailsProvider` constraint is what makes this safe: a
+   * provider outside that union fails to compile here, so the `placeDetails?`
+   * optionality on the connector interface — which exists to keep 1.2.0 a minor
+   * for bring-your-own-connector implementers — never becomes a runtime footgun
+   * for facade users. The runtime guard below covers only a custom connector
+   * injected past the type system.
+   */
+  // `async` so the guard below REJECTS rather than throwing synchronously: every
+  // other facade method returns a promise, and a caller writing
+  // `placeDetails(...).catch(...)` must not be bypassed by a sync throw.
+  async placeDetails(
+    this: Geocoding<P & PlaceDetailsProvider>,
+    options: PlaceDetailsOptionsFor<P>,
+  ): Promise<IPlaceDetailsResult> {
+    const impl = this.connector.placeDetails?.bind(this.connector);
+    if (impl === undefined) {
+      throw new ConnectorError({
+        message: `Provider '${this.providerId}' does not implement placeDetails`,
+        statusCode: null,
+        providerCode: 'unsupported_option',
+        providerMessage: `Provider '${this.providerId}' does not implement placeDetails`,
+      });
+    }
+    return impl(options as IPlaceDetailsOptions);
   }
 }
 

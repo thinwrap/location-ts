@@ -7,6 +7,9 @@ import type {
   IReverseGeocodeOptions,
   IReverseGeocodeResult,
   IAutocompleteOptions,
+  IAutocompletePrediction,
+  IPlaceDetailsOptions,
+  IPlaceDetailsResult,
   IAutocompleteResult,
   ProviderCode,
 } from '../../types';
@@ -23,6 +26,7 @@ import type {
 const GEOCODE_URL = 'https://api.tomtom.com/search/2/geocode';
 const REVERSE_GEOCODE_URL = 'https://api.tomtom.com/search/2/reverseGeocode';
 const SEARCH_URL = 'https://api.tomtom.com/search/2/search';
+const PLACE_BY_ID_URL = 'https://api.tomtom.com/search/2/place.json';
 
 /**
  * TomTom Search v2 connector — Geocoding.
@@ -110,7 +114,9 @@ export class TomTomGeocodingConnector
       | null;
     if (data === null) throw malformedBodyError(response.status, data);
     return {
-      candidates: (data.results ?? []).map((r) => normalizeCandidate(r)),
+      candidates: (data.results ?? [])
+        .map((r) => normalizeCandidate(r))
+        .filter((c): c is IGeocodeCandidate => c !== null),
       raw: data,
     };
   }
@@ -196,6 +202,11 @@ export class TomTomGeocodingConnector
     if (options.radius !== undefined) {
       baseQuery.radius = String(options.radius);
     }
+    // `countryFilter` (ISO 3166-1 alpha-2) → TomTom `countrySet=<comma-csv>`,
+    // same translation as forward geocode.
+    if (options.countryFilter && options.countryFilter.length > 0) {
+      baseQuery.countrySet = options.countryFilter.join(',');
+    }
 
     const merged = mergePassthrough(
       {} as Record<string, unknown>,
@@ -218,14 +229,82 @@ export class TomTomGeocodingConnector
       | null;
     if (data === null) throw malformedBodyError(response.status, data);
     return {
-      predictions: (data.results ?? []).map((r) => ({
-        description: r.poi?.name
-          ? `${r.poi.name}, ${r.address.freeformAddress}`
-          : r.address.freeformAddress,
-        // placeId is optional; set it only when the vendor returns an
-        // id rather than emitting `placeId: undefined` as an own-property (#146).
-        ...(r.id !== undefined ? { placeId: r.id } : {}),
-      })),
+      predictions: (data.results ?? []).map((r) => {
+        const prediction: IAutocompletePrediction = {
+          description: r.poi?.name
+            ? `${r.poi.name}, ${r.address.freeformAddress}`
+            : r.address.freeformAddress,
+          // placeId is optional; set it only when the vendor returns an
+          // id rather than emitting `placeId: undefined` as an own-property (#146).
+          ...(r.id !== undefined ? { placeId: r.id } : {}),
+        };
+        // Live-verified: `poi.name` is undefined for street/address results, which
+        // have no distinct main part. Omit the whole object there rather than
+        // splitting `freeformAddress` on a comma, which would be a guess.
+        if (typeof r.poi?.name === 'string' && r.poi.name !== '') {
+          const secondaryText = r.address?.freeformAddress;
+          prediction.structuredFormat = {
+            mainText: r.poi.name,
+            ...(typeof secondaryText === 'string' && secondaryText !== ''
+              ? { secondaryText }
+              : {}),
+          };
+        }
+        return prediction;
+      }),
+      raw: data,
+    };
+  }
+
+  /**
+   * Resolve a TomTom result id to a full candidate.
+   *
+   * `GET https://api.tomtom.com/search/2/place.json?entityId=` — a plain lookup,
+   * no per-session billing concept.
+   */
+  async placeDetails(options: IPlaceDetailsOptions): Promise<IPlaceDetailsResult> {
+    const query: Record<string, string> = {
+      key: this.config.apiKey,
+      entityId: options.placeId,
+    };
+    if (options.language !== undefined) {
+      query.language = options.language;
+    }
+
+    const merged = mergePassthrough({}, {}, options._passthrough, query);
+    const response = await this.sendGet(PLACE_BY_ID_URL, {
+      headers: merged.headers,
+      query: merged.query,
+    });
+
+    if (!response.ok) {
+      throw await this.raiseHttpError(response, 'TomTom Place Details');
+    }
+
+    const data = (await response.json().catch(() => null)) as
+      | TomTomGeocodeResponse
+      | null;
+    if (data === null) throw malformedBodyError(response.status, data);
+
+    const result = data.results?.[0];
+    const candidate = result !== undefined ? normalizeCandidate(result) : null;
+    if (candidate === null) {
+      throw new ConnectorError({
+        message: 'TomTom Place Details returned no result',
+        statusCode: response.status,
+        providerCode: 'no_route',
+        providerMessage: 'TomTom Place Details returned no result',
+        cause: data,
+      });
+    }
+
+    const wantsName = options.include?.includes('name') === true;
+    const poiName = result?.poi?.name;
+    return {
+      candidate,
+      ...(wantsName && typeof poiName === 'string' && poiName !== ''
+        ? { name: poiName }
+        : {}),
       raw: data,
     };
   }
@@ -316,10 +395,18 @@ function normalizeCandidate(r: {
     topLeftPoint?: { lat: number; lon: number };
     btmRightPoint?: { lat: number; lon: number };
   };
-}): IGeocodeCandidate {
+}): IGeocodeCandidate | null {
+  // Skip a result without real coordinates rather than emitting a fabricated
+  // (0,0) candidate or letting a missing `position` surface as a raw TypeError.
+  const lat = r.position?.lat;
+  const lng = r.position?.lon;
+  if (typeof lat !== 'number' || typeof lng !== 'number') {
+    return null;
+  }
+
   const candidate: IGeocodeCandidate = {
-    formattedAddress: r.address.freeformAddress,
-    location: { lat: r.position.lat, lng: r.position.lon },
+    formattedAddress: r.address?.freeformAddress ?? '',
+    location: { lat, lng },
   };
   if (r.id !== undefined) candidate.placeId = r.id;
 

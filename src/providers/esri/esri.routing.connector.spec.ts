@@ -19,13 +19,14 @@ const defaultConfig: EsriConfig = { apiKey: 'esri-test-token' };
 const ROUTE_URL =
   'https://route-api.arcgis.com/arcgis/rest/services/World/Route/NAServer/Route_World/solve';
 
-const OMIT_DIRECTIONS = Symbol('omit-directions');
+const OMIT_STOPS = Symbol('omit-stops');
+
 
 function buildSuccessBody(
   overrides: {
     attributes?: Record<string, unknown>;
     paths?: number[][][];
-    directions?: unknown;
+    /** Pass OMIT_STOPS to simulate a service that returns no stops FeatureSet. */
     stops?: unknown;
   } = {},
 ): Record<string, unknown> {
@@ -34,8 +35,8 @@ function buildSuccessBody(
       features: [
         {
           attributes: overrides.attributes ?? {
-            Total_Length: 8047,
-            Total_Time: 10,
+            Total_TravelTime: 10,
+            Total_Kilometers: 8.047,
           },
           geometry: {
             paths: overrides.paths ?? [
@@ -50,26 +51,38 @@ function buildSuccessBody(
     },
   };
 
-  if (overrides.stops !== undefined) {
-    body.stops = overrides.stops;
-  }
+  if (overrides.stops === OMIT_STOPS) return body;
 
-  if (overrides.directions === OMIT_DIRECTIONS) {
-    return body;
-  }
-  body.directions =
-    overrides.directions === undefined
-      ? [
-          {
-            features: [
-              { attributes: { length: 0, time: 0, maneuverType: 'esriDMTStop' } },
-              { attributes: { length: 8047, time: 10 } },
-              { attributes: { length: 0, time: 0, maneuverType: 'esriDMTStop' } },
-            ],
-          },
-        ]
-      : overrides.directions;
+  // Default: two located stops whose cumulative costs describe one 8047 m / 10 min
+  // leg. `Cumul_TravelTime` is the DRIVING spelling — walking responses carry
+  // `Cumul_WalkTime` instead, which is why the connector discovers the key.
+  body.stops =
+    overrides.stops === undefined
+      ? {
+          features: [
+            { attributes: { Sequence: 1, Status: 0, Cumul_TravelTime: 0, Cumul_Kilometers: 0 } },
+            { attributes: { Sequence: 2, Status: 0, Cumul_TravelTime: 10, Cumul_Kilometers: 8.047 } },
+          ],
+        }
+      : overrides.stops;
   return body;
+}
+
+/** Build a stops FeatureSet from cumulative values, in INPUT order. */
+function stopsWithCumulative(
+  rows: Array<{ seq: number; minutes: number; km: number; status?: number }>,
+  timeKey = 'Cumul_TravelTime',
+): unknown {
+  return {
+    features: rows.map((r) => ({
+      attributes: {
+        Sequence: r.seq,
+        Status: r.status ?? 0,
+        [timeKey]: r.minutes,
+        Cumul_Kilometers: r.km,
+      },
+    })),
+  };
 }
 
 function buildSuccessResponse(body: unknown = buildSuccessBody()): Response {
@@ -113,8 +126,17 @@ describe('EsriRoutingConnector', () => {
       expect(params.get('f')).toBe('json');
       expect(params.get('token')).toBe('esri-test-token');
       expect(params.get('returnRoutes')).toBe('true');
-      expect(params.get('returnDirections')).toBe('true');
-      expect(params.get('directionsLengthUnits')).toBe('esriNAUMeters');
+      // Legs come from the stops FeatureSet's cumulative costs, so the stops are
+      // always requested and the superseded turn-by-turn payload never is.
+      expect(params.get('returnStops')).toBe('true');
+      // Explicit 'false' is load-bearing: the SERVICE DEFAULT is true, so omitting
+      // the parameter still ships the entire directions payload.
+      expect(params.get('returnDirections')).toBe('false');
+      expect(params.get('accumulateAttributeNames')).toBe('TravelTime,Kilometers');
+      // No m-values: we read `paths` for the polyline and never the measures.
+      expect(params.get('outputLines')).toBe('esriNAOutputLineTrueShape');
+      expect(params.get('directionsOutputType')).toBeNull();
+      expect(params.get('directionsLengthUnits')).toBeNull();
       expect(params.get('outSR')).toBe('4326');
     });
 
@@ -295,11 +317,126 @@ describe('EsriRoutingConnector', () => {
   });
 
   describe('Result-shape normalization', () => {
-    it('reads Total_Length as meters and Total_Time as minutes', async () => {
+    it('derives legs AND totals from the cumulative stop costs', async () => {
+      // One source for both, so they cannot disagree: each leg is a difference
+      // between consecutive stops and the total is the last cumulative value.
       mockFetch.mockResolvedValueOnce(
         buildSuccessResponse(
           buildSuccessBody({
-            attributes: { Total_Length: 12345, Total_Time: 25 },
+            attributes: { Total_TravelTime: 30, Total_Kilometers: 12 },
+            stops: stopsWithCumulative([
+              { seq: 1, minutes: 0, km: 0 },
+              { seq: 2, minutes: 10, km: 4 },
+              { seq: 3, minutes: 30, km: 12 },
+            ]),
+          }),
+        ),
+      );
+
+      const result = await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+          { lat: 2, lng: 2 },
+        ],
+      });
+
+      expect(result.legs).toEqual([
+        { distanceMeters: 4000, durationSeconds: 600 },
+        { distanceMeters: 8000, durationSeconds: 1200 },
+      ]);
+      expect(result.totalDistanceMeters).toBe(12000);
+      expect(result.totalDurationSeconds).toBe(1800);
+      // The invariant that is now structural rather than coincidental.
+      expect(result.legs.reduce((a, l) => a + l.distanceMeters, 0)).toBe(
+        result.totalDistanceMeters,
+      );
+      expect(result.legs.reduce((a, l) => a + l.durationSeconds, 0)).toBe(
+        result.totalDurationSeconds,
+      );
+    });
+
+    it('differences stops in VISIT order, not input order', async () => {
+      // Stops come back in INPUT order while cumulative costs run along the route.
+      // With findBestSequence those differ; sorting by Sequence is what keeps the
+      // legs positive and correctly attributed.
+      mockFetch.mockResolvedValueOnce(
+        buildSuccessResponse(
+          buildSuccessBody({
+            attributes: { Total_TravelTime: 30, Total_Kilometers: 12 },
+            // Input order 1,3,2 — i.e. the optimizer visits the third input second.
+            stops: stopsWithCumulative([
+              { seq: 1, minutes: 0, km: 0 },
+              { seq: 3, minutes: 30, km: 12 },
+              { seq: 2, minutes: 10, km: 4 },
+            ]),
+          }),
+        ),
+      );
+
+      const result = await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+          { lat: 2, lng: 2 },
+        ],
+        optimize: true,
+      });
+
+      expect(result.legs).toEqual([
+        { distanceMeters: 4000, durationSeconds: 600 },
+        { distanceMeters: 8000, durationSeconds: 1200 },
+      ]);
+    });
+
+    it('discovers the walking cumulative key (Cumul_WalkTime, not Cumul_TravelTime)', async () => {
+      // The cumulative field is suffixed with the ACTIVE IMPEDANCE. Hardcoding the
+      // driving spelling is the same mistake that once made the walking matrix
+      // report every duration as 0.
+      mockFetch.mockResolvedValueOnce(
+        buildSuccessResponse(
+          buildSuccessBody({
+            attributes: { Total_WalkTime: 13.094903051108146, Total_Kilometers: 1.091226960340165 },
+            stops: stopsWithCumulative(
+              [
+                { seq: 1, minutes: 0, km: 0 },
+                { seq: 2, minutes: 13.094903051108146, km: 1.091226960340165 },
+              ],
+              'Cumul_WalkTime',
+            ),
+          }),
+        ),
+      );
+
+      const result = await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+        ],
+        travelMode: 'walking',
+      });
+
+      expect(result.totalDistanceMeters).toBeCloseTo(1091.23, 1);
+      expect(result.totalDurationSeconds).toBeCloseTo(13.094903051108146 * 60, 3);
+      const [, init] = mockFetch.mock.calls[0]!;
+      // ...and the REQUEST must ask for the matching attribute, or no cumulative
+      // field comes back at all (silently, not as an error).
+      expect(parseForm(init!.body as string).get('accumulateAttributeNames')).toBe(
+        'WalkTime,Kilometers',
+      );
+    });
+
+    it('falls back to the route totals when a stop failed to locate', async () => {
+      // A non-zero Status carries no usable cumulative cost, so every later
+      // difference would be wrong. Prefer the route's own totals + an even split.
+      mockFetch.mockResolvedValueOnce(
+        buildSuccessResponse(
+          buildSuccessBody({
+            attributes: { Total_TravelTime: 20, Total_Kilometers: 1 },
+            stops: stopsWithCumulative([
+              { seq: 1, minutes: 0, km: 0 },
+              { seq: 2, minutes: 20, km: 1, status: 7 },
+            ]),
           }),
         ),
       );
@@ -311,10 +448,10 @@ describe('EsriRoutingConnector', () => {
         ],
       });
 
-      expect(result.totalDistanceMeters).toBe(12345);
-      expect(result.totalDurationSeconds).toBe(25 * 60);
+      expect(result.totalDistanceMeters).toBe(1000);
+      expect(result.totalDurationSeconds).toBe(1200);
+      expect(result.legs).toEqual([{ distanceMeters: 1000, durationSeconds: 1200 }]);
     });
-
     it('falls back to Total_Kilometers * 1000 when Total_Length is absent (brownfield parity)', async () => {
       mockFetch.mockResolvedValueOnce(
         buildSuccessResponse(
@@ -335,95 +472,12 @@ describe('EsriRoutingConnector', () => {
       expect(result.totalDurationSeconds).toBe(600);
     });
 
-    it('derives totals from the directions summary (real walking shape: Total_WalkTime, no Total_Time/Total_Length)', async () => {
-      // The live ArcGIS walking response carries neither Total_Time nor
-      // Total_Length; its impedance attribute is Total_WalkTime, and the
-      // reliable totals live in directions[0].summary (meters + minutes).
-      // The pre-fix connector read Total_Time first and yielded duration 0.
-      mockFetch.mockResolvedValueOnce(
-        buildSuccessResponse(
-          buildSuccessBody({
-            attributes: {
-              Total_WalkTime: 13.094903051108146,
-              Total_Kilometers: 1.091226960340165,
-              Total_Miles: 0.6780697279993455,
-            },
-            directions: [
-              {
-                summary: {
-                  totalLength: 1091.226960340165,
-                  totalTime: 13.094903051108146,
-                  totalDriveTime: 13.094903051108146,
-                },
-                features: [
-                  { attributes: { length: 0, time: 0, maneuverType: 'esriDMTStop' } },
-                  { attributes: { length: 1091.226960340165, time: 13.094903051108146 } },
-                  { attributes: { length: 0, time: 0, maneuverType: 'esriDMTStop' } },
-                ],
-              },
-            ],
-          }),
-        ),
-      );
-
-      const result = await connector.route({
-        waypoints: [
-          { lat: 0, lng: 0 },
-          { lat: 1, lng: 1 },
-        ],
-        travelMode: 'walking',
-      });
-
-      expect(result.totalDistanceMeters).toBeCloseTo(1091.23, 1);
-      expect(result.totalDurationSeconds).toBeCloseTo(13.094903051108146 * 60, 3);
-    });
-
-    it('reconstructs per-leg distance/duration from directions delimited by esriDMTStop', async () => {
+    it('falls back to even-split legs when the stops FeatureSet is absent', async () => {
       mockFetch.mockResolvedValueOnce(
         buildSuccessResponse(
           buildSuccessBody({
             attributes: { Total_Length: 1000, Total_Time: 20 },
-            directions: [
-              {
-                features: [
-                  { attributes: { length: 0, time: 0, maneuverType: 'esriDMTStop' } },
-                  { attributes: { length: 300, time: 6 } },
-                  { attributes: { length: 100, time: 2 } },
-                  { attributes: { length: 0, time: 0, maneuverType: 'esriDMTStop' } },
-                  { attributes: { length: 600, time: 12 } },
-                  { attributes: { length: 0, time: 0, maneuverType: 'esriDMTStop' } },
-                ],
-              },
-            ],
-          }),
-        ),
-      );
-
-      const result = await connector.route({
-        waypoints: [
-          { lat: 0, lng: 0 },
-          { lat: 1, lng: 1 },
-          { lat: 2, lng: 2 },
-        ],
-      });
-
-      expect(result.legs).toHaveLength(2);
-      expect(result.legs[0]).toEqual({
-        distanceMeters: 400,
-        durationSeconds: 8 * 60,
-      });
-      expect(result.legs[1]).toEqual({
-        distanceMeters: 600,
-        durationSeconds: 12 * 60,
-      });
-    });
-
-    it('falls back to even-split legs when directions are absent', async () => {
-      mockFetch.mockResolvedValueOnce(
-        buildSuccessResponse(
-          buildSuccessBody({
-            attributes: { Total_Length: 1000, Total_Time: 20 },
-            directions: OMIT_DIRECTIONS,
+            stops: OMIT_STOPS,
           }),
         ),
       );
@@ -504,6 +558,24 @@ describe('EsriRoutingConnector', () => {
     });
 
     it('omits waypointOrder when the stops FeatureSet is absent', async () => {
+      mockFetch.mockResolvedValueOnce(
+        buildSuccessResponse(buildSuccessBody({ stops: OMIT_STOPS })),
+      );
+
+      const result = await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+        ],
+        optimize: true,
+      });
+
+      expect(result.waypointOrder).toBeUndefined();
+    });
+
+    it('omits waypointOrder for an unoptimized route even though stops are returned', async () => {
+      // Stops are always requested (legs come from them), so this pins that an
+      // unoptimized route reports no ordering rather than an identity permutation.
       mockFetch.mockResolvedValueOnce(buildSuccessResponse());
 
       const result = await connector.route({
@@ -754,7 +826,7 @@ describe('EsriRoutingConnector', () => {
       }
 
       expect(thrown).toBeInstanceOf(ConnectorError);
-      expect(thrown!.providerCode).toBe('unknown');
+      expect(thrown!.providerCode).toBe('no_route');
       expect(thrown!.providerMessage).toBe('ESRI Routing returned no routes');
     });
   });

@@ -296,6 +296,31 @@ describe('EsriGeocodingConnector', () => {
       expect(u).toContain('token=esri-test-token');
     });
 
+    it('forwards countryFilter as a countryCode CSV', async () => {
+      mockFetch.mockResolvedValueOnce(
+        buildSuggestResponseBody({ suggestions: [] }),
+      );
+
+      await connector.autocomplete({
+        input: 'New York',
+        countryFilter: ['IL', 'PS'],
+      });
+
+      const u = urlOf(mockFetch.mock.calls[0]!);
+      expect(u).toContain('countryCode=IL%2CPS');
+    });
+
+    it('omits countryCode when no countryFilter is given', async () => {
+      mockFetch.mockResolvedValueOnce(
+        buildSuggestResponseBody({ suggestions: [] }),
+      );
+
+      await connector.autocomplete({ input: 'New York' });
+
+      const u = urlOf(mockFetch.mock.calls[0]!);
+      expect(u).not.toContain('countryCode');
+    });
+
     it('maps each suggestion.magicKey → prediction.placeId', async () => {
       mockFetch.mockResolvedValueOnce(
         buildSuggestResponseBody({

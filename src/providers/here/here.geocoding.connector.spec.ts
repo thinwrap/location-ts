@@ -208,7 +208,10 @@ describe('HereGeocodingConnector', () => {
     it('GETs /v1/autosuggest with q + limit=10', async () => {
       mockFetch.mockResolvedValueOnce(buildAutosuggestResponse());
 
-      const result = await connector.autocomplete({ input: 'Ber' });
+      const result = await connector.autocomplete({
+        input: 'Ber',
+        location: { lat: 52.52, lng: 13.405 },
+      });
 
       const [url] = mockFetch.mock.calls[0]!;
       expect(url as string).toContain(
@@ -222,6 +225,9 @@ describe('HereGeocodingConnector', () => {
       expect(result.predictions[0]).toEqual({
         description: 'Berlin',
         placeId: 'here:ac:1',
+        // This fixture has no `address`, which is exactly HERE's query-type
+        // suggestion shape — so `secondaryText` is omitted rather than blank.
+        structuredFormat: { mainText: 'Berlin' },
       });
     });
 
@@ -258,10 +264,80 @@ describe('HereGeocodingConnector', () => {
     it('passes language as lang query param', async () => {
       mockFetch.mockResolvedValueOnce(buildAutosuggestResponse());
 
-      await connector.autocomplete({ input: 'Ber', language: 'de' });
+      await connector.autocomplete({
+        input: 'Ber',
+        language: 'de',
+        location: { lat: 52.52, lng: 13.405 },
+      });
 
       const [url] = mockFetch.mock.calls[0]!;
       expect(url as string).toContain('lang=de');
+    });
+
+    it('throws without a search context rather than sending a request HERE rejects', async () => {
+      await expect(connector.autocomplete({ input: 'Ber' })).rejects.toThrow(
+        /requires a search context/,
+      );
+
+      // The point of the guard: no round-trip is spent discovering this.
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('accepts a passthrough-supplied in=bbox as the search context', async () => {
+      mockFetch.mockResolvedValueOnce(buildAutosuggestResponse());
+
+      await connector.autocomplete({
+        input: 'Ber',
+        _passthrough: {
+          query: { in: 'bbox:13.08,52.33,13.76,52.67' },
+        },
+      });
+
+      const [url] = mockFetch.mock.calls[0]!;
+      expect(url as string).toContain('in=bbox');
+    });
+
+    it('translates countryFilter to in=countryCode with alpha-3 codes', async () => {
+      mockFetch.mockResolvedValueOnce(buildAutosuggestResponse());
+
+      await connector.autocomplete({
+        input: 'Ber',
+        location: { lat: 52.52, lng: 13.405 },
+        countryFilter: ['IL', 'PS'],
+      });
+
+      const [url] = mockFetch.mock.calls[0]!;
+      expect(url as string).toContain('in=countryCode%3AISR%2CPSE');
+      expect(url as string).toContain('at=52.52%2C13.405');
+    });
+
+    it('emits BOTH in= values when countryFilter and radius are combined', async () => {
+      mockFetch.mockResolvedValueOnce(buildAutosuggestResponse());
+
+      await connector.autocomplete({
+        input: 'Ber',
+        location: { lat: 52.52, lng: 13.405 },
+        radius: 5000,
+        countryFilter: ['IL'],
+      });
+
+      // HERE requires the country filter to accompany the spatial filter, and
+      // spells both `in` — so the pair must survive as a repeated key rather
+      // than one overwriting the other.
+      const [url] = mockFetch.mock.calls[0]!;
+      expect(url as string).toContain('in=circle%3A52.52%2C13.405%3Br%3D5000');
+      expect(url as string).toContain('in=countryCode%3AISR');
+      expect((url as string).match(/[?&]in=/g)).toHaveLength(2);
+    });
+
+    it('raises invalid_request for a country code with no alpha-3 mapping', async () => {
+      await expect(
+        connector.autocomplete({
+          input: 'Ber',
+          location: { lat: 52.52, lng: 13.405 },
+          countryFilter: ['ZZ'],
+        }),
+      ).rejects.toThrow(/mapping unavailable for ZZ/);
     });
   });
 

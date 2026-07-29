@@ -4,11 +4,15 @@ export interface TomTomRouteResponse {
       lengthInMeters: number;
       travelTimeInSeconds: number;
       trafficDelayInSeconds?: number;
+      /** Only returned when `computeTravelTimeFor=all` is requested. */
+      noTrafficTravelTimeInSeconds?: number;
     };
     legs: Array<{
       summary: {
         lengthInMeters: number;
         travelTimeInSeconds: number;
+        /** Only returned when `computeTravelTimeFor=all` is requested. */
+        noTrafficTravelTimeInSeconds?: number;
       };
       points: Array<{ latitude: number; longitude: number }>;
     }>;
@@ -59,6 +63,11 @@ export interface TomTomGeocodeResponse {
       countryCode?: string;
     };
     position: { lat: number; lon: number };
+    /**
+     * Present for POI results (and on the `place.json` lookup); absent for plain
+     * street/address results, which have no distinct name.
+     */
+    poi?: { name?: string };
   }>;
 }
 
@@ -96,22 +105,7 @@ export interface TomTomReachableRangeResponse {
   };
 }
 
-// --------------------------------------------------------------------------
-// IsochroneOptionsMap augmentation
-//
-// the base `IIsochroneOptions.travelMode` is narrowed to
-// `'driving' | 'walking'`. TomTom is 1 of 2 providers (alongside Mapbox) with
-// native bicycle support, so it widens `travelMode` back to include
-// `'cycling'` here via TypeScript module augmentation. HERE and ESRI do not
-// augment — their narrowed type stays at base.
-// --------------------------------------------------------------------------
-
-import type { IIsochroneOptions } from '../../types';
-
-declare module '../../types/isochrone.interface' {
-  interface IsochroneOptionsMap {
-    tomtom: Omit<IIsochroneOptions, 'travelMode'> & {
-      travelMode?: 'driving' | 'walking' | 'cycling';
-    };
-  }
-}
+// TomTom's isochrone `travelMode` widening deliberately does NOT live here — see
+// `tomtom.config.ts`. A `declare module` block only applies if its file is part of
+// the consumer's compilation, and nothing in the emitted type graph imports this
+// module, so an augmentation here is invisible from the published package.

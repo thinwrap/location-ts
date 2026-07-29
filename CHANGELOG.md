@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-07-28
+
+Driven by external-consumer feedback, applied across all four language siblings. Additive or
+correctness only. Per-provider detail lives in the connector READMEs under `src/providers/`.
+
+### Added
+
+- `countryFilter` on `autocomplete()` — all five geocoders. Google's ccTLD codes (`GB` →
+  `uk`) and 15-code cap are handled; it also suppresses Google's *query* predictions.
+- `placeDetails()` on the `Geocoding` facade and all five geocoding connectors — resolves an
+  `autocomplete()` `placeId` to an `IGeocodeCandidate`. `include: ['name']` gates Google's
+  `displayName`, whose field mask drives the SKU tier.
+- `sessionToken` on Google `autocomplete()`/`placeDetails()` and Mapbox `placeDetails()` —
+  both vendors bill per **session** with one and per request without, so a keystroke-driven
+  UI without a token is billed once per character typed.
+- `structuredFormat?` on `IAutocompletePrediction` (`mainText`/`secondaryText`). Never
+  synthesized, so absent for TomTom street results and for Esri entirely.
+- `ProviderCode: 'no_route'` — the provider answered but no route exists, normalizing six
+  different vendor signals (200/400/422, in-body codes, empty arrays).
+- `ProviderCode: 'timeout'`, plus a default 30-second request bound.
+- `polylineQuality?: 'simplified' | 'detailed'`, default `'simplified'` — ~30x smaller on
+  Mapbox and OSRM with distances and durations byte-identical. No such control exists on
+  HERE/TomTom/Esri.
+- `trafficMode?: 'none' | 'live'` on routing and matrix, default `'none'` — see *Changed*.
+- `include?: RoutingInclude[]`, default `[]`; first token `'durationWithoutTraffic'` populates
+  `durationWithoutTrafficSeconds?` per leg and `totalDurationWithoutTrafficSeconds?` on the
+  result. Native on Google/HERE/TomTom, never synthesized.
+- `OsrmConfig.supportedExcludeClasses?` — declare what your build was compiled with to enable
+  `avoidTolls`/`avoidFerries`/`avoidHighways`.
+
+### Changed
+
+- **Google no longer sends `routingPreference: TRAFFIC_AWARE` for a bare `departureTime`**, on
+  routing and matrix. It is a Pro-tier SKU feature and matrix bills per element, so a 10x10
+  request moved 100 billed elements. Now driven by `trafficMode: 'live'`.
+- **TomTom now sends `traffic=false` explicitly** — its default was ON. Results change unless
+  `trafficMode: 'live'` is passed.
+- Mapbox and OSRM routing default to `overview=simplified` (was `full`) and no longer send
+  `steps` or `annotations`.
+- HERE `findsequence2` honours `avoidTolls` and takes traffic from `trafficMode`. Previously
+  the optimizer ordered waypoints as if tolls were acceptable while the follow-up `/routes`
+  call avoided them.
+
+### Fixed
+
+- `waypointOrder` could be silently corrupt on Google, TomTom, OSRM and Mapbox. All four now
+  validate against the **input** waypoint count and omit the field unless it is a complete
+  permutation of `[0..N-1]`.
+- Geocoding no longer emits a fabricated `(0,0)` candidate or a raw `TypeError` for absent or
+  non-numeric coordinates, across Google, HERE, TomTom and Esri.
+- HERE `autocomplete()` with no `location` sent a request Autosuggest rejects; it now raises
+  `invalid_request`, and a `_passthrough.query.at`/`.in` you supply counts as the context.
+- ESRI legs now come from the stops output (`returnStops` + `Cumul_*` differences) instead of
+  the superseded `directions` FeatureSet, so legs reconcile to the totals by construction.
+  `raw` no longer carries `directions`, and `waypointOrder` is emitted only when optimizing.
+- Mapbox `geometries` is no longer decoupled from the decoder — overriding it to `polyline`
+  divided every coordinate by 10 silently. `geometries=geojson` now works.
+- OSRM `baseUrl` requires an `http(s)://` scheme (previously reported as
+  `provider_unavailable`, indistinguishable from an outage) and is validated at call time
+  rather than construction. Path prefixes are supported.
+- `no_route` now covers OSRM/Mapbox `NoRoute`/`NoTrips`/`NoSegment`, an empty `legs[]`, and
+  OSRM `Ok` with an empty `routes[]`. Esri requires `unlocated` in `error.details[]` — other
+  in-body 400s stay `invalid_request`.
+- A BYO transport's timeout now reports `'timeout'`. Classification asked only whether the
+  library's own signal fired, and an `AbortSignal.any` abort does not abort its sources.
+- Per-provider `declare module` augmentations shipped as no-ops, making Mapbox's
+  `sessionToken` unusable: an extensionless target does not resolve under `node16`/`nodenext`,
+  and that is ignored rather than an error. `check:dist` now asserts it.
+
+### Documentation
+
+- Per-geocoder "Country filter" sections, and match-highlighting offsets documented on Google
+  and HERE with their absence stated on Mapbox, TomTom and Esri. Not normalized: only 2 of 5
+  return them and the shapes are incompatible. The offsets count **Unicode code points**, so
+  `slice()` is wrong outside the BMP.
+- Per-provider "Turn-by-turn instructions" sections. TBT is off by default and not normalized,
+  and Google's `X-Goog-FieldMask` and HERE's `return` are **replaced** rather than merged — so
+  a partial override silently zeroes every normalized distance, duration and polyline. The
+  shipped Google example had exactly that bug; fixed.
+
 ## [1.1.0] — 2026-07-24
 
 ### Added

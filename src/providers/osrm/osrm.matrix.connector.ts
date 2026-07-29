@@ -8,6 +8,7 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import { joinCoords, mergePassthrough } from '../../utils';
+import { validateOsrmBaseUrl } from './osrm.base-url';
 import type { OsrmConfig } from './osrm.config';
 import type { OsrmTableResponse } from './osrm.types';
 
@@ -70,24 +71,12 @@ export class OsrmMatrixConnector
 
   constructor(private config: OsrmConfig, fetchImpl?: typeof fetch) {
     super(fetchImpl);
-    // required baseUrl. Throw synchronously before any HTTP.
-    if (
-      config === null ||
-      config === undefined ||
-      typeof config.baseUrl !== 'string' ||
-      config.baseUrl === ''
-    ) {
-      throw new ConnectorError({
-        message:
-          'OSRM connector requires explicit baseUrl. The public demo server is not used as a default.',
-        statusCode: null,
-        providerCode: 'invalid_request',
-        providerMessage: 'baseUrl is required for OSRM',
-      });
-    }
   }
 
   async matrix(options: IMatrixOptions): Promise<IMatrixResult> {
+    // Validated at CALL time, not construction time — see the routing connector.
+    const baseUrl = validateOsrmBaseUrl(this.config);
+
     // pre-flight validation runs synchronously before any HTTP call.
     this.validateOsrmCompat(options);
 
@@ -115,7 +104,7 @@ export class OsrmMatrixConnector
       (_, i) => i + options.origins.length,
     );
 
-    const url = `${this.config.baseUrl}/table/v1/${profile}/${coords}`;
+    const url = `${baseUrl}/table/v1/${profile}/${coords}`;
 
     const baseQuery: Record<string, string> = {
       sources: originIndices.join(';'),
@@ -340,10 +329,9 @@ export class OsrmMatrixConnector
 /**
  * Map base {@link IMatrixOptions.travelMode} to an OSRM profile name.
  *
- * these use the OSRM-standard names `driving / walking /
- * cycling` — consistent with OSRM Routing and PHP Story
- * 3.18. Consumers are responsible for verifying that their OSRM build has the
- * requested profile compiled.
+ * The three base modes map 1:1 onto the OSRM-standard profile names
+ * `driving / walking / cycling`, matching {@link OsrmRoutingConnector}. Whether a
+ * profile exists is a property of the operator's build, not of the mapping.
  */
 function mapProfile(mode?: 'driving' | 'walking' | 'cycling'): string {
   switch (mode) {

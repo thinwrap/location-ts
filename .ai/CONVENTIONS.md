@@ -13,6 +13,7 @@ src/
   index.ts                              # public-API barrel
   base/                                 # BaseConnector (HTTP + error wrapping)
   facades/                              # Routing/Matrix/Geocoding/Isochrone facades + *.spec.ts
+  providers/<contract>.spec.ts          # cross-provider contract spec — see below
   providers/<provider>/                 # one directory per provider — 6 total
     index.ts                            # re-exports for the provider
     <provider>.config.ts                # <Provider>Config interface
@@ -60,6 +61,16 @@ export type IsochroneProvider = 'mapbox' | 'here' | 'esri' | 'tomtom';
 | `index.ts` | yes | Barrel re-export for the provider directory |
 | `README.md` | yes | Per-connector consumer doc (plain Markdown) |
 
+### Cross-provider contract specs
+
+A behaviour that must hold **identically across every provider** gets one spec at
+`src/providers/<contract>.spec.ts` instead of the same test copied into six connector
+specs — currently `no-route`, `routing-options`, `structured-format` and `place-details`.
+Each carries one case per provider in a single file, so a provider missing from a contract
+is visible by reading one list instead of auditing six directories. These are the
+invariants a new connector must satisfy: when you add a provider, add its case here too.
+Provider-specific behaviour still belongs in the co-located connector spec.
+
 ## `mapVendorError(status, body)` pattern
 
 Each connector implements `private mapVendorError(httpStatus: number, body: unknown): ProviderCode`.
@@ -77,8 +88,14 @@ Canonical baseline mapping (override per vendor when the response carries finer 
 | network failure | `provider_unavailable` |
 | unparseable | `unknown` |
 
-Plus the 5 location-extended codes raised by **pre-flight validation** (OSRM mostly)
-and **wire-translation** (HERE Matrix polling timeout, TomTom unsupported travel mode).
+Plus the 7 location-extended codes, raised by **pre-flight validation** (OSRM mostly),
+**wire-translation** (HERE Matrix polling timeout, TomTom unsupported travel mode),
+**response inspection** (`no_route` — see below), and the **transport bound**
+(`timeout`, set by `BaseConnector` when its own `AbortSignal` fired).
+
+`no_route` is the one code that cannot be read off the HTTP status: the vendors serve
+"no route exists" on 200 (Google, HERE, Esri), 422 (Mapbox) and 400 (OSRM, TomTom).
+Each `mapVendorError` matches the vendor's envelope code instead.
 
 ## `Retry-After` surfacing pattern
 

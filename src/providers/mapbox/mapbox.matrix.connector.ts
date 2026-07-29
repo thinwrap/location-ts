@@ -15,7 +15,7 @@ import type { MapboxMatrixResponse } from './mapbox.types';
 const MATRIX_URL = 'https://api.mapbox.com/directions-matrix/v1/mapbox';
 
 /**
- * Mapbox Matrix v1 connector — per-connector template.
+ * Mapbox Matrix v1 connector.
  *
  * GETs `https://api.mapbox.com/directions-matrix/v1/mapbox/{profile}/{coords}`
  * with `access_token`, `sources`, `destinations`, and an annotations invariant

@@ -15,8 +15,7 @@ import type { GoogleRouteMatrixElement } from './google.types';
 const MATRIX_URL = 'https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix';
 
 /**
- * Google Distance Matrix v2 (RouteMatrix) connector — per-connector template
- *
+ * Google Distance Matrix v2 (RouteMatrix) connector.
  *
  * POSTs to https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix
  * with `X-Goog-Api-Key` and `X-Goog-FieldMask` headers. Google emits an
@@ -61,13 +60,15 @@ export class GoogleMatrixConnector
 
     // Google rejects `routingPreference` for WALK/BICYCLE ("Routing preference
     // cannot be set for WALK or BICYCLE routing mode.") — only DRIVE and
-    // TWO_WHEELER accept it. TRAFFIC_AWARE when a departureTime is supplied
-    // (the consumer cares about timing), else TRAFFIC_UNAWARE; overridable via
-    // `_passthrough.body`.
+    // TWO_WHEELER accept it. Overridable via `_passthrough.body`.
+    //
+    // `TRAFFIC_AWARE` is a Pro-tier SKU feature, and Route Matrix bills PER
+    // ELEMENT — so it follows the explicit `trafficMode` opt-in rather than the
+    // presence of `departureTime`. Deriving it from a departure time would move
+    // origins x destinations billed elements onto Pro pricing at once.
     if (travelMode === 'DRIVE' || travelMode === 'TWO_WHEELER') {
-      body.routingPreference = options.departureTime
-        ? 'TRAFFIC_AWARE'
-        : 'TRAFFIC_UNAWARE';
+      body.routingPreference =
+        options.trafficMode === 'live' ? 'TRAFFIC_AWARE' : 'TRAFFIC_UNAWARE';
     }
 
     if (options.avoidTolls) {

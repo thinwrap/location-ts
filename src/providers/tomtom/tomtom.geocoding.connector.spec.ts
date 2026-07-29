@@ -187,6 +187,27 @@ describe('TomTomGeocodingConnector', () => {
     expect(result.predictions[1]!.description).toBe('New York, NY, USA');
   });
 
+  it('should pass countryFilter as countrySet for autocomplete', async () => {
+    mockFetch.mockResolvedValueOnce(buildSearchResponse());
+
+    await connector.autocomplete({
+      input: 'Empire State',
+      countryFilter: ['IL', 'PS'],
+    });
+
+    const [url] = mockFetch.mock.calls[0]!;
+    expect(url as string).toContain('countrySet=IL%2CPS');
+  });
+
+  it('should omit countrySet from autocomplete when no countryFilter is given', async () => {
+    mockFetch.mockResolvedValueOnce(buildSearchResponse());
+
+    await connector.autocomplete({ input: 'Empire State' });
+
+    const [url] = mockFetch.mock.calls[0]!;
+    expect(url as string).not.toContain('countrySet');
+  });
+
   it('should pass language and countryFilter for geocode', async () => {
     mockFetch.mockResolvedValueOnce(buildGeocodeResponse());
 

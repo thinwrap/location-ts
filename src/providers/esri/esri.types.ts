@@ -1,5 +1,9 @@
 export interface EsriRouteFeatureAttributes {
-  /** Length in meters when `directionsLengthUnits=esriNAUMeters`. */
+  /**
+   * Total length in meters. Not emitted by the public World/Route service in
+   * either driving or walking mode (verified live) — the distance attribute is
+   * suffixed instead, e.g. `Total_Kilometers`. Read only as a fallback.
+   */
   Total_Length?: number;
   /** Travel time in minutes. */
   Total_Time?: number;
@@ -7,9 +11,9 @@ export interface EsriRouteFeatureAttributes {
   Total_TravelTime?: number;
   /** Walking-mode impedance: total walk time in minutes (WALK travel mode). */
   Total_WalkTime?: number;
-  /** Legacy field: brownfield responses report Total_Miles. */
+  /** Legacy distance attribute, in miles; superseded by `Total_Length`. */
   Total_Miles?: number;
-  /** Legacy field: brownfield responses report Total_Kilometers (kilometers). */
+  /** Legacy distance attribute, in kilometers; superseded by `Total_Length`. */
   Total_Kilometers?: number;
 }
 
@@ -23,18 +27,30 @@ export interface EsriStopFeatureAttributes {
   Sequence?: number;
   Name?: string;
   ObjectID?: number;
-}
 
-export interface EsriDirectionStepAttributes {
-  /** Length in meters when `directionsLengthUnits=esriNAUMeters`. */
-  length: number;
-  /** Time in minutes. */
-  time: number;
   /**
-   * Maneuver classification. Leg boundaries are delimited by
-   * `esriDMTStop` steps.
+   * Status of locating this stop on the network. `0` is OK; the documented
+   * non-zero codes include `1` (Not Located), `5` (Not Reached) and `7` (Not
+   * located on closest). A non-zero status means the `Cumul_*` values below may
+   * be absent.
    */
-  maneuverType?: string;
+  Status?: number;
+
+  /**
+   * Snap distance: metres between the requested coordinate and where it was located
+   * on the network. Not read by any normalized field — a coordinate far from any
+   * road still yields a well-formed route, so this is the only signal that it
+   * happened. The acceptable threshold is application policy, so it is documented in
+   * the connector README rather than enforced here.
+   */
+  DistanceToNetworkInMeters?: number;
+
+  /**
+   * Cumulative cost from the origin **to and including this stop**, one field per
+   * accumulated attribute. The suffix is the attribute name, so the key is
+   * impedance-dependent: `Cumul_TravelTime` driving, `Cumul_WalkTime` walking.
+   */
+  [cumulativeField: `Cumul_${string}`]: number | undefined;
 }
 
 export interface EsriRouteResponse {
@@ -46,24 +62,6 @@ export interface EsriRouteResponse {
       };
     }>;
   };
-  directions?: Array<{
-    features: Array<{
-      attributes: EsriDirectionStepAttributes;
-    }>;
-    /**
-     * Route-level totals. Travel-mode-independent: `totalLength` is in meters
-     * when `directionsLengthUnits=esriNAUMeters`, `totalTime` is in minutes.
-     * Preferred over the `Total_*` route attributes, whose names vary by the
-     * active impedance (TravelTime vs WalkTime).
-     */
-    summary?: {
-      totalLength?: number;
-      totalTime?: number;
-      totalDriveTime?: number;
-    };
-  }>;
-  // Returned when `returnStops=true`; features are in INPUT order, each with a
-  // 1-based `Sequence` = its position in the optimized route.
   stops?: {
     features: Array<{
       attributes: EsriStopFeatureAttributes;

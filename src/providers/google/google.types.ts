@@ -3,11 +3,11 @@ export interface GoogleRoutesResponse {
     legs: Array<{
       distanceMeters: number;
       duration: string;
-      staticDuration: string;
+      staticDuration?: string;
     }>;
     distanceMeters: number;
     duration: string;
-    staticDuration: string;
+    staticDuration?: string;
     polyline: { encodedPolyline: string };
     optimizedIntermediateWaypointIndex?: number[];
   }>;
@@ -75,6 +75,16 @@ export interface GooglePlacesAutocompleteNewResponse {
     placePrediction?: {
       placeId?: string;
       text?: { text?: string };
+      /** Default-on for Places Autocomplete — no field mask or extra cost. */
+      structuredFormat?: {
+        mainText?: { text?: string };
+        secondaryText?: { text?: string };
+      };
     };
   }>;
 }
+
+// Per-provider INPUT augmentations for Google (`sessionToken`) deliberately do
+// NOT live here — see `google.config.ts`. A `declare module` block only applies
+// if its file is part of the consumer's compilation, and nothing in the emitted
+// type graph imports this module (the connectors reference it in comments only).
