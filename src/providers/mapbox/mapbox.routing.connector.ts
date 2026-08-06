@@ -14,6 +14,7 @@ import {
   joinCoords,
   mergePassthrough,
 } from '../../utils';
+import { toIsoSeconds } from '../../utils/datetime';
 import type { MapboxConfig } from './mapbox.config';
 
 const DIRECTIONS_URL = 'https://api.mapbox.com/directions/v5/mapbox';
@@ -183,7 +184,9 @@ export class MapboxRoutingConnector
     if (excludes) baseQuery.exclude = excludes;
 
     if (options.departureTime) {
-      baseQuery.depart_at = options.departureTime.toISOString();
+      // Mapbox documents `depart_at` as one of exactly three ISO 8601 forms,
+      // none carrying milliseconds — so seconds precision, not toISOString().
+      baseQuery.depart_at = toIsoSeconds(options.departureTime);
     }
 
     const merged = mergePassthrough(
@@ -253,7 +256,9 @@ export class MapboxRoutingConnector
     if (excludes) baseQuery.exclude = excludes;
 
     if (options.departureTime) {
-      baseQuery.depart_at = options.departureTime.toISOString();
+      // Mapbox documents `depart_at` as one of exactly three ISO 8601 forms,
+      // none carrying milliseconds — so seconds precision, not toISOString().
+      baseQuery.depart_at = toIsoSeconds(options.departureTime);
     }
 
     const merged = mergePassthrough(

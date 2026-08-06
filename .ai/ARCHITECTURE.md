@@ -126,6 +126,30 @@ Outlier translations (e.g. HERE Matrix v8 submit/poll/retrieve, TomTom Reachable
 single-budget fan-out, ESRI HTTP-200-with-error-body inspection) live inside the
 corresponding connector — never in `BaseConnector`, never as global middleware.
 
+## The `fetchImpl` contract, and why it is enforced defensively
+
+**A non-2xx must be RETURNED as a `Response`, never thrown.** Every connector's
+`if (!response.ok) throw await this.raiseHttpError(...)` depends on it, and so does the
+per-connector mapping above.
+
+The seam is not fully under the caller's control, which is what makes this load-bearing: on
+Node, `globalThis.fetch` dispatches through undici's **process-global** dispatcher, and a host
+application can replace it at any time — `setGlobalDispatcher(new Agent().compose(retry(),
+interceptors.responseError()))` is a normal thing for an app to do. Under `responseError()` a
+non-2xx never materializes as a `Response`; `fetch` rejects with `TypeError: fetch failed`
+whose `.cause` is a `ResponseError` carrying `statusCode`/`headers`/`body`. None of that is
+visible from the `fetchImpl` the caller passed in.
+
+`BaseConnector.invokeFetch` therefore **rebuilds the `Response`** from such a rejection and
+returns it, rather than classifying the error itself. That choice is deliberate: classifying in
+the base would move vendor error mapping out of the connector (breaking per-connector locality)
+and lose `providerMessage` parsing and `Retry-After`. Rebuilding keeps all 24 connectors
+unchanged. The detection is duck-typed on the error shape — never an `undici` import, since the
+library has zero runtime dependencies.
+
+The library reads `globalThis.fetch`; it never writes to it or to any other global. Inheriting
+the host's proxy/TLS/DNS configuration is intended, imposing anything on the host is not.
+
 ## Stateless wrapper, no retry
 
 The wrapper holds no token cache, no connection

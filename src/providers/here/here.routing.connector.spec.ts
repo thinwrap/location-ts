@@ -249,6 +249,54 @@ describe('HereRoutingConnector', () => {
       expect(result.waypointOrder).toEqual([0, 2, 1, 3]);
     });
 
+    describe('departure formatting (legacy WPS grammar)', () => {
+      async function emittedDeparture(departureTime: Date): Promise<string | null> {
+        mockFetch
+          .mockResolvedValueOnce(buildSequenceResponse())
+          .mockResolvedValueOnce(buildRouteResponse());
+        await connector.route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 2, lng: 2 },
+            { lat: 3, lng: 3 },
+            { lat: 4, lng: 4 },
+          ],
+          optimize: true,
+          departureTime,
+        });
+        return parseUrlParams(mockFetch.mock.calls[0]![0] as string).get('departure');
+      }
+
+      // Live-verified against findsequence2: `2026-08-07T03:06:00.000Z` answers
+      // 400 `Bad Format for Date and Time`, `2026-08-07T03:06:00Z` answers 200.
+      // The whole optimized-route path is dead without this.
+      it('emits seconds precision with a zone designator, never milliseconds', async () => {
+        const departure = await emittedDeparture(new Date('2026-08-07T03:06:00.000Z'));
+        expect(departure).toBe('2026-08-07T03:06:00Z');
+        expect(departure).not.toContain('.');
+        expect(departure).toMatch(/Z$/);
+      });
+
+      it('truncates a sub-second departure rather than rounding it into the future', async () => {
+        expect(await emittedDeparture(new Date('2026-08-07T03:06:00.999Z'))).toBe(
+          '2026-08-07T03:06:00Z',
+        );
+      });
+
+      it('leaves the /v8/routes leg on the fractional form it accepts', async () => {
+        mockFetch.mockResolvedValueOnce(buildRouteResponse());
+        await connector.route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 1, lng: 1 },
+          ],
+          departureTime: new Date('2026-08-07T03:06:00.000Z'),
+        });
+        const params = parseUrlParams(mockFetch.mock.calls[0]![0] as string);
+        expect(params.get('departureTime')).toBe('2026-08-07T03:06:00.000Z');
+      });
+    });
+
     it('triggers optimization on optimizeFixedOrigin', async () => {
       mockFetch
         .mockResolvedValueOnce(buildSequenceResponse())
@@ -502,6 +550,90 @@ describe('HereRoutingConnector', () => {
       expect(thrown).toBeInstanceOf(ConnectorError);
       expect((thrown as ConnectorError).providerCode).toBe('invalid_request');
       expect((thrown as ConnectorError).statusCode).toBe(400);
+    });
+
+    it('surfaces the legacy WPS `errors[]` message findsequence2 answers with', async () => {
+      // findsequence2 does not use the v8 `{ title, cause }` envelope; its reason
+      // lives in `errors[]`, and dropping it leaves the caller a bare "failed: 400".
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            results: null,
+            errors: ['Bad Format for Date and Time: 2026-08-07T03:06:00.000Z.'],
+            responseCode: '400',
+          }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      const thrown = (await connector
+        .route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 1, lng: 1 },
+            { lat: 2, lng: 2 },
+          ],
+          optimize: true,
+        })
+        .catch((e) => e)) as ConnectorError;
+      expect(thrown.providerMessage).toContain('Bad Format for Date and Time');
+    });
+
+    it('surfaces `errors[]` when findsequence2 reports a rejection as HTTP 200', async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ results: null, errors: ['Invalid credentials'], responseCode: '401' }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      const thrown = (await connector
+        .route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 1, lng: 1 },
+            { lat: 2, lng: 2 },
+          ],
+          optimize: true,
+        })
+        .catch((e) => e)) as ConnectorError;
+      expect(thrown.providerMessage).toBe(
+        'HERE findsequence2 returned no sequence: Invalid credentials',
+      );
+    });
+
+    it('maps a findsequence2 failure through mapVendorError when the dispatcher throws it', async () => {
+      // End-to-end for the production shape: a host-installed global dispatcher
+      // composing `interceptors.responseError()` rejects instead of returning the
+      // 400. The caller must still get invalid_request + the HERE message, not
+      // provider_unavailable with a null status.
+      const rejection = new TypeError('fetch failed');
+      (rejection as { cause?: unknown }).cause = {
+        name: 'ResponseError',
+        code: 'UND_ERR_RESPONSE',
+        statusCode: 400,
+        headers: { 'content-type': 'application/json' },
+        body: {
+          results: null,
+          errors: ['Bad Format for Date and Time: 2026-08-07T03:06:00.000Z.'],
+          responseCode: '400',
+        },
+      };
+      mockFetch.mockRejectedValueOnce(rejection);
+
+      const thrown = (await connector
+        .route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 1, lng: 1 },
+            { lat: 2, lng: 2 },
+          ],
+          optimize: true,
+        })
+        .catch((e) => e)) as ConnectorError;
+      expect(thrown).toBeInstanceOf(ConnectorError);
+      expect(thrown.statusCode).toBe(400);
+      expect(thrown.providerCode).toBe('invalid_request');
+      expect(thrown.providerMessage).toContain('Bad Format for Date and Time');
+      expect(JSON.stringify(thrown.cause)).not.toContain(defaultConfig.apiKey);
     });
   });
 

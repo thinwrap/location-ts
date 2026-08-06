@@ -15,6 +15,7 @@ import {
   mergePassthrough,
 } from '../../utils';
 import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
+import { toIsoSeconds } from '../../utils/datetime';
 import type { HereConfig } from './here.config';
 import type {
   HereRouteResponse,
@@ -294,7 +295,7 @@ export class HereRoutingConnector
       // HERE findsequence2 documents the departure-time param as `departure`
       // (ISO 8601); `departureTime` is not recognized and was silently ignored,
       // so traffic-aware sequencing never took effect.
-      baseQuery.departure = options.departureTime.toISOString();
+      baseQuery.departure = toIsoSeconds(options.departureTime);
     }
 
     // Merge `_passthrough` (query + headers) into this leg too — it was silently
@@ -334,11 +335,19 @@ export class HereRoutingConnector
     }
     const sequenceResult = data.results?.[0];
     if (!sequenceResult || !Array.isArray(sequenceResult.waypoints)) {
+      // The legacy WPS endpoint also reports a rejected request as HTTP 200 with
+      // `{ results: null, errors: [...], responseCode: '400' }`, so the reason
+      // arrives here rather than through `raiseHttpError`. Surface it.
+      const reason = readHereErrorMessage(data);
+      const providerMessage =
+        reason !== null
+          ? `HERE findsequence2 returned no sequence: ${reason}`
+          : 'HERE findsequence2 returned no sequence';
       throw new ConnectorError({
-        message: 'HERE findsequence2 returned no sequence',
+        message: providerMessage,
         statusCode: response.status,
         providerCode: 'unknown',
-        providerMessage: 'HERE findsequence2 returned no sequence',
+        providerMessage,
         cause: data,
       });
     }
@@ -513,6 +522,13 @@ function readHereErrorMessage(body: unknown): string | null {
   }
   if (typeof cause === 'string' && cause !== '') return cause;
 
+  // findsequence2 is the legacy WPS shape — no `title`/`cause`, just
+  // `{ results: null, errors: ['Bad Format for Date and Time: …'],
+  //    responseCode: '400' }`. Without this the one statement of *why* is
+  // dropped and the caller sees a bare "failed: 400".
+  const errors = readHereErrorList(obj.errors);
+  if (errors !== null) return errors;
+
   // Fallback: nested { error: { message } } or top-level { message } / { error }.
   const error = obj.error;
   if (error !== null && typeof error === 'object') {
@@ -523,4 +539,13 @@ function readHereErrorMessage(body: unknown): string | null {
   if (typeof error === 'string' && error !== '') return error;
 
   return null;
+}
+
+/** Join the non-empty strings of a WPS `errors[]` array, or `null` if there are none. */
+function readHereErrorList(errors: unknown): string | null {
+  if (!Array.isArray(errors)) return null;
+  const messages = errors.filter(
+    (entry): entry is string => typeof entry === 'string' && entry !== '',
+  );
+  return messages.length > 0 ? messages.join('; ') : null;
 }

@@ -633,18 +633,21 @@ describe('MapboxRoutingConnector', () => {
       expect(params.get('exclude')).toBe('motorway');
     });
 
-    it('emits depart_at when departureTime is set', async () => {
+    // Mapbox enumerates exactly three accepted ISO 8601 forms for `depart_at`
+    // (`YYYY-MM-DDThh:mm:ssZ`, `…±hh:mm`, `YYYY-MM-DDThh:mm`); the millisecond
+    // form `toISOString()` produces is not one of them.
+    it('emits depart_at at seconds precision when departureTime is set', async () => {
       mockFetch.mockResolvedValueOnce(buildDirectionsResponse());
       await connector.route({
         waypoints: [
           { lat: 0, lng: 0 },
           { lat: 1, lng: 1 },
         ],
-        departureTime: new Date('2024-01-15T08:00:00Z'),
+        departureTime: new Date('2024-01-15T08:00:00.750Z'),
       });
       const [url] = mockFetch.mock.calls[0]!;
       const params = parseUrlParams(url as string);
-      expect(params.get('depart_at')).toBe('2024-01-15T08:00:00.000Z');
+      expect(params.get('depart_at')).toBe('2024-01-15T08:00:00Z');
     });
   });
 

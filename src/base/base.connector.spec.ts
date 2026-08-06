@@ -140,6 +140,114 @@ describe('BaseConnector', () => {
       expect(err.cause).not.toBe(netErr);
       expect(err.cause).toEqual({ raw: { name: 'TypeError' } });
     });
+
+    it('keeps the diagnostic code of a transport failure on the sanitized cause', async () => {
+      // `name` is 'TypeError' for every undici failure — DNS, reset, TLS — so it
+      // identifies nothing on its own. `code` is what names the failure.
+      const netErr = new TypeError('fetch failed');
+      (netErr as { cause?: unknown }).cause = Object.assign(new Error('read ECONNRESET'), {
+        name: 'SocketError',
+        code: 'ECONNRESET',
+      });
+      mockFetch.mockRejectedValueOnce(netErr);
+      const c = new TestConnector();
+      const err = (await c.callGet('https://api.example.com/x').catch((e) => e)) as ConnectorError;
+      expect(err.cause).toEqual({
+        raw: { name: 'TypeError', code: 'ECONNRESET', causeName: 'SocketError' },
+      });
+    });
+
+    it('drops a URL-shaped `code` so a leaky fetchImpl cannot smuggle a credential', async () => {
+      const netErr = new TypeError('fetch failed');
+      (netErr as { cause?: unknown }).cause = {
+        code: 'https://api.example.com/x?key=SECRET',
+        name: 'https://api.example.com/x?key=SECRET',
+      };
+      mockFetch.mockRejectedValueOnce(netErr);
+      const c = new TestConnector();
+      const err = (await c.callGet('https://api.example.com/x').catch((e) => e)) as ConnectorError;
+      expect(JSON.stringify({ m: err.message, c: err.cause })).not.toContain('SECRET');
+      expect(err.cause).toEqual({ raw: { name: 'TypeError' } });
+    });
+  });
+
+  describe('fetchImpl that rejects instead of returning a non-2xx Response', () => {
+    /**
+     * Shape of undici's `ResponseError`, thrown when the host application
+     * installs a global dispatcher composing `interceptors.responseError()`.
+     * Duck-typed here exactly as the library duck-types it — no undici import.
+     */
+    function responseErrorRejection(statusCode: number, body: unknown, headers: Record<string, string> = {}) {
+      const wrapper = new TypeError('fetch failed');
+      (wrapper as { cause?: unknown }).cause = {
+        name: 'ResponseError',
+        message: 'Response Error',
+        code: 'UND_ERR_RESPONSE',
+        statusCode,
+        body,
+        headers: { 'content-type': 'application/json', ...headers },
+      };
+      return wrapper;
+    }
+
+    it.each([400, 429, 503])('rebuilds the %i Response so the caller sees the real status', async (status) => {
+      mockFetch.mockRejectedValueOnce(
+        responseErrorRejection(status, { errors: ['Bad Format for Date and Time: x'] }),
+      );
+      const c = new TestConnector();
+      const response = await c.callGet('https://api.example.com/x');
+      expect(response.status).toBe(status);
+      expect(response.ok).toBe(false);
+      await expect(response.json()).resolves.toEqual({
+        errors: ['Bad Format for Date and Time: x'],
+      });
+    });
+
+    it('preserves response headers such as Retry-After', async () => {
+      mockFetch.mockRejectedValueOnce(
+        responseErrorRejection(429, { title: 'Too Many Requests' }, { 'retry-after': '30' }),
+      );
+      const c = new TestConnector();
+      const response = await c.callGet('https://api.example.com/x');
+      expect(response.headers.get('retry-after')).toBe('30');
+    });
+
+    it('accepts a body the interceptor left as text', async () => {
+      mockFetch.mockRejectedValueOnce(responseErrorRejection(400, 'plain text failure'));
+      const c = new TestConnector();
+      const response = await c.callGet('https://api.example.com/x');
+      await expect(response.text()).resolves.toBe('plain text failure');
+    });
+
+    it('handles a null-body status without throwing', async () => {
+      mockFetch.mockRejectedValueOnce(responseErrorRejection(304, ''));
+      const c = new TestConnector();
+      const response = await c.callGet('https://api.example.com/x');
+      expect(response.status).toBe(304);
+    });
+
+    it('still reports a genuine transport failure as provider_unavailable', async () => {
+      // No status anywhere in the chain — the provider never answered.
+      const netErr = new TypeError('fetch failed');
+      (netErr as { cause?: unknown }).cause = { name: 'SocketError', code: 'UND_ERR_SOCKET' };
+      mockFetch.mockRejectedValueOnce(netErr);
+      const c = new TestConnector();
+      await expect(c.callGet('https://api.example.com/x')).rejects.toMatchObject({
+        name: 'ConnectorError',
+        statusCode: null,
+        providerCode: 'provider_unavailable',
+      });
+    });
+
+    it('does not mistake a non-HTTP numeric field for a status', async () => {
+      const netErr = new TypeError('fetch failed');
+      (netErr as { cause?: unknown }).cause = { name: 'SocketError', statusCode: 0 };
+      mockFetch.mockRejectedValueOnce(netErr);
+      const c = new TestConnector();
+      await expect(c.callGet('https://api.example.com/x')).rejects.toMatchObject({
+        providerCode: 'provider_unavailable',
+      });
+    });
   });
 
   describe('request timeout', () => {

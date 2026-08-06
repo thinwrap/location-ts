@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] — 2026-08-06
+
+### Fixed
+
+- **HERE optimized routing carrying a `departureTime` failed outright** (regression introduced
+  in 1.2.0). The `findsequence2` leg emitted a millisecond-precision `departure`
+  (`2026-08-07T03:06:00.000Z`) and the legacy WPS endpoint answers HTTP 400 *Bad Format for
+  Date and Time*. It now emits seconds precision with the zone designator
+  (`2026-08-07T03:06:00Z`), matching HERE's own documented example. `/v8/routes` is unchanged
+  — it accepts the fractional form.
+- **Every HTTP error collapsed into `provider_unavailable` with a null status when the host
+  application's `fetch` rejects on a non-2xx.** Node's undici dispatcher is process-global and
+  invisible to the injected `fetchImpl`, so a host composing `interceptors.responseError()`
+  turned every 400/429/503 from every provider into an apparent transport failure —
+  `raiseHttpError` never ran. `BaseConnector` now rebuilds the `Response` from such a
+  rejection, so each connector's own status mapping, `providerMessage` and `Retry-After`
+  handling run unchanged. Genuine transport failures are classified exactly as before.
+- **`ConnectorError.cause.raw` carried only `name`**, which is `TypeError` for every undici
+  failure — DNS, reset, TLS, aborted redirect — and so identified nothing. It now also carries
+  `code` (`ECONNRESET`, `UND_ERR_RESPONSE`, `ENOTFOUND`, …), `causeName` and `statusCode` when
+  present. Only identifier-shaped values are accepted, so a URL or credential still cannot
+  reach it, and the raw message and error object remain suppressed.
+- **HERE `findsequence2` error text was discarded.** Its legacy envelope
+  (`{"results":null,"errors":["…"],"responseCode":"400"}`) carries neither `title` nor `cause`,
+  so the caller saw a bare `failed: 400`. Both the HTTP-error path and the
+  HTTP-200-with-`responseCode` path now surface it.
+- **Mapbox `depart_at` emitted a millisecond value**, which is not one of the three ISO 8601
+  forms Mapbox documents for that parameter. Now seconds precision.
+
 ## [1.2.0] — 2026-07-28
 
 Driven by external-consumer feedback, applied across all four language siblings. Additive or
