@@ -144,6 +144,28 @@ export abstract class BaseConnector {
 // Module-private helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Key marking an error body that reached us unreadable. Namespaced so it can
+ * never collide with vendor content, and surfaced through `ConnectorError.cause`
+ * so a caller can tell "the provider said nothing" from "the provider's answer
+ * was destroyed before we could read it" — the second silently degrades any
+ * classification that reads the body.
+ */
+export const BODY_UNAVAILABLE_KEY = '_thinwrapErrorBodyUnavailable';
+
+/**
+ * Whether a decoded error body is the marker above rather than vendor content.
+ * Connectors whose `mapVendorError` reads the body use this to avoid returning a
+ * confident code they cannot actually justify.
+ */
+export function isErrorBodyUnavailable(body: unknown): boolean {
+  return (
+    body !== null &&
+    typeof body === 'object' &&
+    typeof (body as Record<string, unknown>)[BODY_UNAVAILABLE_KEY] === 'string'
+  );
+}
+
 /** Walk `err`, `err.cause`, `err.cause.cause` — deep enough for a wrapped rejection. */
 function* errorChain(err: unknown, depth = 3): Generator<Record<string, unknown>> {
   let current = err;
@@ -182,7 +204,10 @@ function responseFromThrownHttpError(err: unknown): Response | null {
     }
 
     // 204/205/304 are null-body statuses; `new Response(body, …)` throws for them.
-    const body = status === 204 || status === 205 || status === 304 ? null : readErrorBody(link.body);
+    const body =
+      status === 204 || status === 205 || status === 304
+        ? null
+        : readErrorBody(link.body, link.headers);
 
     try {
       return new Response(body, { status, headers: readErrorHeaders(link.headers) });
@@ -196,9 +221,34 @@ function responseFromThrownHttpError(err: unknown): Response | null {
   return null;
 }
 
-/** Normalize a buffered error body to something the `Response` constructor accepts. */
-function readErrorBody(body: unknown): string | Uint8Array | ArrayBuffer | null {
-  if (typeof body === 'string') return body;
+/**
+ * Normalize a buffered error body to something the `Response` constructor accepts.
+ *
+ * A `content-encoding` on the error means the body was buffered **still
+ * compressed** and is unrecoverable — drop it rather than hand a connector
+ * mojibake. A dispatcher-level interceptor sits *below* fetch's content-decoding,
+ * so it buffers raw wire bytes and text-decodes them; gzip is not valid UTF-8, so
+ * every invalid byte becomes U+FFFD before we ever see the value. Measured on a
+ * real gzipped 400: 16 of 66 bytes replaced, the `1f 8b` magic destroyed, and
+ * re-encoding as latin1/binary/utf8 all fail to inflate (`Z_DATA_ERROR`). There
+ * is nothing here to salvage — not with `zlib`, not with anything.
+ *
+ * (Verified against undici 8.9: this is driven by `content-encoding`, not by the
+ * `;charset=` suffix — its content-type check is a prefix match, so
+ * `application/json;charset=UTF-8` parses fine when the body is uncompressed. Its
+ * own `decompress()` interceptor does not help in any composition order.)
+ */
+function readErrorBody(body: unknown, headers: unknown): string | Uint8Array | ArrayBuffer | null {
+  if (typeof body === 'string') {
+    const encoding = contentEncodingOf(headers);
+    // Substitute a namespaced marker rather than `null`. Every connector already
+    // routes the decoded error body into `ConnectorError.cause`, so this reaches
+    // all of them without touching one — and it turns a silent gap into a stated
+    // reason. It cannot be mistaken for vendor content: no provider emits this
+    // key, and no connector's message reader looks for it, so `providerMessage`
+    // stays null exactly as it would have.
+    return encoding === null ? body : JSON.stringify({ [BODY_UNAVAILABLE_KEY]: encoding });
+  }
   if (body instanceof Uint8Array || body instanceof ArrayBuffer) return body;
   if (body === null || body === undefined) return null;
   if (typeof body === 'object') {
@@ -209,6 +259,17 @@ function readErrorBody(body: unknown): string | Uint8Array | ArrayBuffer | null 
     } catch {
       return null;
     }
+  }
+  return null;
+}
+
+/** The error's declared body encoding, or `null` when it is absent or `identity`. */
+function contentEncodingOf(headers: unknown): string | null {
+  if (headers === null || typeof headers !== 'object') return null;
+  for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+    if (key.toLowerCase() !== 'content-encoding') continue;
+    const encoding = (Array.isArray(value) ? value.join(',') : String(value)).trim().toLowerCase();
+    return encoding === '' || encoding === 'identity' ? null : encoding;
   }
   return null;
 }

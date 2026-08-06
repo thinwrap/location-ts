@@ -1,4 +1,4 @@
-import { BaseConnector } from '../../base/base.connector';
+import { BaseConnector, isErrorBodyUnavailable } from '../../base/base.connector';
 import type {
   IRoutingConnector,
   IRoutingLeg,
@@ -262,6 +262,13 @@ export class GoogleRoutingConnector
     if (reasonCode !== null) return reasonCode;
 
     const googleStatus = readGoogleErrorStatus(body);
+
+    // Google answers HTTP 400 for BOTH an invalid key and a malformed request —
+    // only `error.details[].reason` separates them, and the headers are
+    // byte-identical (verified live). So when the body never reached us, the
+    // status-only fallback below cannot justify `invalid_request`: say `unknown`
+    // rather than confidently blame the caller's request.
+    if (isErrorBodyUnavailable(body)) return 'unknown';
 
     if (httpStatus === 401) return 'auth_failed';
     if (httpStatus === 403) {

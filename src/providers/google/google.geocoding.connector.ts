@@ -1,4 +1,4 @@
-import { BaseConnector } from '../../base/base.connector';
+import { BaseConnector, isErrorBodyUnavailable } from '../../base/base.connector';
 import type {
   IGeocodingConnector,
   IGeocodeOptions,
@@ -462,7 +462,12 @@ export class GoogleGeocodingConnector
     return new ConnectorError({
       message: body?.error_message ?? `${fallbackMessage}: ${response.status}`,
       statusCode: response.status,
-      providerCode: this.mapVendorError(response.status, body?.status),
+      // `mapVendorError` reads only the envelope status, which a destroyed body
+      // cannot supply — so the status-only fallback would confidently return a
+      // code it has no evidence for. Say `unknown` instead.
+      providerCode: isErrorBodyUnavailable(body)
+        ? 'unknown'
+        : this.mapVendorError(response.status, body?.status),
       providerMessage: this.formatProviderMessage(
         body?.error_message ?? null,
         retryAfter,

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { BaseConnector } from './base.connector';
+import { BaseConnector, isErrorBodyUnavailable } from './base.connector';
 import { ConnectorError } from '../types/error.types';
 
 class TestConnector extends BaseConnector {
@@ -217,6 +217,56 @@ describe('BaseConnector', () => {
       const c = new TestConnector();
       const response = await c.callGet('https://api.example.com/x');
       await expect(response.text()).resolves.toBe('plain text failure');
+    });
+
+    it('replaces an unrecoverable compressed body with a stated reason', async () => {
+      // A dispatcher-level interceptor buffers raw wire bytes, below fetch's
+      // content-decoding, and text-decodes them. gzip is not valid UTF-8, so the
+      // bytes are already destroyed (U+FFFD) by the time we see the string —
+      // measured: 16 of 66 bytes replaced, `1f 8b` magic gone, inflation
+      // impossible in any re-encoding. Surfacing a namespaced marker instead of
+      // mojibake (or silence) is what lets a connector tell "the provider said
+      // nothing" from "the answer was destroyed before we could read it".
+      const gzipMangled = '�  ��';
+      mockFetch.mockRejectedValueOnce(
+        responseErrorRejection(400, gzipMangled, { 'content-encoding': 'gzip' }),
+      );
+      const c = new TestConnector();
+      const response = await c.callGet('https://api.example.com/x');
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toEqual({
+        _thinwrapErrorBodyUnavailable: 'gzip',
+      });
+      expect(response.headers.get('content-encoding')).toBeNull();
+    });
+
+    it('marks the body unavailable for any non-identity encoding', async () => {
+      mockFetch.mockRejectedValueOnce(
+        responseErrorRejection(400, '�  ��', { 'content-encoding': 'br' }),
+      );
+      const c = new TestConnector();
+      const response = await c.callGet('https://api.example.com/x');
+      expect(isErrorBodyUnavailable(await response.json())).toBe(true);
+    });
+
+    it('keeps a plain text body when no content-encoding is declared', async () => {
+      mockFetch.mockRejectedValueOnce(
+        responseErrorRejection(400, 'Bad Format for Date and Time', {
+          'content-type': 'text/plain',
+        }),
+      );
+      const c = new TestConnector();
+      const response = await c.callGet('https://api.example.com/x');
+      await expect(response.text()).resolves.toBe('Bad Format for Date and Time');
+    });
+
+    it('keeps a body whose content-encoding is identity', async () => {
+      mockFetch.mockRejectedValueOnce(
+        responseErrorRejection(400, '{"errors":["x"]}', { 'content-encoding': 'identity' }),
+      );
+      const c = new TestConnector();
+      const response = await c.callGet('https://api.example.com/x');
+      await expect(response.json()).resolves.toEqual({ errors: ['x'] });
     });
 
     it('handles a null-body status without throwing', async () => {

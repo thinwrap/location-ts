@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.2] — 2026-08-06
+
+### Fixed
+
+- **An error body the host's dispatcher buffered while still compressed no longer
+  degrades error classification silently.** A dispatcher-level interceptor sits
+  *below* fetch's content-decoding, so it buffers raw gzip bytes and text-decodes
+  them; the result is irrecoverable (measured on a real gzipped 400: 16 of 66 bytes
+  replaced with U+FFFD, the `1f 8b` magic destroyed, inflation impossible in any
+  re-encoding — and undici's own `decompress()` interceptor does not help, in any
+  composition order).
+
+  Rather than pass mojibake through, `BaseConnector` now substitutes a namespaced
+  marker, which every connector already routes into `ConnectorError.cause`:
+
+  ```json
+  { "_thinwrapErrorBodyUnavailable": "gzip" }
+  ```
+
+  Status, provider code and `Retry-After` were already surviving; this makes the
+  *reason* for a missing `providerMessage` explicit instead of leaving a silent gap.
+  Uncompressed and `identity`-encoded bodies are untouched.
+
+- **Google no longer returns a confident `invalid_request` when it cannot see the
+  body.** Google answers HTTP 400 for both an invalid API key and a malformed
+  request; only `error.details[].reason` separates them, and the response headers
+  are byte-identical (verified live). With the body destroyed, the status-only
+  fallback was reporting `invalid_request` — a wrong code, stated confidently, on
+  what is actually an auth failure. All three Google connectors now report `unknown`
+  in that case. Behaviour on a normal host is unchanged.
+
+  Live-verified across all five providers via the new `probe:dispatcher` playground
+  script. Two of six cases gzip their error bodies (HERE `findsequence2`, Google).
+  The only way to keep vendor error text is not to compose
+  `interceptors.responseError()` onto a shared dispatcher.
+
+### Documentation
+
+- The **Bring your own `fetch`** section now states the transport contract (a non-2xx must
+  be returned, not thrown) and warns that injecting a `fetch` does **not** isolate you from
+  the host process — `globalThis.fetch` and `undici.fetch` both dispatch through undici's
+  process-global dispatcher. It shows the isolated alternative, verified live to restore
+  both the correct provider code and the vendor message:
+
+  ```ts
+  const isolated = new Agent();
+  const fetchImpl = ((url, init) =>
+    undiciFetch(url as string, { ...init, dispatcher: isolated })) as typeof fetch;
+  ```
+
+  This was previously documented only in `.ai/ARCHITECTURE.md`, which consumers never see.
+
 ## [1.2.1] — 2026-08-06
 
 ### Fixed

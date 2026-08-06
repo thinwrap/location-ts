@@ -161,6 +161,33 @@ const tracingFetch: typeof fetch = async (url, init) => {
 const routing = new Routing('google', { apiKey: process.env.GOOGLE_KEY! }, tracingFetch);
 ```
 
+**Contract: a non-2xx must be RETURNED as a `Response`, not thrown.** That is plain
+fetch semantics, and it is what lets each connector map the status to a `providerCode`
+(429 → `rate_limited`, 401 → `auth_failed`, …) and read the vendor's message.
+
+**Injecting a `fetch` does not isolate you from the host process.** On Node, both
+`globalThis.fetch` and `undici.fetch` dispatch through undici's *process-global*
+dispatcher, so anything the application installed applies to your calls too — including
+a `responseError()` interceptor, under which a non-2xx **rejects** instead of resolving.
+The library detects that case and rebuilds the `Response`, so classification still works.
+One thing it cannot repair: if the provider gzipped the error body, that interceptor
+buffers it below fetch's content-decoding and the bytes are destroyed before any library
+sees them, so the vendor's message text is lost.
+
+If you want your calls genuinely isolated from the host's configuration, pass an explicit
+dispatcher rather than relying on the global one:
+
+```typescript
+import { Agent, fetch as undiciFetch } from 'undici';
+
+const isolated = new Agent();                      // no inherited interceptors
+const routing = new Routing(
+  'google',
+  { apiKey: process.env.GOOGLE_KEY! },
+  ((url, init) => undiciFetch(url as string, { ...init, dispatcher: isolated })) as typeof fetch,
+);
+```
+
 The wrapper holds no state — no token cache, no connection pool, no retry buffer. Every
 operation is a single function call from input to output with one HTTP round-trip
 (except HERE Matrix v8, which transparently runs a submit → poll → retrieve cycle behind
@@ -197,6 +224,22 @@ try {
   } else throw e;
 }
 ```
+
+### When the provider's error body never arrived
+
+If the host process reconfigured undici's global dispatcher to reject non-2xx responses
+(see *Bring your own `fetch`* above), a **gzipped** error body is destroyed before any
+library can read it. The status still classifies correctly, but the vendor's message is
+gone — and a connector that classifies *from* the body (Google answers HTTP 400 for both
+an invalid key and a malformed request) reports `unknown` rather than guessing.
+
+`cause` states when this happened, so a missing `providerMessage` is never unexplained:
+
+```jsonc
+{ "_thinwrapErrorBodyUnavailable": "gzip" }
+```
+
+Pass an explicit dispatcher (shown above) to avoid it entirely.
 
 ### `no_route` — "there is no route", normalized
 

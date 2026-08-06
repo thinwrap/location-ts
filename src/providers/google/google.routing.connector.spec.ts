@@ -349,6 +349,12 @@ describe('GoogleRoutingConnector', () => {
       [500, null, 'provider_unavailable'],
       [503, null, 'provider_unavailable'],
       [418, null, 'unknown'],
+      // Google answers 400 for BOTH an invalid key and a malformed request, and
+      // the headers are byte-identical (verified live) — only the body separates
+      // them. When the body was destroyed in transit, `invalid_request` would be
+      // a confident answer with no evidence behind it, so say `unknown`.
+      [400, { _thinwrapErrorBodyUnavailable: 'gzip' }, 'unknown'],
+      [403, { _thinwrapErrorBodyUnavailable: 'gzip' }, 'unknown'],
     ])(
       'HTTP %i with body %j maps to providerCode %s',
       async (status, errorBody, expectedCode) => {
