@@ -466,6 +466,55 @@ describe('HereRoutingConnector', () => {
         'fastest;truck;traffic:disabled',
       );
     });
+
+    // `bus` and `privateBus` are distinct modes at HERE, not synonyms: `bus`
+    // may use bus-exclusive streets, `privateBus` only where a waypoint sits
+    // on one. Before this was typed, a caller wanting a licensed bus had to
+    // go through `_passthrough.query`.
+    it('forwards bus and privateBus to /v8/routes', async () => {
+      for (const mode of ['bus', 'privateBus'] as const) {
+        mockFetch.mockResolvedValueOnce(buildRouteResponse());
+
+        await connector.route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 1, lng: 1 },
+          ],
+          // @ts-expect-error narrowed input not visible through IRoutingOptions
+          transportMode: mode,
+        });
+
+        const [url] = mockFetch.mock.calls.at(-1)!;
+        expect(parseUrlParams(url as string).get('transportMode')).toBe(mode);
+      }
+    });
+
+    // findsequence2's `mode` grammar accepts `bus` but NOT `privateBus`
+    // (verified live: HTTP 400 "Unknown transport mode 'privateBus'"). The
+    // connector forwards verbatim rather than silently substituting, so this
+    // pins the value that survives the optimization leg.
+    it('forwards bus into the findsequence2 mode string', async () => {
+      mockFetch
+        .mockResolvedValueOnce(buildSequenceResponse())
+        .mockResolvedValueOnce(buildRouteResponse());
+
+      await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+          { lat: 2, lng: 2 },
+          { lat: 3, lng: 3 },
+        ],
+        optimize: true,
+        // @ts-expect-error narrowed input not visible through IRoutingOptions
+        transportMode: 'bus',
+      });
+
+      const [firstUrl] = mockFetch.mock.calls[0]!;
+      expect(parseUrlParams(firstUrl as string).get('mode')).toBe(
+        'fastest;bus;traffic:disabled',
+      );
+    });
   });
 
   describe('mapVendorError ', () => {

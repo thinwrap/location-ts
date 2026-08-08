@@ -33,7 +33,16 @@ export type { GoogleConfig } from './providers/google';
 export { MapboxRoutingConnector, MapboxMatrixConnector, MapboxGeocodingConnector, MapboxIsochroneConnector } from './providers/mapbox';
 export type { MapboxConfig } from './providers/mapbox';
 export { HereRoutingConnector, HereMatrixConnector, HereGeocodingConnector, HereIsochroneConnector } from './providers/here';
-export type { HereConfig } from './providers/here';
+export type {
+  HereConfig,
+  // The narrowed HERE input shapes. The module augmentation already types
+  // `transportMode` at the call site, so these are only needed to NAME the
+  // vocabulary — declaring a variable, or a helper that takes one. The PHP, Go
+  // and Python siblings all export their equivalents; TypeScript did not.
+  HereRoutingOptions,
+  HereMatrixOptions,
+  HereTransportMode,
+} from './providers/here';
 export { EsriRoutingConnector, EsriMatrixConnector, EsriGeocodingConnector, EsriIsochroneConnector } from './providers/esri';
 export type { EsriConfig } from './providers/esri';
 export { TomTomRoutingConnector, TomTomMatrixConnector, TomTomGeocodingConnector, TomTomIsochroneConnector } from './providers/tomtom';

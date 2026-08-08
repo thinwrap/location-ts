@@ -11,7 +11,7 @@ import type { ProviderCode } from '../../types/error.types';
 import { mergePassthrough } from '../../utils';
 import { assertFiniteCoordinate } from '../../utils/coordinate';
 import type { HereConfig } from './here.config';
-import type { HereMatrixResponse } from './here.types';
+import type { HereMatrixResponse, HereTransportMode } from './here.types';
 
 const MATRIX_URL = 'https://matrix.router.hereapi.com/v8/matrix';
 const POLL_INITIAL_DELAY_MS = 1_000;
@@ -27,7 +27,14 @@ const POLL_DEFAULT_DEADLINE_MS = 60_000;
  * `new Matrix('here', cfg).matrix(input)` narrows its parameter type.
  */
 export interface HereMatrixOptions extends IMatrixOptions {
-  transportMode?: 'car' | 'truck' | 'pedestrian' | 'bicycle' | 'scooter';
+  /**
+   * When set, overrides the base `travelMode` mapping at the wire level.
+   * Matrix v8 publishes the same eight values as Routing v8, so this shares
+   * {@link HereTransportMode} rather than restating a narrower list — the
+   * inline union that used to live here had drifted and silently rejected
+   * `taxi`, `bus` and `privateBus`, all of which the service accepts.
+   */
+  transportMode?: HereTransportMode;
 }
 
 declare module '../../types/matrix.interface' {

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.3] — 2026-08-08
+
+### Added
+
+- `HereTransportMode` gains `bus` — a distinct mode from `privateBus`, not a synonym.
+- `HereTransportMode`, `HereRoutingOptions` and `HereMatrixOptions` are now exported; the PHP,
+  Go and Python siblings already exposed their equivalents.
+
+### Fixed
+
+- HERE matrix `transportMode` accepts all eight modes; its own union had drifted and
+  rejected `taxi`, `bus` and `privateBus`.
+
+### Documentation
+
+- HERE README: `privateBus` is incompatible with `optimize: true` (`findsequence2` 400s),
+  plus `taxi[allowDriveThroughTaxiRoads]` and `networkRestrictedTruck` via `_passthrough`.
+
 ## [1.2.2] — 2026-08-06
 
 ### Fixed

@@ -30,10 +30,30 @@ export interface HereSequenceResponse {
 }
 
 /**
- * The vehicle classes HERE Routing v8 accepts beyond the three the base
- * {@link IRoutingOptions.travelMode} carries.
+ * The vehicle classes HERE accepts beyond the three the base
+ * {@link IRoutingOptions.travelMode} carries. Valid on Routing v8 *and* Matrix
+ * v8 — the two services publish the same set.
+ *
+ * `bus` and `privateBus` are distinct, not synonyms: `bus` may drive through
+ * bus-restricted and bus-exclusive streets, while `privateBus` uses those
+ * streets only where a waypoint sits on one (the pick-up / drop-off case).
+ * HERE lists `bicycle`, `bus` and `privateBus` as Beta with limited
+ * functionality.
+ *
+ * **`privateBus` is incompatible with `optimize: true`.** Optimization runs
+ * through the legacy `findsequence2` endpoint, whose `mode` grammar accepts
+ * only `car`, `truck`, `pedestrian`, `bus`, `bicycle`, `scooter` and `taxi`;
+ * `privateBus` comes back as HTTP 400 `Unknown transport mode` (verified
+ * live 2026-08-08). Use `bus` when you need optimization.
+ *
+ * HERE's routing enum has one further value, `networkRestrictedTruck`, which
+ * is deliberately absent: it is rejected by both `findsequence2` and Matrix
+ * v8, and on `/v8/routes` it 400s unless the caller also sends
+ * `networkRestrictedTruck[permittedNetworks]`, which this connector does not
+ * model. Reach it through `_passthrough.query` if you need it.
  *
  * @see HereRoutingOptions
+ * @see https://docs.here.com/routing/docs/routing-v8-bus-taxi-routing
  */
 export type HereTransportMode =
   | 'car'
@@ -42,6 +62,7 @@ export type HereTransportMode =
   | 'bicycle'
   | 'scooter'
   | 'taxi'
+  | 'bus'
   | 'privateBus';
 
 /**

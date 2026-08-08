@@ -359,6 +359,31 @@ describe('HereMatrixConnector', () => {
     expect(body.transportMode).toBe('truck');
   });
 
+  // Matrix v8 publishes the same eight transport modes as Routing v8 — verified
+  // live for `bus` and `privateBus`, both HTTP 200. This connector's own union
+  // used to stop at `scooter`, so `taxi`/`bus`/`privateBus` were unreachable
+  // without a cast even though the service accepts them.
+  it.each(['taxi', 'bus', 'privateBus'] as const)(
+    'should forward the %s transport mode to the matrix body',
+    async (mode) => {
+      mockFetch
+        .mockResolvedValueOnce(submitResp())
+        .mockResolvedValueOnce(completedResp())
+        .mockResolvedValueOnce(resultResp());
+
+      const options: HereMatrixOptions = {
+        origins: [{ lat: 0, lng: 0 }],
+        destinations: [{ lat: 1, lng: 1 }],
+        transportMode: mode,
+      };
+      await connector.matrix(options);
+
+      const [, init] = mockFetch.mock.calls[0]!;
+      const body = JSON.parse(init!.body as string) as Record<string, unknown>;
+      expect(body.transportMode).toBe(mode);
+    },
+  );
+
   // polling-timeout test: every poll returns 'pending', deadline expires
   it('should throw matrix_polling_timeout with cause.matrixId on deadline expiry', async () => {
     // Submit succeeds, then unlimited pending responses.
