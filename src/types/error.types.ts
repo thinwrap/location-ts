@@ -7,7 +7,7 @@ export type ProviderCode =
   | 'invalid_request'
   | 'unknown'
   // === 7 location-extended values ===
-  | 'unsupported_field' // e.g., OSRM rejecting `departureTime` → typed pre-flight error
+  | 'unsupported_field' // e.g., Mapbox Matrix rejecting `departureTime` with traffic → typed pre-flight error
   | 'unsupported_option' // e.g., OSRM rejecting `avoidTolls` → typed pre-flight error
   | 'unsupported_travel_mode' // e.g., TomTom/ESRI Matrix rejecting cycling → typed error
   | 'profile_not_configured' // OSRM missing compiled profile for requested travel mode
@@ -26,6 +26,17 @@ export type ProviderCode =
   // provider as down.
   | 'timeout';
 
+/**
+ * The error every **operation failure** rejects with: a vendor error, a
+ * transport failure or timeout, request data the library refuses before
+ * sending (non-finite coordinates, too few waypoints, an invalid `Date`, …;
+ * `statusCode: null`), or a capability the provider lacks (`unsupported_*`).
+ *
+ * Misuse of the API is deliberately NOT a `ConnectorError`: an unknown
+ * provider, a missing config, or a value outside a closed vocabulary such as
+ * `travelMode: 'flying'` is a `TypeError`, so a bug in the calling code is not
+ * mistaken for bad end-user input (`invalid_request`) or an outage.
+ */
 export class ConnectorError extends Error {
   public readonly statusCode: number | null;
   public readonly providerCode: ProviderCode;

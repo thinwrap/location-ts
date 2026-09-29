@@ -7,9 +7,13 @@ import type {
   ProviderCode,
 } from '../../types';
 import { ConnectorError } from '../../types';
-import { joinCoords, mergePassthrough } from '../../utils';
+import { isFiniteNumber, joinCoords, malformedResponseError, mergePassthrough } from '../../utils';
+import { validateMatrixOptions } from '../../utils/validate-options';
 import { validateOsrmBaseUrl } from './osrm.base-url';
 import type { OsrmConfig } from './osrm.config';
+import { OSRM_TABLE_ANNOTATIONS } from './osrm.defaults';
+import { classifyOsrmEnvelopeCode } from './osrm.envelope';
+import { resolveOsrmExcludes } from './osrm.exclude';
 import type { OsrmTableResponse } from './osrm.types';
 
 /**
@@ -17,7 +21,7 @@ import type { OsrmTableResponse } from './osrm.types';
  * OSRM. Mirrors the {@link OsrmRoutingConnector} for `baseUrl`
  * validation, pre-flight checks, and the per-connector error mapping. Mirrors
  * {@link MapboxMatrixConnector} for the `annotations=duration,
- * distance` invariant.
+ * distance` default.
  *
  * **HTTP shape.** `GET <baseUrl>/table/v1/{profile}/{coords}?annotations=
  * duration,distance&sources={origin_indices}&destinations={dest_indices}`.
@@ -25,26 +29,31 @@ import type { OsrmTableResponse } from './osrm.types';
  * `sources`/`destinations` are zero-indexed semicolon-separated indices into
  * that combined list.
  *
- * **`baseUrl` required.** Same as the constructor throws
- * synchronously when `baseUrl` is omitted or empty. The public OSRM demo
- * server is intentionally NOT used as a default.
+ * **`baseUrl` required.** Validated at the top of `.matrix()`, like the routing
+ * connector: a missing, empty or schemeless `baseUrl` rejects with
+ * `invalid_request` before any request. The public OSRM demo server is
+ * intentionally NOT used as a default.
  *
- * **Pre-flight validation.** OSRM does not natively model traffic or
- * tolls. Pre-flight checks raise typed {@link ConnectorError} with
- * `statusCode: null`:
- *   - `'unsupported_field'`  — `departureTime` set.
- *   - `'unsupported_option'` — `avoidTolls` set.
+ * **Pre-flight validation.** OSRM honours `avoidTolls` only on a build
+ * compiled with the `toll` exclude class. The pre-flight check raises a typed
+ * {@link ConnectorError} with `statusCode: null`:
+ *   - `'unsupported_option'` — `avoidTolls` set without `'toll'` declared in
+ *     `OsrmConfig.supportedExcludeClasses`; when it is declared, `/table` gets
+ *     `exclude=toll`, the same rule as the routing connector.
+ *
+ * **Traffic and departure time.** OSRM has no time parameter and no traffic
+ * model at request time, so `trafficMode: 'traffic'` is ignored and
+ * `departureTime` with it; under `'none'` a departure time has no effect by
+ * definition. Neither is rejected.
  *
  * `IMatrixOptions` has no `avoidFerries`/`avoidHighways` (those live on
- * {@link IRoutingOptions} per the locked types), so pre-flight here
- * is two checks rather than the four in Routing.
+ * {@link IRoutingOptions} per the locked types), so only `avoidTolls` applies.
  *
- * **Annotations invariant.** OSRM's default `/table` response is duration-only
- * (no distances). To keep the "both distance and duration" guarantee,
- * we force `annotations=duration,distance` AFTER the `_passthrough` merge.
- * A consumer attempting to override via `_passthrough.query.annotations` is
- * silently overwritten; README documents that to layer extra annotations the
- * consumer must include both built-ins explicitly.
+ * **Annotations default.** OSRM's default `/table` response is duration-only
+ * (no distances), so the connector asks for both
+ * ({@link OSRM_TABLE_ANNOTATIONS}). It is set before the `_passthrough` merge
+ * like every other default, so `_passthrough.query.annotations` replaces it; a
+ * list missing either value fails the dimension check and raises `unknown`.
  *
  * **No auth surface.** Consumers needing auth front their OSRM
  * instance with a reverse proxy. Reverse-proxy 401/429 responses are surfaced
@@ -52,15 +61,17 @@ import type { OsrmTableResponse } from './osrm.types';
  *
  * **Result-shape normalization.** OSRM's `durations[][]` +
  * `distances[][]` 2D arrays (origin-major) are flattened into the canonical
- * flat `cells[]` shape; native units (meters + seconds, no conversion). Null
- * cells in the vendor body are coerced to 0.
+ * flat `cells[]` shape; native units (meters + seconds, no conversion). A null
+ * cell (unroutable pair) is omitted from `cells[]`, never coerced to 0.
  *
- * **In-body status codes.** OSRM may return HTTP 200 with
- * `body.code !== 'Ok'` for `NoTable`, `InvalidQuery`, `InvalidOptions`. These
- * raise {@link ConnectorError} with `providerCode: 'invalid_request'`.
+ * **Envelope codes.** A non-Ok `code` — on a 4xx, where OSRM normally sends
+ * it, or on a 2xx — is classified like the routing connector's: `NoSegment`
+ * (and `NoTable`, documented as "No route found") → `no_route`,
+ * `InvalidQuery`/`InvalidOptions`/`InvalidValue` → `invalid_request`,
+ * `NotImplemented` → `unsupported_option`.
  *
  * Travel-mode mapping uses the OSRM-standard names `'driving'/'walking'/
- * 'cycling'` (consistent with OSRM Routing and the PHP sibling). Consumers must
+ * 'cycling'` (consistent with OSRM Routing). Consumers must
  * verify their OSRM build has the requested profile compiled.
  */
 export class OsrmMatrixConnector
@@ -74,16 +85,16 @@ export class OsrmMatrixConnector
   }
 
   async matrix(options: IMatrixOptions): Promise<IMatrixResult> {
+    validateMatrixOptions(options, 'OSRM Matrix');
     // Validated at CALL time, not construction time — see the routing connector.
     const baseUrl = validateOsrmBaseUrl(this.config);
 
     // pre-flight validation runs synchronously before any HTTP call.
-    this.validateOsrmCompat(options);
+    const excludes = resolveOsrmExcludes({ avoidTolls: options.avoidTolls }, this.config);
 
-    // P11 (#31, #91): empty origins/destinations would build an invalid
-    // `/table/v1/{profile}/` URL with an empty coord segment + empty
-    // `sources`/`destinations`. Reject locally with a clear error rather than
-    // surfacing an opaque vendor 400/404 (matches ESRI's explicit guard).
+    // Empty origins/destinations would build an invalid `/table/v1/{profile}/`
+    // URL with an empty coord segment + empty `sources`/`destinations`. Reject
+    // locally with a clear error rather than surfacing an opaque vendor 400/404.
     if (options.origins.length === 0 || options.destinations.length === 0) {
       throw new ConnectorError({
         message: 'OSRM Matrix requires at least one origin and one destination',
@@ -109,13 +120,14 @@ export class OsrmMatrixConnector
     const baseQuery: Record<string, string> = {
       sources: originIndices.join(';'),
       destinations: destinationIndices.join(';'),
+      // OSRM's default is duration-only; asking for both is what populates
+      // `distanceMeters`. A default like any other, so passthrough replaces it.
+      annotations: OSRM_TABLE_ANNOTATIONS.join(','),
     };
+    if (excludes.length > 0) {
+      baseQuery.exclude = excludes.join(',');
+    }
 
-    // Merge passthrough first; the `annotations` invariant is then set AFTER
-    // the merge so any consumer attempt to override it via
-    // `_passthrough.query.annotations` is silently overwritten. This
-    // guarantees `distanceMeters` is populated on every cell — OSRM's default
-    // is duration-only.
     const merged = mergePassthrough(
       {} as Record<string, unknown>,
       {},
@@ -123,29 +135,24 @@ export class OsrmMatrixConnector
       baseQuery,
     );
 
-    const finalQuery: Record<string, string> = {
-      ...merged.query,
-      annotations: 'duration,distance',
-    };
-
     const response = await this.sendGet(url, {
       headers: merged.headers,
-      query: finalQuery,
+      query: merged.query,
     });
 
     if (!response.ok) {
       throw await this.raiseHttpError(response);
     }
 
-    // #108: guard the success-path body parse — a truncated/non-JSON 200
-    // body must surface as a typed error, not an unwrapped SyntaxError.
+    // A truncated/non-JSON 200 body must surface as a typed error, not an
+    // unwrapped SyntaxError.
     const data = (await response.json().catch(() => null)) as
       | OsrmTableResponse
       | null;
 
     // OSRM in-body status codes trigger typed errors even on HTTP 200.
-    if (data === null || data.code !== 'Ok') {
-      throw this.mapInBodyError(data ?? {});
+    if (data === null || typeof data !== 'object' || data.code !== 'Ok') {
+      throw this.mapInBodyError(data ?? {}, response.status);
     }
 
     // 2D-to-flat-cells normalization (origin-major). Index loop emits
@@ -153,20 +160,17 @@ export class OsrmMatrixConnector
     const durations = data.durations ?? [];
     const distances = data.distances ?? [];
 
-    // LOC-CP-1 (loc-CR #79/#99): verify the vendor's 2D matrices match the
-    // requested origins×destinations dimensions BEFORE flattening. OSRM returns
-    // one row per source and one column per destination; a sparse, asymmetric,
-    // or short matrix would otherwise be silently zero-filled by the `?? 0`
-    // cell reads below — returning WRONG cells with no signal. We surface a
-    // typed ConnectorError instead (mirrors the `data.code !== 'Ok'` guard
-    // above). No 'invalid_response' ProviderCode exists in error.types.ts;
-    // 'unknown' is the closest existing value for a malformed provider body.
+    // Verify the vendor's 2D matrices match the requested origins×destinations
+    // dimensions BEFORE flattening. OSRM returns one row per source and one
+    // column per destination; a sparse, asymmetric, or short matrix would
+    // otherwise leave cells unread — returning WRONG cells with no signal.
     assertMatrixDimensions(
       durations,
       distances,
       options.origins.length,
       options.destinations.length,
       data,
+      response.status,
     );
 
     const cells: IMatrixCell[] = [];
@@ -178,6 +182,14 @@ export class OsrmMatrixConnector
         // rather than coercing to 0 (which reads as "same location"). Contract:
         // missing/failed entries are omitted from `cells[]`.
         if (durationSeconds == null || distanceMeters == null) continue;
+        if (!isFiniteNumber(durationSeconds) || !isFiniteNumber(distanceMeters)) {
+          throw malformedResponseError(
+            'OSRM matrix',
+            `cell ${oi}→${di} is not a number`,
+            response.status,
+            data,
+          );
+        }
         cells.push({
           originIndex: oi,
           destinationIndex: di,
@@ -188,35 +200,6 @@ export class OsrmMatrixConnector
     }
 
     return { cells, raw: data };
-  }
-
-  /**
-   * Pre-flight validation raising typed {@link ConnectorError}
-   * with `statusCode: null` for OSRM-incompatible inputs. Runs at the top of
-   * `.matrix()` before any HTTP work.
-   *
-   * Unlike {@link OsrmRoutingConnector.validateOsrmCompat}, only two checks:
-   * `IMatrixOptions` has no `avoidFerries`/`avoidHighways` fields per the
-   * locked types. Order: `departureTime` first, then `avoidTolls`.
-   */
-  private validateOsrmCompat(options: IMatrixOptions): void {
-    if (options.departureTime !== undefined) {
-      throw new ConnectorError({
-        message: 'OSRM does not support departureTime',
-        statusCode: null,
-        providerCode: 'unsupported_field',
-        providerMessage: 'OSRM does not support departureTime',
-      });
-    }
-
-    if (options.avoidTolls === true) {
-      throw new ConnectorError({
-        message: 'OSRM does not support avoidTolls',
-        statusCode: null,
-        providerCode: 'unsupported_option',
-        providerMessage: 'avoidTolls is not supported by OSRM',
-      });
-    }
   }
 
   /**
@@ -252,48 +235,47 @@ export class OsrmMatrixConnector
    */
   private mapVendorError(
     httpStatus: number,
-    _body: Record<string, unknown> | null,
+    body: Record<string, unknown> | null,
   ): ProviderCode {
+    // Proxy-layer statuses win: a 401/429 from a reverse proxy has no OSRM
+    // envelope to read.
     if (httpStatus === 401 || httpStatus === 403) return 'auth_failed';
     if (httpStatus === 429) return 'rate_limited';
-    if (httpStatus === 400 || httpStatus === 404) return 'invalid_request';
     if (httpStatus >= 500 && httpStatus < 600) return 'provider_unavailable';
+
+    // OSRM serves every non-Ok envelope code with a 4xx, so the code — not the
+    // status — separates "no road near a coordinate" (`NoSegment`) from "your
+    // request was wrong", exactly as on the routing connector.
+    const classified = classifyTableEnvelopeCode(body);
+    if (classified !== null) return classified;
+
+    if (httpStatus === 400 || httpStatus === 404) return 'invalid_request';
     return 'unknown';
   }
 
   /**
-   * Map an in-body OSRM status code (`data.code !== 'Ok'`) to a typed
-   * {@link ConnectorError}. OSRM occasionally returns HTTP 200 with a
-   * non-Ok envelope code such as `NoTable`, `InvalidQuery`, `InvalidOptions`.
+   * Map an in-body OSRM status code (`data.code !== 'Ok'`) on a 2xx to a typed
+   * {@link ConnectorError}, with the same classification as the 4xx path.
+   * `statusCode` is the real status: the provider answered.
    */
-  private mapInBodyError(body: {
-    code?: string;
-    message?: string;
-  }): ConnectorError {
+  private mapInBodyError(
+    body: { code?: unknown; message?: unknown },
+    statusCode: number,
+  ): ConnectorError {
     const code = typeof body.code === 'string' ? body.code : '';
     const message =
       typeof body.message === 'string' && body.message !== ''
         ? body.message
         : '';
 
-    let providerCode: ProviderCode;
-    switch (code) {
-      case 'NoTable':
-      case 'InvalidQuery':
-      case 'InvalidOptions':
-        providerCode = 'invalid_request';
-        break;
-      default:
-        providerCode = 'unknown';
-        break;
-    }
+    const providerCode: ProviderCode = classifyTableEnvelopeCode(body) ?? 'unknown';
 
     const providerMessage =
       message !== '' ? message : `OSRM returned code: ${code || 'unknown'}`;
 
     return new ConnectorError({
       message: providerMessage,
-      statusCode: null,
+      statusCode,
       providerCode,
       providerMessage,
       cause: body,
@@ -345,22 +327,38 @@ function mapProfile(mode?: 'driving' | 'walking' | 'cycling'): string {
 }
 
 /**
- * LOC-CP-1 (loc-CR #79/#99): guard that the vendor's `durations`/`distances`
- * 2D arrays cover the full requested origins×destinations grid before the
- * row-major flatten. Throws a typed {@link ConnectorError} (`providerCode:
- * 'unknown'`, the closest existing value for a malformed provider body) when
- * either matrix has too few rows or any row is shorter than the requested
- * destination stride — the cases where `?? 0` would silently fabricate cells.
- * The full vendor body is preserved on `cause` per the repo convention.
+ * The `/table` classification: the routing connector's envelope codes, plus
+ * `NoTable`, which OSRM's Table service documents as "No route found".
+ */
+function classifyTableEnvelopeCode(
+  body: { code?: unknown; message?: unknown } | null,
+): ProviderCode | null {
+  if (body !== null && typeof body === 'object' && body.code === 'NoTable') {
+    return 'no_route';
+  }
+  return classifyOsrmEnvelopeCode(body, 'table');
+}
+
+/**
+ * Guard that the vendor's `durations`/`distances` 2D arrays cover the full
+ * requested origins×destinations grid before the row-major flatten. Throws a
+ * typed {@link ConnectorError} (`providerCode: 'unknown'`, the closest existing
+ * value for a malformed provider body) when either matrix has too few rows or
+ * any row is shorter than the requested destination stride — the cases where a
+ * cell would otherwise be silently fabricated or dropped. The full vendor body
+ * is preserved on `cause`.
  */
 function assertMatrixDimensions(
-  durations: (number | null)[][],
-  distances: (number | null)[][],
+  durations: unknown,
+  distances: unknown,
   numOrigins: number,
   numDestinations: number,
   raw: unknown,
-): void {
+  statusCode: number,
+): asserts durations is (number | null)[][] {
   const dimensionsOk =
+    Array.isArray(durations) &&
+    Array.isArray(distances) &&
     durations.length >= numOrigins &&
     distances.length >= numOrigins &&
     durations
@@ -376,7 +374,7 @@ function assertMatrixDimensions(
       `${numOrigins}×${numDestinations} dimensions`;
     throw new ConnectorError({
       message,
-      statusCode: null,
+      statusCode,
       providerCode: 'unknown',
       providerMessage: message,
       cause: raw,

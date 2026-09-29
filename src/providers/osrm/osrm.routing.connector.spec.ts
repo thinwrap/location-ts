@@ -96,8 +96,7 @@ const THREE_WAYPOINTS = [
 
 describe('OsrmRoutingConnector', () => {
   // baseUrl is validated at CALL time, not construction time: building a facade
-  // at module load from environment config must not throw at import. Matches the
-  // location-go / location-py siblings.
+  // at module load from environment config must not throw at import.
   describe('baseUrl validation (at call time)', () => {
     it('exposes providerId "osrm"', () => {
       const connector = new OsrmRoutingConnector(defaultConfig);
@@ -161,6 +160,23 @@ describe('OsrmRoutingConnector', () => {
     });
 
     it.each([
+      ['a scheme-less userinfo URL', 'osrm:s3cret@router.example.com'],
+      ['an unsupported scheme with userinfo', 'ftp://osrm:s3cret@router.example.com/osrm'],
+      ['a single-slash scheme with userinfo', 'https:/osrm:s3cret@router.example.com'],
+    ])('never echoes userinfo credentials for %s', async (_label, baseUrl) => {
+      const err = (await new OsrmRoutingConnector({ baseUrl })
+        .route({ waypoints: TWO_WAYPOINTS })
+        .catch((e: unknown) => e)) as ConnectorError;
+      expect(err).toBeInstanceOf(ConnectorError);
+      expect(err.providerCode).toBe('invalid_request');
+      expect(err.message).not.toContain('s3cret');
+      expect(err.message).not.toContain('osrm:');
+      expect(err.message).toContain('***@router.example.com');
+      expect(JSON.stringify(err)).not.toContain('s3cret');
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it.each([
       ['http', 'http://router.example.com'],
       ['https', 'https://router.example.com'],
       ['an uppercase scheme', 'HTTPS://router.example.com'],
@@ -206,22 +222,21 @@ describe('OsrmRoutingConnector', () => {
       connector = new OsrmRoutingConnector(defaultConfig);
     });
 
-    it('throws unsupported_field for departureTime', async () => {
-      try {
+    // OSRM has no time parameter and no request-time traffic: under `'none'` a
+    // departure time has no effect by definition, and `'traffic'` is ignored
+    // together with it — neither is an error any more.
+    for (const trafficMode of [undefined, 'none', 'traffic', 'live'] as const) {
+      it(`ignores departureTime (trafficMode ${String(trafficMode)}) without a time parameter`, async () => {
+        mockFetch.mockResolvedValueOnce(buildRouteResponse());
         await connector.route({
           waypoints: TWO_WAYPOINTS,
           departureTime: new Date('2024-06-15T08:00:00Z'),
+          trafficMode,
         });
-        expect.fail('expected throw');
-      } catch (err) {
-        expect(err).toBeInstanceOf(ConnectorError);
-        const ce = err as ConnectorError;
-        expect(ce.providerCode).toBe('unsupported_field');
-        expect(ce.statusCode).toBeNull();
-        expect(ce.providerMessage).toContain('departureTime');
-      }
-      expect(mockFetch).not.toHaveBeenCalled();
-    });
+        const query = queryOf();
+        expect([...query.keys()].some((k) => /depart|time|traffic/i.test(k))).toBe(false);
+      });
+    }
 
     it('throws unsupported_option for avoidTolls', async () => {
       try {
@@ -304,15 +319,50 @@ describe('OsrmRoutingConnector', () => {
       expect(q.get('roundtrip')).toBe('false');
     });
 
-    it('does NOT throw the invalid combo when only optimizeFixedOrigin is set', async () => {
+    // OSRM Trip (>= 5.27) accepts one fixed end on an open route: live
+    // router.project-osrm.org answers first/any and any/last with 200 Ok.
+    it('sends source=first&destination=any for optimizeFixedOrigin alone on an open route', async () => {
       mockFetch.mockResolvedValueOnce(buildTripResponse());
+      await connector.route({ waypoints: THREE_WAYPOINTS, optimize: true, optimizeFixedOrigin: true });
+      const q = queryOf();
+      expect(q.get('source')).toBe('first');
+      expect(q.get('destination')).toBe('any');
+      expect(q.get('roundtrip')).toBe('false');
+    });
+
+    it('sends source=any&destination=last for optimizeFixedDestination alone on an open route', async () => {
+      mockFetch.mockResolvedValueOnce(buildTripResponse());
+      await connector.route({ waypoints: THREE_WAYPOINTS, optimizeFixedDestination: true, isRoundTrip: false });
+      const q = queryOf();
+      expect(q.get('source')).toBe('any');
+      expect(q.get('destination')).toBe('last');
+      expect(q.get('roundtrip')).toBe('false');
+    });
+
+    it('maps an older build\'s NotImplemented answer to unsupported_option', async () => {
+      // OSRM < 5.27 rejects a single fixed end on an open trip.
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ code: 'NotImplemented', message: 'This request is not supported' }),
+          { status: 400 },
+        ),
+      );
       await expect(
-        connector.route({
-          waypoints: THREE_WAYPOINTS,
-          optimizeFixedOrigin: true,
-          isRoundTrip: false,
-        }),
-      ).resolves.toBeDefined();
+        connector.route({ waypoints: THREE_WAYPOINTS, optimizeFixedOrigin: true }),
+      ).rejects.toMatchObject({ providerCode: 'unsupported_option', statusCode: 400 });
+    });
+
+    it('allows a single fixed endpoint on a round trip (true/first/any)', async () => {
+      mockFetch.mockResolvedValueOnce(buildTripResponse());
+      await connector.route({
+        waypoints: THREE_WAYPOINTS,
+        optimizeFixedOrigin: true,
+        isRoundTrip: true,
+      });
+      const q = queryOf();
+      expect(q.get('source')).toBe('first');
+      expect(q.get('destination')).toBe('any');
+      expect(q.get('roundtrip')).toBe('true');
     });
   });
 
@@ -341,7 +391,7 @@ describe('OsrmRoutingConnector', () => {
       expect(q.get('geometries')).toBe('polyline');
       // Nothing normalized reads steps, and leg distance/duration are present
       // regardless of `annotations`, so /route requests neither. (The Table
-      // service still forces annotations — that IS what populates its cells.)
+      // service still sends annotations — that IS what populates its cells.)
       expect(q.has('steps')).toBe(false);
       expect(q.has('annotations')).toBe(false);
       // Standard /route dispatch — no trip-only params.
@@ -492,28 +542,46 @@ describe('OsrmRoutingConnector', () => {
       expect(result.totalDistanceMeters).toBe(4000);
     });
 
-    it('uses source=first when optimizeFixedOrigin=true', async () => {
+    it('uses source=first when optimizeFixedOrigin=true (round trip)', async () => {
       mockFetch.mockResolvedValueOnce(buildTripResponse());
 
       await connector.route({
         waypoints: THREE_WAYPOINTS,
         optimizeFixedOrigin: true,
+        isRoundTrip: true,
       });
 
       const q = queryOf();
       expect(q.get('source')).toBe('first');
     });
 
-    it('uses destination=last when optimizeFixedDestination=true', async () => {
+    it('uses destination=last when optimizeFixedDestination=true (round trip)', async () => {
       mockFetch.mockResolvedValueOnce(buildTripResponse());
 
       await connector.route({
         waypoints: THREE_WAYPOINTS,
         optimizeFixedDestination: true,
+        isRoundTrip: true,
       });
 
       const q = queryOf();
       expect(q.get('destination')).toBe('last');
+      expect(q.get('source')).toBe('any');
+    });
+
+    it('allows an open route with both endpoints fixed (false/first/last)', async () => {
+      mockFetch.mockResolvedValueOnce(buildTripResponse());
+
+      await connector.route({
+        waypoints: THREE_WAYPOINTS,
+        optimizeFixedOrigin: true,
+        optimizeFixedDestination: true,
+      });
+
+      const q = queryOf();
+      expect(q.get('source')).toBe('first');
+      expect(q.get('destination')).toBe('last');
+      expect(q.get('roundtrip')).toBe('false');
     });
 
     it('sets roundtrip=true when isRoundTrip=true', async () => {
@@ -879,6 +947,18 @@ describe('OsrmRoutingConnector', () => {
       } catch (err) {
         expect((err as ConnectorError).providerCode).toBe('profile_not_configured');
       }
+    });
+
+    // OSRM sends /trip's NoTrips with a 400; it must classify like the 200 path.
+    it('maps HTTP 400 NoTrips on /trip → no_route, as on the 200 path', async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({ code: 'NoTrips', message: 'No trip visiting all destinations possible.' }), {
+          status: 400,
+        }),
+      );
+      await expect(
+        connector.route({ waypoints: [...TWO_WAYPOINTS, { lat: 1, lng: 1 }], optimize: true }),
+      ).rejects.toMatchObject({ providerCode: 'no_route', statusCode: 400 });
     });
 
     it('maps HTTP 404 → invalid_request', async () => {

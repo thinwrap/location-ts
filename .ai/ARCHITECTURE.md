@@ -78,8 +78,9 @@ normal deployment — and trailing slashes are stripped so the `${baseUrl}/route
 concatenation cannot emit a double slash. Do not add a "no trailing path" rule: it would
 reject valid self-hosts.
 
-The Table service forces `annotations=duration,distance` post-passthrough-merge to guarantee
-both fields on every cell.
+The Table service sends `annotations=duration,distance` (`OSRM_TABLE_ANNOTATIONS`) as a
+default set before the passthrough merge, so both fields are on every cell unless a caller
+deliberately replaces the list.
 
 ### 5. Normalization invariants
 
@@ -95,11 +96,14 @@ convert at the wire layer before populating the result DTO.
 
 ### 6. Location-extended `ProviderCode` enum
 
-13 values: 6 notifications-canonical + 7 location-extended.
+13 values: 6 notifications-canonical + 7 location-extended. `ConnectorError` carries
+**operation failures** only; API misuse (unknown provider, missing config, a value outside a
+closed vocabulary) is a `TypeError` by design — see "Two kinds of failure" in
+[`CONVENTIONS.md`](./CONVENTIONS.md).
 
 - Canonical: `rate_limited`, `auth_failed`, `invalid_request`, `invalid_recipient`,
   `provider_unavailable`, `unknown`.
-- Location-extended: `unsupported_field` (e.g. OSRM rejecting `departureTime`),
+- Location-extended: `unsupported_field` (e.g. Mapbox Matrix rejecting `departureTime` with traffic),
   `unsupported_option` (e.g. OSRM rejecting `avoidTolls`),
   `unsupported_travel_mode` (e.g. ESRI/TomTom Matrix rejecting cycling),
   `profile_not_configured` (OSRM missing compiled travel-mode profile),

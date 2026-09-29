@@ -43,7 +43,7 @@ export function validateOsrmBaseUrl(config: OsrmConfig | null | undefined): stri
 
   if (!/^https?:\/\//i.test(config.baseUrl)) {
     throw new ConnectorError({
-      message: `OSRM baseUrl must start with http:// or https:// (got: ${config.baseUrl})`,
+      message: `OSRM baseUrl must start with http:// or https:// (got: ${redactUserinfo(config.baseUrl)})`,
       statusCode: null,
       providerCode: 'invalid_request',
       providerMessage: 'OSRM baseUrl must start with http:// or https://',
@@ -51,4 +51,24 @@ export function validateOsrmBaseUrl(config: OsrmConfig | null | undefined): stri
   }
 
   return config.baseUrl.replace(/\/+$/, '');
+}
+
+/**
+ * Replace a URL's userinfo (`user:pass@`) with `***` so a credential embedded
+ * in `baseUrl` — the usual way to reach an OSRM behind basic-auth — never lands
+ * in an error message or a log line.
+ *
+ * Deliberately not `new URL()`: the value being echoed is the one that failed
+ * the scheme check, so it may be scheme-less (`user:pass@host`) or malformed
+ * (`https:/user:pass@host`). Everything between the scheme's slashes (or the
+ * start) and the LAST `@` is masked — over-redacting an `@` that sat in a path
+ * is harmless in an error message; under-redacting a password is not.
+ */
+export function redactUserinfo(url: string): string {
+  const at = url.lastIndexOf('@');
+  if (at < 0) return url;
+  const scheme = /^[A-Za-z][A-Za-z0-9+.-]*:\/+/.exec(url);
+  const start = scheme !== null ? scheme[0].length : 0;
+  if (start > at) return url;
+  return `${url.slice(0, start)}***${url.slice(at)}`;
 }

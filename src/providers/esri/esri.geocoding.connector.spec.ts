@@ -501,11 +501,9 @@ describe('EsriGeocodingConnector', () => {
       });
     }
 
-    // Esri 429-precedence regression: a genuine HTTP 429 must classify as
-    // rate_limited EVEN when the body carries an error code that would
-    // otherwise fall through to the generic 'unknown' mapping. (Previously the
-    // in-body branch short-circuited and returned 'unknown' before the 429
-    // status check was reached.)
+    // A genuine HTTP 429 must classify as rate_limited EVEN when the body
+    // carries an error code that would otherwise fall through to the generic
+    // 'unknown' mapping: the status check runs before the in-body branch.
     it('HTTP 429 with a generic in-body error code → rate_limited (429-precedence)', async () => {
       mockFetch.mockResolvedValueOnce(
         new Response(

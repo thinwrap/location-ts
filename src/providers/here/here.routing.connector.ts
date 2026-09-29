@@ -9,14 +9,22 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import {
+  assertRouteHasLegs,
   decodeFlexPolyline,
   encodePolyline,
   isCompleteWaypointOrder,
+  isFiniteNumber,
+  isRecord,
+  malformedResponseError,
   mergePassthrough,
+  optionalArray,
 } from '../../utils';
+import { validateRoutingOptions } from '../../utils/validate-options';
 import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
 import { toIsoSeconds } from '../../utils/datetime';
+import { isTrafficRequested } from '../../utils/traffic';
 import type { HereConfig } from './here.config';
+import { HERE_ROUTING_RETURN } from './here.defaults';
 import type {
   HereRouteResponse,
   HereRoutingOptions,
@@ -55,6 +63,7 @@ export class HereRoutingConnector
   }
 
   async route(options: IRoutingOptions): Promise<IRoutingResult> {
+    validateRoutingOptions(options, 'HERE Routing');
     const waypoints = options.waypoints;
     if (waypoints.length < 2) {
       throw new ConnectorError({
@@ -137,15 +146,19 @@ export class HereRoutingConnector
     const baseQuery: Record<string, string> = {
       apiKey: this.config.apiKey,
       transportMode,
-      return: 'polyline,summary',
+      return: HERE_ROUTING_RETURN.join(','),
       routingMode: 'fast',
       origin: `${formatCoord(first.lat)},${formatCoord(first.lng)}`,
       destination: `${formatCoord(last.lat)},${formatCoord(last.lng)}`,
     };
 
-    if (options.departureTime) {
-      baseQuery.departureTime = options.departureTime.toISOString();
-    }
+    // HERE applies live traffic whenever `departureTime` is omitted (it assumes
+    // "now"), and a traffic-aware request is billed at the Time-Aware Routing
+    // rate instead of the basic Car/Bicycle/Pedestrian rate. HERE's price list
+    // names the two ways to stay on the basic rate: `departureTime=any` or
+    // `traffic[mode]=disabled`. These are defaults only — `_passthrough.query`
+    // is merged over them and can re-enable traffic.
+    Object.assign(baseQuery, hereRoutesTrafficQuery(options));
 
     const avoidFeatures = buildAvoidFeatures(options);
     if (avoidFeatures !== '') {
@@ -179,7 +192,7 @@ export class HereRoutingConnector
     const data = (await response.json().catch(() => null)) as
       | HereRouteResponse
       | null;
-    if (data === null) {
+    if (!isRecord(data)) {
       throw new ConnectorError({
         message: 'HERE Routing returned a malformed response body',
         statusCode: response.status,
@@ -188,8 +201,12 @@ export class HereRoutingConnector
         cause: data,
       });
     }
-    const route = data.routes?.[0];
-    if (!route) {
+    const routes = optionalArray(data.routes);
+    if (routes === null) {
+      throw malformedResponseError('HERE Routing', '`routes` is not a list', response.status, data);
+    }
+    const route = routes[0] as HereRouteResponse['routes'][number] | undefined | null;
+    if (route === undefined) {
       // Live-verified: HERE answers an unroutable request with HTTP 200,
       // `routes: []`, and a critical entry in `notices[]` (e.g.
       // `couldNotMatchOrigin`). Surface the notice text so the caller sees WHY
@@ -208,23 +225,62 @@ export class HereRoutingConnector
       });
     }
 
+    if (!isRecord(route)) {
+      throw malformedResponseError('HERE Routing', 'the first route is not an object', response.status, data);
+    }
+
+    // Every section must be an object carrying the requested summary: a
+    // missing length/duration would otherwise be summed as 0 into a plausible,
+    // wrong leg.
+    const sections = optionalArray(route.sections);
+    if (
+      sections === null ||
+      sections.some(
+        (sec) =>
+          !isRecord(sec) ||
+          !isRecord(sec.summary) ||
+          !isFiniteNumber(sec.summary.length) ||
+          !isFiniteNumber(sec.summary.duration),
+      )
+    ) {
+      throw malformedResponseError(
+        'HERE Routing',
+        'a section has no summary length/duration',
+        response.status,
+        data,
+      );
+    }
+    assertRouteHasLegs(sections.length, waypoints.length, 'HERE Routing', data, response.status);
+
     // HERE ships `baseDuration` inside the `summary` block already requested, so
     // the opt-in costs nothing extra here — it only gates whether the field is
     // surfaced, keeping the normalized shape identical across providers.
     const wantsBaseDuration =
       options.include?.includes('durationWithoutTraffic') === true;
 
+    const typedSections = sections as HereRouteSection[];
     const allCoords: LatLng[] = [];
-    const legs = (route.sections ?? []).map((section) => {
+    for (const section of typedSections) {
       if (typeof section.polyline === 'string' && section.polyline !== '') {
         allCoords.push(...decodeFlexPolyline(section.polyline));
       }
+    }
+
+    const legs = groupSectionsIntoLegs(typedSections, waypoints.length).map((group) => {
       const leg: IRoutingLeg = {
-        distanceMeters: section.summary?.length ?? 0,
-        durationSeconds: section.summary?.duration ?? 0,
+        distanceMeters: group.reduce((sum, s) => sum + s.summary.length, 0),
+        durationSeconds: group.reduce((sum, s) => sum + s.summary.duration, 0),
       };
-      if (wantsBaseDuration && typeof section.summary?.baseDuration === 'number') {
-        leg.durationWithoutTrafficSeconds = section.summary.baseDuration;
+      // Only when every section of the leg carried it, so a partial response
+      // omits the field rather than under-reporting it.
+      if (
+        wantsBaseDuration &&
+        group.every((s) => typeof s.summary?.baseDuration === 'number')
+      ) {
+        leg.durationWithoutTrafficSeconds = group.reduce(
+          (sum, s) => sum + (s.summary?.baseDuration as number),
+          0,
+        );
       }
       return leg;
     });
@@ -274,34 +330,35 @@ export class HereRoutingConnector
       apiKey: this.config.apiKey,
       start: `${formatCoord(first.lat)},${formatCoord(first.lng)}`,
       end: `${formatCoord(last.lat)},${formatCoord(last.lng)}`,
-      // Two fixes in one string, deliberately split by cost:
+      // `Type;TransportModes;TrafficMode;RouteFeature1,RouteFeature2`, per the
+      // Waypoints Sequence `mode` grammar.
       //
-      // `tollroad:-3` — the toll modifier is FREE, so `avoidTolls` is honoured
-      // unconditionally. Without it the optimizer ordered waypoints as if tolls
-      // were fine and only the follow-up /routes call avoided them, so the
-      // ordering and the route disagreed.
+      // Route features: the same avoids the follow-up /routes call applies, so
+      // the sequence is optimized over the roads the route will actually use —
+      // otherwise the order and the route disagree. `-3` is HERE's "strictly
+      // avoid", and the features are one comma-joined segment.
       //
       // `traffic:` — enabling traffic on findsequence2 is BILLABLE, so it
       // follows the explicit `trafficMode` opt-in and stays disabled by default.
       mode: [
         'fastest',
         transportMode,
-        `traffic:${options.trafficMode === 'live' ? 'enabled' : 'disabled'}`,
-        ...(options.avoidTolls === true ? ['tollroad:-3'] : []),
+        `traffic:${isTrafficRequested(options.trafficMode) ? 'enabled' : 'disabled'}`,
+        ...buildSequenceRouteFeatures(options),
       ].join(';'),
     };
 
     if (options.departureTime) {
       // HERE findsequence2 documents the departure-time param as `departure`
-      // (ISO 8601); `departureTime` is not recognized and was silently ignored,
-      // so traffic-aware sequencing never took effect.
+      // (ISO 8601); it silently ignores an unrecognized `departureTime`, so
+      // traffic-aware sequencing would never take effect.
       baseQuery.departure = toIsoSeconds(options.departureTime);
     }
 
-    // Merge `_passthrough` (query + headers) into this leg too — it was silently
-    // dropped, so a consumer could not tune the sequence request (e.g. `improveFor`,
-    // `mode` overrides). The connector query (including the per-intermediate
-    // destinationN keys) is the base; passthrough.query overrides on collision.
+    // Merge `_passthrough` (query + headers) into this leg too, so a consumer
+    // can tune the sequence request (e.g. `improveFor`, `mode` overrides). The
+    // connector query (including the per-intermediate destinationN keys) is the
+    // base; passthrough.query overrides on collision.
     const connectorQuery: Record<string, string> = { ...baseQuery };
     for (let i = 0; i < intermediates.length; i++) {
       const wp = intermediates[i]!;
@@ -324,7 +381,7 @@ export class HereRoutingConnector
     const data = (await response.json().catch(() => null)) as
       | HereSequenceResponse
       | null;
-    if (data === null) {
+    if (!isRecord(data)) {
       throw new ConnectorError({
         message: 'HERE findsequence2 returned a malformed response body',
         statusCode: response.status,
@@ -333,8 +390,8 @@ export class HereRoutingConnector
         cause: data,
       });
     }
-    const sequenceResult = data.results?.[0];
-    if (!sequenceResult || !Array.isArray(sequenceResult.waypoints)) {
+    const sequenceResult = Array.isArray(data.results) ? data.results[0] : undefined;
+    if (!isRecord(sequenceResult) || !Array.isArray(sequenceResult.waypoints)) {
       // The legacy WPS endpoint also reports a rejected request as HTTP 200 with
       // `{ results: null, errors: [...], responseCode: '400' }`, so the reason
       // arrives here rather than through `raiseHttpError`. Surface it.
@@ -422,8 +479,8 @@ export class HereRoutingConnector
   }
 
   /**
-   * Map HERE (HTTP status, body) → canonical {@link ProviderCode}. Per
-   * the classification is purely status-driven. the mapping lives
+   * Map HERE (HTTP status, body) → canonical {@link ProviderCode}. The
+   * classification is purely status-driven, and the mapping lives
    * per-connector (no shared middleware).
    */
   private mapVendorError(
@@ -497,6 +554,97 @@ function readHereNotice(data: unknown): string | null {
     if (code !== null) return code;
   }
   return null;
+}
+
+type HereRouteSection = HereRouteResponse['routes'][number]['sections'][number];
+
+/**
+ * Group HERE route sections into one group per requested leg.
+ *
+ * A section is not a leg. HERE splits the route at every waypoint *and* at every
+ * implicit change of mode — a ferry or car-shuttle crossing becomes its own
+ * `TransitSection` inside an otherwise driving route — so mapping sections 1:1
+ * would report a two-waypoint trip with a ferry as three legs. What marks a
+ * requested stop is `arrival.place.waypoint`: present for each `via`, absent for
+ * origin/destination and for stops the router added itself. A leg therefore
+ * closes after a section arriving at a waypoint, and after the final section.
+ *
+ * A response carrying no `waypoint` markers at all but exactly one section per
+ * leg keeps the 1:1 mapping.
+ */
+function groupSectionsIntoLegs(
+  sections: HereRouteSection[],
+  waypointCount: number,
+): HereRouteSection[][] {
+  const hasMarkers = sections.some(
+    (s) => typeof s.arrival?.place?.waypoint === 'number',
+  );
+  if (!hasMarkers && sections.length === waypointCount - 1) {
+    return sections.map((s) => [s]);
+  }
+
+  const groups: HereRouteSection[][] = [];
+  let current: HereRouteSection[] = [];
+  sections.forEach((section, i) => {
+    current.push(section);
+    const atWaypoint = typeof section.arrival?.place?.waypoint === 'number';
+    if (atWaypoint || i === sections.length - 1) {
+      groups.push(current);
+      current = [];
+    }
+  });
+  return groups;
+}
+
+/**
+ * The `/v8/routes` departure/traffic parameters for the caller's `trafficMode`.
+ *
+ * - `'traffic'` (or its alias `'live'`): HERE's own behaviour — the caller's
+ *   `departureTime` if given, otherwise nothing, which HERE reads as "now"
+ *   with live traffic.
+ * - unset / `'none'` without a time: `departureTime=any`, which drops dynamic
+ *   traffic but keeps long-term closures in effect.
+ * - unset / `'none'` with a time: `traffic[mode]=disabled` instead, plus the
+ *   caller's `departureTime` when it came from the options. `any` would discard
+ *   the time; HERE's `disabled` also ignores long-term closures, a trade-off the
+ *   README documents.
+ *
+ * A time set through `_passthrough.query` counts as "with a time": a passthrough
+ * `departureTime` would replace `any` and put the request back on live traffic
+ * (and the Time-Aware rate), and HERE rejects `departureTime=any` combined with
+ * `arrivalTime` with HTTP 400. A passthrough `departureTime=any` is the caller
+ * asking for `any` itself, so it keeps the closure-preserving default.
+ */
+function hereRoutesTrafficQuery(options: IRoutingOptions): Record<string, string> {
+  const departureTime = options.departureTime?.toISOString();
+  if (isTrafficRequested(options.trafficMode)) {
+    return departureTime !== undefined ? { departureTime } : {};
+  }
+  if (departureTime !== undefined) {
+    return { departureTime, 'traffic[mode]': 'disabled' };
+  }
+  const passthroughQuery = options._passthrough?.query;
+  if (
+    (passthroughQuery?.departureTime !== undefined && passthroughQuery.departureTime !== 'any') ||
+    passthroughQuery?.arrivalTime !== undefined
+  ) {
+    return { 'traffic[mode]': 'disabled' };
+  }
+  return { departureTime: 'any' };
+}
+
+/**
+ * The findsequence2 `mode` route-feature segment for the avoid flags, or no
+ * segment at all. HERE's road features are `tollroad`, `motorway`, `boatFerry`,
+ * `railFerry`, `tunnel` and `dirtRoad`; a ferry avoid covers both ferry kinds,
+ * matching `/routes`' single `ferry` feature.
+ */
+function buildSequenceRouteFeatures(options: IRoutingOptions): string[] {
+  const features: string[] = [];
+  if (options.avoidTolls === true) features.push('tollroad:-3');
+  if (options.avoidHighways === true) features.push('motorway:-3');
+  if (options.avoidFerries === true) features.push('boatFerry:-3', 'railFerry:-3');
+  return features.length > 0 ? [features.join(',')] : [];
 }
 
 function buildAvoidFeatures(options: IRoutingOptions): string {

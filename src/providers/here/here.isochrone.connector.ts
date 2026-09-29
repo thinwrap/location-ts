@@ -1,4 +1,3 @@
-import type { Polygon } from 'geojson';
 import { BaseConnector } from '../../base/base.connector';
 import type {
   IIsochroneConnector,
@@ -7,10 +6,21 @@ import type {
   ProviderCode,
 } from '../../types';
 import { ConnectorError } from '../../types';
-import { decodeFlexPolyline, mergePassthrough, validateIsochroneCap } from '../../utils';
+import {
+  decodeFlexPolyline,
+  isFiniteNumber,
+  isRecord,
+  malformedResponseError,
+  mergePassthrough,
+  optionalArray,
+  toContourGeometry,
+  validateIsochroneCap,
+} from '../../utils';
 import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
 import type { HereConfig } from './here.config';
 import type { HereIsolineResponse } from './here.types';
+
+type HereIsoline = HereIsolineResponse['isolines'][number];
 
 const ISOLINE_URL = 'https://isoline.router.hereapi.com/v8/isolines';
 
@@ -28,16 +38,15 @@ const ISOLINE_URL = 'https://isoline.router.hereapi.com/v8/isolines';
  * **Range params.** Native units (seconds for time, meters for
  * distance) — no conversion.
  *
- * **Response normalization.** HERE returns each isoline's outer ring
- * as a flexible-polyline string; {@link decodeFlexPolyline} decodes it, and
- * the connector closes the GeoJSON Polygon ring by appending the first
- * coordinate when the boundary is not already closed.
+ * **Response normalization.** HERE types `isolines[].polygons` as a
+ * MultiPolygon — one `{ outer, inner[] }` entry per disconnected part (parts
+ * joined only by a ferry are listed under `connections`), each ring a
+ * flexible-polyline string. {@link decodeFlexPolyline} decodes every outer and
+ * inner ring, and {@link toContourGeometry} closes and winds them: one part is
+ * a `Polygon`, several a `MultiPolygon` holding all of them, holes kept.
  *
  * **Cap.** {@link validateIsochroneCap} enforces a 4-value
  * ceiling at the top of `.isochrone`.
- *
- * v1.0 ignores `polygons[j].inner[]` holes; documented in the per-connector
- * README.
  */
 export class HereIsochroneConnector
   extends BaseConnector
@@ -54,13 +63,16 @@ export class HereIsochroneConnector
 
     assertFiniteCoordinate(options.center, 'HERE isochrone center');
 
-    const transportMode = this.mapTransportMode(options.travelMode);
+    const transportMode = this.mapTransportMode(
+      options.travelMode as 'driving' | 'walking' | 'cycling' | undefined,
+    );
 
     const baseQuery: Record<string, string> = {
       apiKey: this.config.apiKey,
       origin: `${formatCoord(options.center.lat)},${formatCoord(options.center.lng)}`,
       'range[type]': options.type,
-      'range[values]': options.values.join(','),
+      // Plain decimals: `String(1e21)` is `1e+21`, which HERE does not parse.
+      'range[values]': options.values.map(formatCoord).join(','),
       transportMode,
     };
 
@@ -87,7 +99,7 @@ export class HereIsochroneConnector
     const data = (await response.json().catch(() => null)) as
       | HereIsolineResponse
       | null;
-    if (data === null) {
+    if (!isRecord(data)) {
       throw new ConnectorError({
         message: 'HERE Isochrone returned a malformed response body',
         statusCode: response.status,
@@ -97,27 +109,40 @@ export class HereIsochroneConnector
       });
     }
 
-    const contours = (data.isolines ?? [])
-      .map((iso) => {
-        const outerFlex = iso.polygons?.[0]?.outer;
-        const coords = outerFlex ? decodeFlexPolyline(outerFlex) : [];
-        const ring = coords.map((c) => [c.lng, c.lat]);
-        // Close the ring if not already closed (GeoJSON requires it).
-        if (ring.length > 0) {
-          const first = ring[0]!;
-          const last = ring[ring.length - 1]!;
-          if (first[0] !== last[0] || first[1] !== last[1]) {
-            ring.push([first[0]!, first[1]!]);
-          }
+    const isolines = optionalArray(data.isolines);
+    if (isolines === null || isolines.length === 0) {
+      throw malformedResponseError('HERE Isochrone', 'no isolines', response.status, data);
+    }
+
+    const contours = isolines
+      .map((entry) => {
+        const iso = isRecord(entry) ? (entry as unknown as HereIsoline) : null;
+        const value: unknown = iso?.range?.value;
+        const parts = optionalArray(iso?.polygons);
+        // An isoline with no outer ring describes no area: refuse it rather than
+        // emit an empty `[[]]` polygon.
+        if (!isFiniteNumber(value) || parts === null || parts.length === 0) {
+          throw malformedResponseError(
+            'HERE Isochrone',
+            'an isoline has no range value or no outer polygon',
+            response.status,
+            data,
+          );
         }
-        const polygon: Polygon = {
-          type: 'Polygon',
-          coordinates: [ring],
-        };
-        return {
-          value: iso.range.value,
-          geometry: polygon,
-        };
+        // An unusable part is dropped rather than failing the isochrone; an
+        // isoline left with no usable part at all describes no area.
+        const polygons = parts
+          .map(decodeHerePolygon)
+          .filter((polygon): polygon is number[][][] => polygon !== null);
+        if (polygons.length === 0) {
+          throw malformedResponseError(
+            'HERE Isochrone',
+            'an isoline has no usable outer ring',
+            response.status,
+            data,
+          );
+        }
+        return { value, geometry: toContourGeometry(polygons) };
       })
       .sort((a, b) => a.value - b.value);
 
@@ -143,8 +168,9 @@ export class HereIsochroneConnector
   }
 
   /**
-   * Map HERE (HTTP status) → canonical {@link ProviderCode}. Mirrors
-   * */
+   * Map HERE (HTTP status) → canonical {@link ProviderCode}, the same table as
+   * the other HERE connectors.
+   */
   private mapVendorError(httpStatus: number): ProviderCode {
     if (httpStatus === 401 || httpStatus === 403) return 'auth_failed';
     if (httpStatus === 429) return 'rate_limited';
@@ -170,13 +196,59 @@ export class HereIsochroneConnector
     return base;
   }
 
-  private mapTransportMode(mode?: 'driving' | 'walking'): string {
+  /**
+   * HERE's normalized isochrone modes are driving and walking (`'cycling'` is
+   * not in its input type). A `'cycling'` that arrives anyway, from JS or a
+   * variable typed for Mapbox/TomTom, fails fast with the capability code Esri
+   * uses, rather than silently computing a car isoline. HERE lists its own
+   * `bicycle` isoline mode as Beta with limited functionality; a caller who
+   * wants it sends `_passthrough.query.transportMode = 'bicycle'`.
+   */
+  private mapTransportMode(mode?: 'driving' | 'walking' | 'cycling'): string {
     switch (mode) {
       case 'walking':
         return 'pedestrian';
+      case 'cycling': {
+        const message = 'HERE Isoline Routing does not support travelMode "cycling"';
+        throw new ConnectorError({
+          message,
+          statusCode: null,
+          providerCode: 'unsupported_travel_mode',
+          providerMessage: message,
+        });
+      }
       default:
         return 'car';
     }
+  }
+}
+
+/**
+ * One HERE isoline polygon `{ outer, inner? }` as `[exterior, ...holes]` in
+ * `[lng, lat]` order, or `null` when the outer ring is missing, empty or
+ * undecodable — a part without an exterior describes no area. An unreadable
+ * inner ring is dropped instead: losing a hole overstates the area slightly,
+ * while dropping the part would lose all of it.
+ */
+function decodeHerePolygon(part: unknown): number[][][] | null {
+  if (!isRecord(part)) return null;
+  const outer = decodeRing(part.outer);
+  if (outer === null) return null;
+  const holes = (optionalArray(part.inner) ?? [])
+    .map(decodeRing)
+    .filter((ring): ring is number[][] => ring !== null);
+  return [outer, ...holes];
+}
+
+/** A flexible-polyline ring as `[lng, lat]` positions, or `null` when unusable. */
+function decodeRing(flex: unknown): number[][] | null {
+  if (typeof flex !== 'string' || flex === '') return null;
+  try {
+    const ring = decodeFlexPolyline(flex).map((c) => [c.lng, c.lat]);
+    return ring.length > 0 ? ring : null;
+  } catch {
+    // `decodeFlexPolyline` throws on a truncated or invalid string.
+    return null;
   }
 }
 

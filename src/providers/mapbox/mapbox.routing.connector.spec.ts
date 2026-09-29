@@ -181,7 +181,7 @@ describe('MapboxRoutingConnector', () => {
       expect(init?.method).toBe('GET');
     });
 
-    it('dispatches to /optimized-trips/v1 when only optimizeFixedOrigin is set', async () => {
+    it('dispatches to /optimized-trips/v1 when only optimizeFixedOrigin is set (round trip)', async () => {
       mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
       await connector.route({
         waypoints: [
@@ -189,18 +189,20 @@ describe('MapboxRoutingConnector', () => {
           { lat: 1, lng: 1 },
         ],
         optimizeFixedOrigin: true,
+        isRoundTrip: true,
       });
       const [url] = mockFetch.mock.calls[0]!;
       expect(url).toContain('/optimized-trips/v1/mapbox');
     });
 
-    it('dispatches to /optimized-trips/v1 when only optimizeFixedDestination is set', async () => {
+    it('dispatches to /optimized-trips/v1 when both fixed-endpoint flags are set', async () => {
       mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
       await connector.route({
         waypoints: [
           { lat: 0, lng: 0 },
           { lat: 1, lng: 1 },
         ],
+        optimizeFixedOrigin: true,
         optimizeFixedDestination: true,
       });
       const [url] = mockFetch.mock.calls[0]!;
@@ -242,7 +244,29 @@ describe('MapboxRoutingConnector', () => {
       expect(params.get('roundtrip')).toBe('false');
     });
 
-    it('optimizeFixedOrigin pins source to "first" and frees the destination', async () => {
+    // Optimization v1: with roundtrip=false only source=first&destination=last
+    // is supported — "All other combinations are unsupported".
+    for (const flag of ['optimizeFixedOrigin', 'optimizeFixedDestination'] as const) {
+      it(`${flag} alone on an open route throws unsupported_option (no request)`, async () => {
+        const err = await connector
+          .route({
+            waypoints: [
+              { lat: 0, lng: 0 },
+              { lat: 1, lng: 1 },
+              { lat: 2, lng: 2 },
+            ],
+            optimize: true,
+            [flag]: true,
+          })
+          .catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(ConnectorError);
+        expect((err as ConnectorError).providerCode).toBe('unsupported_option');
+        expect((err as ConnectorError).statusCode).toBeNull();
+        expect(mockFetch).not.toHaveBeenCalled();
+      });
+    }
+
+    it('both fixed-endpoint flags on an open route send source=first&destination=last', async () => {
       mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
       await connector.route({
         waypoints: [
@@ -251,14 +275,34 @@ describe('MapboxRoutingConnector', () => {
           { lat: 2, lng: 2 },
         ],
         optimizeFixedOrigin: true,
+        optimizeFixedDestination: true,
       });
       const [url] = mockFetch.mock.calls[0]!;
       const params = parseUrlParams(url as string);
       expect(params.get('source')).toBe('first');
-      expect(params.get('destination')).toBe('any');
+      expect(params.get('destination')).toBe('last');
+      expect(params.get('roundtrip')).toBe('false');
     });
 
-    it('optimizeFixedDestination pins destination to "last" and frees the source', async () => {
+    it('optimizeFixedOrigin on a round trip stays allowed (true/first/any)', async () => {
+      mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
+      await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+          { lat: 2, lng: 2 },
+        ],
+        optimizeFixedOrigin: true,
+        isRoundTrip: true,
+      });
+      const [url] = mockFetch.mock.calls[0]!;
+      const params = parseUrlParams(url as string);
+      expect(params.get('roundtrip')).toBe('true');
+      expect(params.get('source')).toBe('first');
+    });
+
+    // Live Optimization v1: roundtrip=true&source=any&destination=last → 200 Ok.
+    it('forwards optimizeFixedDestination on a round trip as destination=last', async () => {
       mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
       await connector.route({
         waypoints: [
@@ -267,11 +311,26 @@ describe('MapboxRoutingConnector', () => {
           { lat: 2, lng: 2 },
         ],
         optimizeFixedDestination: true,
+        isRoundTrip: true,
       });
-      const [url] = mockFetch.mock.calls[0]!;
-      const params = parseUrlParams(url as string);
-      expect(params.get('source')).toBe('any');
+      const params = parseUrlParams(mockFetch.mock.calls[0]![0] as string);
+      expect(params.get('roundtrip')).toBe('true');
+      expect(params.get('source')).toBe('first');
       expect(params.get('destination')).toBe('last');
+    });
+
+    it('sends no destination on a round trip without optimizeFixedDestination', async () => {
+      mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
+      await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+          { lat: 2, lng: 2 },
+        ],
+        optimizeFixedOrigin: true,
+        isRoundTrip: true,
+      });
+      expect(parseUrlParams(mockFetch.mock.calls[0]![0] as string).has('destination')).toBe(false);
     });
 
     it('isRoundTrip=true emits roundtrip=true (source=first)', async () => {
@@ -618,25 +677,161 @@ describe('MapboxRoutingConnector', () => {
       expect(params.get('exclude')).toBe('toll,ferry');
     });
 
-    it('includes exclude param for avoidHighways on optimized-trips dispatch', async () => {
-      mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
+    // Live Directions: walking `exclude=toll`/`motorway` → 422 "exclude value
+    // must be one of: ferry, cash_only_tolls, border_crossing, …"; cycling
+    // `exclude=toll` → 422 "… one of: ferry, cash_only_tolls, unpaved, tunnel";
+    // `exclude=ferry` → 200 on both.
+    for (const travelMode of ['walking', 'cycling'] as const) {
+      it(`sends only exclude=ferry on the ${travelMode} profile`, async () => {
+        mockFetch.mockResolvedValueOnce(buildDirectionsResponse());
+        await connector.route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 1, lng: 1 },
+          ],
+          travelMode,
+          avoidTolls: true,
+          avoidHighways: true,
+          avoidFerries: true,
+        });
+        expect(parseUrlParams(mockFetch.mock.calls[0]![0] as string).get('exclude')).toBe('ferry');
+      });
+
+      it(`sends no exclude on the ${travelMode} profile for toll/highway flags alone`, async () => {
+        mockFetch.mockResolvedValueOnce(buildDirectionsResponse());
+        await connector.route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 1, lng: 1 },
+          ],
+          travelMode,
+          avoidTolls: true,
+          avoidHighways: true,
+        });
+        expect(parseUrlParams(mockFetch.mock.calls[0]![0] as string).has('exclude')).toBe(false);
+      });
+    }
+
+    it('keeps toll,ferry,motorway on the driving profile', async () => {
+      mockFetch.mockResolvedValueOnce(buildDirectionsResponse());
       await connector.route({
         waypoints: [
           { lat: 0, lng: 0 },
           { lat: 1, lng: 1 },
         ],
-        optimize: true,
+        avoidTolls: true,
+        avoidFerries: true,
         avoidHighways: true,
       });
-      const [url] = mockFetch.mock.calls[0]!;
-      const params = parseUrlParams(url as string);
-      expect(params.get('exclude')).toBe('motorway');
+      expect(parseUrlParams(mockFetch.mock.calls[0]![0] as string).get('exclude')).toBe(
+        'toll,ferry,motorway',
+      );
     });
+
+    it('selects the driving-traffic profile for trafficMode live, with depart_at and exclude', async () => {
+      mockFetch.mockResolvedValueOnce(buildDirectionsResponse());
+      await connector.route({
+        waypoints: [
+          { lat: 40.8509, lng: -73.9701 },
+          { lat: 40.8448, lng: -73.8648 },
+        ],
+        trafficMode: 'live',
+        avoidTolls: true,
+        departureTime: new Date('2026-09-29T13:00:00Z'),
+      });
+      const url = mockFetch.mock.calls[0]![0] as string;
+      expect(new URL(url).pathname).toMatch(/^\/directions\/v5\/mapbox\/driving-traffic\//);
+      const params = parseUrlParams(url);
+      expect(params.get('depart_at')).toBe('2026-09-29T13:00:00Z');
+      expect(params.get('exclude')).toBe('toll');
+    });
+
+    it.each([
+      ['trafficMode none', { trafficMode: 'none' as const }, '/mapbox/driving/'],
+      ['walking + live', { travelMode: 'walking' as const, trafficMode: 'live' as const }, '/mapbox/walking/'],
+      ['cycling + live', { travelMode: 'cycling' as const, trafficMode: 'live' as const }, '/mapbox/cycling/'],
+    ])('keeps the plain profile for %s', async (_label, extra, segment) => {
+      mockFetch.mockResolvedValueOnce(buildDirectionsResponse());
+      await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+        ],
+        ...extra,
+      });
+      expect(mockFetch.mock.calls[0]![0] as string).toContain(segment);
+    });
+
+    it('keeps an optimized route on the driving profile under trafficMode live', async () => {
+      // Optimization v1 publishes no driving-traffic profile.
+      mockFetch.mockResolvedValueOnce(buildOptimizedTripsResponse());
+      await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+          { lat: 2, lng: 2 },
+        ],
+        optimize: true,
+        trafficMode: 'live',
+      });
+      expect(mockFetch.mock.calls[0]![0] as string).toContain('/optimized-trips/v1/mapbox/driving/');
+    });
+
+    // Optimization v1 has no `exclude` or `depart_at`, and "unrecognized options
+    // in the query string result in an InvalidInput error".
+    for (const flag of ['avoidTolls', 'avoidFerries', 'avoidHighways'] as const) {
+      it(`${flag} on an optimized route throws unsupported_option (no request)`, async () => {
+        await expect(
+          connector.route({
+            waypoints: [
+              { lat: 0, lng: 0 },
+              { lat: 1, lng: 1 },
+            ],
+            optimize: true,
+            [flag]: true,
+          }),
+        ).rejects.toMatchObject({ providerCode: 'unsupported_option', statusCode: null });
+        expect(mockFetch).not.toHaveBeenCalled();
+      });
+    }
+
+    it('departureTime with traffic on an optimized route throws unsupported_field (no request)', async () => {
+      await expect(
+        connector.route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 1, lng: 1 },
+          ],
+          optimize: true,
+          departureTime: new Date('2024-01-15T08:00:00Z'),
+          trafficMode: 'traffic',
+        }),
+      ).rejects.toMatchObject({ providerCode: 'unsupported_field', statusCode: null });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    for (const travelMode of ['walking', 'cycling'] as const) {
+      it(`omits depart_at on the ${travelMode} Directions profile`, async () => {
+        // depart_at is documented for driving / driving-traffic only.
+        mockFetch.mockResolvedValueOnce(buildDirectionsResponse());
+        await connector.route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 1, lng: 1 },
+          ],
+          travelMode,
+          departureTime: new Date('2024-01-15T08:00:00Z'),
+        });
+        const [url] = mockFetch.mock.calls[0]!;
+        expect(url).toContain(`/mapbox/${travelMode}/`);
+        expect(parseUrlParams(url as string).get('depart_at')).toBeNull();
+      });
+    }
 
     // Mapbox enumerates exactly three accepted ISO 8601 forms for `depart_at`
     // (`YYYY-MM-DDThh:mm:ssZ`, `…±hh:mm`, `YYYY-MM-DDThh:mm`); the millisecond
     // form `toISOString()` produces is not one of them.
-    it('emits depart_at at seconds precision when departureTime is set', async () => {
+    it('emits depart_at at seconds precision when departureTime is set with traffic', async () => {
       mockFetch.mockResolvedValueOnce(buildDirectionsResponse());
       await connector.route({
         waypoints: [
@@ -644,6 +839,7 @@ describe('MapboxRoutingConnector', () => {
           { lat: 1, lng: 1 },
         ],
         departureTime: new Date('2024-01-15T08:00:00.750Z'),
+        trafficMode: 'traffic',
       });
       const [url] = mockFetch.mock.calls[0]!;
       const params = parseUrlParams(url as string);
@@ -721,6 +917,28 @@ describe('MapboxRoutingConnector', () => {
         expected: 'no_route',
       },
       {
+        // Live: cycling exclude=toll → this exact body.
+        label: 'HTTP 422 InvalidInput → invalid_request',
+        status: 422,
+        body: {
+          code: 'InvalidInput',
+          message: 'exclude value must be one of: ferry, cash_only_tolls, unpaved, tunnel',
+        },
+        expected: 'invalid_request',
+      },
+      {
+        label: 'HTTP 422 NoSegment → no_route',
+        status: 422,
+        body: { code: 'NoSegment' },
+        expected: 'no_route',
+      },
+      {
+        label: 'HTTP 422 with no envelope code → invalid_request',
+        status: 422,
+        body: { message: 'Request too large for custom parameters' },
+        expected: 'invalid_request',
+      },
+      {
         label: 'HTTP 422 ProcessingError → unknown',
         status: 422,
         body: { code: 'ProcessingError' },
@@ -762,6 +980,45 @@ describe('MapboxRoutingConnector', () => {
         expect((thrown as ConnectorError).statusCode).toBe(c.status);
       });
     }
+
+    // Mapbox routing was the one connector that dropped Retry-After.
+    it('surfaces Retry-After on a 429 like every other connector', async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({ message: 'Too Many Requests' }), {
+          status: 429,
+          headers: { 'Retry-After': '17' },
+        }),
+      );
+      const err = (await connector
+        .route({ waypoints: [{ lat: 0, lng: 0 }, { lat: 1, lng: 1 }] })
+        .catch((e: unknown) => e)) as ConnectorError;
+      expect(err.providerCode).toBe('rate_limited');
+      expect(err.providerMessage).toBe('Too Many Requests; retry after 17 seconds');
+      expect((err.cause as { retryAfter?: string }).retryAfter).toBe('17');
+    });
+
+    // Live Optimization v1: roundtrip=false&source=first&destination=any →
+    // HTTP 200 {"code":"NotImplemented","message":"This request is not supported"}.
+    it('maps a 200 NotImplemented envelope (passthrough-forced combo) to unsupported_option', async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ code: 'NotImplemented', message: 'This request is not supported' }),
+          { status: 200 },
+        ),
+      );
+      await expect(
+        connector.route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 1, lng: 1 },
+            { lat: 2, lng: 2 },
+          ],
+          optimize: true,
+          _passthrough: { query: { destination: 'any' } },
+        }),
+      ).rejects.toMatchObject({ providerCode: 'unsupported_option', statusCode: 200 });
+      expect(parseUrlParams(mockFetch.mock.calls[0]![0] as string).get('destination')).toBe('any');
+    });
 
     it('throws ConnectorError on 200-OK envelope with code !== "Ok"', async () => {
       mockFetch.mockResolvedValueOnce(

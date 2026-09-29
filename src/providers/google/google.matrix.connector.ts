@@ -7,10 +7,14 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
-import { mergePassthrough } from '../../utils';
+import { isRecord, malformedResponseError, mergePassthrough } from '../../utils';
+import { assertNonEmptyMatrix, validateMatrixOptions } from '../../utils/validate-options';
 import { assertFiniteCoordinate } from '../../utils/coordinate';
+import { isTrafficRequested } from '../../utils/traffic';
 import type { GoogleConfig } from './google.config';
+import { GOOGLE_MATRIX_FIELD_MASK } from './google.defaults';
 import type { GoogleRouteMatrixElement } from './google.types';
+import { mapGoogleReason, readGoogleErrorReason } from './google.error-reason';
 
 const MATRIX_URL = 'https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix';
 
@@ -36,6 +40,8 @@ export class GoogleMatrixConnector
   }
 
   async matrix(options: IMatrixOptions): Promise<IMatrixResult> {
+    validateMatrixOptions(options, 'Google Matrix');
+    assertNonEmptyMatrix(options, 'Google Matrix');
     // Reject NaN/non-finite coordinates before they serialize into the JSON
     // body (JSON.stringify(NaN) === "null" would silently corrupt the request).
     // Out-of-range but finite lat/lng pass through verbatim (thin-wrapper).
@@ -66,23 +72,26 @@ export class GoogleMatrixConnector
     // ELEMENT — so it follows the explicit `trafficMode` opt-in rather than the
     // presence of `departureTime`. Deriving it from a departure time would move
     // origins x destinations billed elements onto Pro pricing at once.
+    const traffic = isTrafficRequested(options.trafficMode);
     if (travelMode === 'DRIVE' || travelMode === 'TWO_WHEELER') {
-      body.routingPreference =
-        options.trafficMode === 'live' ? 'TRAFFIC_AWARE' : 'TRAFFIC_UNAWARE';
+      body.routingPreference = traffic ? 'TRAFFIC_AWARE' : 'TRAFFIC_UNAWARE';
     }
 
     if (options.avoidTolls) {
       body.routeModifiers = { avoidTolls: true };
     }
 
-    if (options.departureTime) {
+    // The departure time is sent only with traffic. Google answers HTTP 400
+    // "Timestamp cannot be set for TRAFFIC_UNAWARE routing mode." when both are
+    // present, and documents that an unaware matrix is computed on
+    // time-independent speeds, so under `'none'` the time could change nothing.
+    if (options.departureTime && traffic) {
       body.departureTime = options.departureTime.toISOString();
     }
 
     const headers: Record<string, string> = {
       'X-Goog-Api-Key': this.config.apiKey,
-      'X-Goog-FieldMask':
-        'originIndex,destinationIndex,distanceMeters,duration,status,condition',
+      'X-Goog-FieldMask': GOOGLE_MATRIX_FIELD_MASK.join(','),
     };
 
     const merged = mergePassthrough(body, headers, options._passthrough);
@@ -114,23 +123,50 @@ export class GoogleMatrixConnector
     // concatenated by newlines (not array-wrapped). Read the full body and
     // split + parse each non-empty line.
     const text = await response.text();
-    const elements = parseNdjsonElements(text);
+    const elements = parseNdjsonElements(text, response.status);
 
-    const cells: IMatrixCell[] = elements
-      .filter(isSuccessfulElement)
-      .map((el) => ({
+    // Every requested pair gets an element, failed ones included, so an empty
+    // answer to a non-empty request is not "no cells" — it is a body we cannot
+    // read. Reporting it as an empty success would fabricate a result.
+    if (
+      elements.length === 0 &&
+      options.origins.length > 0 &&
+      options.destinations.length > 0
+    ) {
+      throw malformedResponseError('Google Matrix', 'no elements', response.status, text);
+    }
+
+    const cells: IMatrixCell[] = [];
+    for (const el of elements) {
+      if (!isRecord(el)) {
+        throw malformedResponseError('Google Matrix', 'an element is not an object', response.status, elements);
+      }
+      if (!isSuccessfulElement(el)) continue;
+      if (!Number.isInteger(el.originIndex) || !Number.isInteger(el.destinationIndex)) {
+        throw malformedResponseError(
+          'Google Matrix',
+          'an element has no originIndex/destinationIndex',
+          response.status,
+          elements,
+        );
+      }
+      cells.push({
         originIndex: el.originIndex,
         destinationIndex: el.destinationIndex,
+        // Google's JSON omits zero-valued fields (a same-point pair), so an
+        // absent distance/duration on a ROUTE_EXISTS element is 0 by definition.
         distanceMeters: el.distanceMeters ?? 0,
         durationSeconds: parseDuration(el.duration ?? '0s'),
-      }));
+      });
+    }
 
     return { cells, raw: elements };
   }
 
   /**
-   * Map (HTTP status, decoded body) → canonical {@link ProviderCode}. Per
-   * (per-connector locality).    */
+   * Map (HTTP status, decoded body) → canonical {@link ProviderCode}. Lives on the
+   * connector rather than in `BaseConnector`: error translation is per-provider.
+   */
   private mapVendorError(httpStatus: number, body: unknown): ProviderCode {
     // Prefer the structured google.rpc.ErrorInfo reason (robust) over the HTTP
     // status: Google returns 400 INVALID_ARGUMENT for an invalid key, which the
@@ -204,7 +240,7 @@ function parseDuration(duration: string): number {
  * for one (originIndex, destinationIndex) pair; the body is NOT array-wrapped.
  * Tolerates both pure NDJSON and the occasional array-wrapped envelope.
  */
-function parseNdjsonElements(text: string): GoogleRouteMatrixElement[] {
+function parseNdjsonElements(text: string, statusCode: number): GoogleRouteMatrixElement[] {
   const trimmed = text.trim();
   if (trimmed === '') return [];
 
@@ -231,7 +267,7 @@ function parseNdjsonElements(text: string): GoogleRouteMatrixElement[] {
       // unified ConnectorError contract.
       throw new ConnectorError({
         message: 'Google Matrix returned an unparseable NDJSON line',
-        statusCode: null,
+        statusCode,
         // No 'invalid_response' ProviderCode exists in error.types.ts; 'unknown'
         // is the closest existing value for a malformed provider body.
         providerCode: 'unknown',
@@ -244,13 +280,24 @@ function parseNdjsonElements(text: string): GoogleRouteMatrixElement[] {
 }
 
 /**
- * An element is "successful" when its `status` field is absent (Google omits
- * it on success when the field mask requests it) OR its `status.code` is 0
- * (the RPC OK code). Per, failed cells are retained in `raw` but excluded
- * from `cells[]`.
+ * Whether an element is a usable cell. Failed cells are retained in `raw` but
+ * excluded from `cells[]`.
+ *
+ * `status` is a `google.rpc.Status` whose OK form Google serializes as `{}` or
+ * omits (proto3 drops default values), so an absent/empty status or code 0 is
+ * OK. `condition` is independent of it: an element can be status-OK with
+ * `ROUTE_NOT_FOUND`, so anything other than `ROUTE_EXISTS` is a failed cell.
+ *
+ * An element carrying NEITHER field says nothing about whether a route exists
+ * — `condition` is in the connector's field mask and `ROUTE_EXISTS` is not a
+ * default value Google would drop — so it is treated as failed rather than
+ * read as a 0 m / 0 s cell.
  */
 function isSuccessfulElement(el: GoogleRouteMatrixElement): boolean {
   const status = el.status;
+  if (el.condition === undefined && (status === undefined || status === null)) {
+    return false;
+  }
   const statusOk =
     status === undefined ||
     status === null ||
@@ -258,58 +305,10 @@ function isSuccessfulElement(el: GoogleRouteMatrixElement): boolean {
     status.code === null ||
     status.code === 0;
   if (!statusOk) return false;
-  // `condition` is independent of `status`: an element can be status-OK with
-  // `ROUTE_NOT_FOUND` and no distanceMeters/duration. Treat anything other than
-  // ROUTE_EXISTS (when present) as a failed cell so it is omitted from cells[].
   if (el.condition !== undefined && el.condition !== 'ROUTE_EXISTS') {
     return false;
   }
   return true;
-}
-
-/**
- * Read the machine-readable reason from a `google.rpc.ErrorInfo` entry in
- * `error.details[]` (domain `googleapis.com`). This is a stable enum from
- * `google/api/error_reason.proto`, unlike the human `message`.
- */
-function readGoogleErrorReason(body: unknown): string | null {
-  if (body === null || typeof body !== 'object' || !('error' in body)) return null;
-  const err = (body as { error?: unknown }).error;
-  if (err === null || typeof err !== 'object' || !('details' in err)) return null;
-  const details = (err as { details?: unknown }).details;
-  if (!Array.isArray(details)) return null;
-  for (const d of details) {
-    if (d === null || typeof d !== 'object') continue;
-    const domain = (d as { domain?: unknown }).domain;
-    const type = (d as { '@type'?: unknown })['@type'];
-    const isErrorInfo =
-      domain === 'googleapis.com' ||
-      (typeof type === 'string' && type.endsWith('google.rpc.ErrorInfo'));
-    if (!isErrorInfo) continue;
-    const reason = (d as { reason?: unknown }).reason;
-    if (typeof reason === 'string' && reason !== '') return reason;
-  }
-  return null;
-}
-
-const GOOGLE_AUTH_REASONS = new Set<string>([
-  'API_KEY_INVALID', 'API_KEY_SERVICE_BLOCKED', 'API_KEY_HTTP_REFERRER_BLOCKED',
-  'API_KEY_IP_ADDRESS_BLOCKED', 'API_KEY_ANDROID_APP_BLOCKED', 'API_KEY_IOS_APP_BLOCKED',
-  'CREDENTIALS_MISSING', 'ACCESS_TOKEN_EXPIRED', 'ACCESS_TOKEN_SCOPE_INSUFFICIENT',
-  'ACCESS_TOKEN_TYPE_UNSUPPORTED', 'ACCOUNT_STATE_INVALID', 'CONSUMER_INVALID',
-  'CONSUMER_SUSPENDED', 'USER_PROJECT_DENIED', 'SERVICE_DISABLED', 'BILLING_DISABLED',
-]);
-const GOOGLE_RATE_REASONS = new Set<string>(['RATE_LIMIT_EXCEEDED', 'RESOURCE_QUOTA_EXCEEDED']);
-
-/**
- * Map a `google.rpc.ErrorInfo` reason to a canonical {@link ProviderCode}, or
- * `null` to fall back to the HTTP-status mapping.
- */
-function mapGoogleReason(reason: string | null): ProviderCode | null {
-  if (reason === null) return null;
-  if (GOOGLE_AUTH_REASONS.has(reason)) return 'auth_failed';
-  if (GOOGLE_RATE_REASONS.has(reason)) return 'rate_limited';
-  return null;
 }
 
 function readGoogleErrorStatus(body: unknown): string | null {

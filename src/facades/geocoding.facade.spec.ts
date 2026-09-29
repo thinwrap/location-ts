@@ -97,11 +97,30 @@ describe('Geocoding (unified facade)', () => {
     expect(new Geocoding('tomtom', { apiKey: 'tk' }).providerId).toBe('tomtom');
   });
 
-  it('should throw on unknown provider', () => {
-    expect(
+  it('should throw a TypeError on unknown provider', () => {
+    const create = () =>
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      () => new Geocoding('unknown' as any, {} as any)
-    ).toThrow('Unknown geocoding provider: unknown');
+      new Geocoding('unknown' as any, {} as any);
+    expect(create).toThrow(TypeError);
+    expect(create).toThrow('Unknown geocoding provider: unknown');
+  });
+
+  it('names a Symbol provider in the TypeError instead of crashing on it', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(() => new Geocoding(Symbol('x') as any, {} as any)).toThrow(
+      'Unknown geocoding provider: Symbol(x)',
+    );
+  });
+
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['a string', 'key'],
+  ])('throws a TypeError at construction for a %s config', (_label, config) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const create = () => new Geocoding('google', config as any);
+    expect(create).toThrow(TypeError);
+    expect(create).toThrow('Geocoding requires a config object');
   });
 
   it('uses the injected fetchImpl when one is supplied to the facade', async () => {

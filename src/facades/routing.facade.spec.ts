@@ -168,11 +168,30 @@ describe('Routing (unified facade)', () => {
     expect(routing.providerId).toBe('tomtom');
   });
 
-  it('should throw on unknown provider', () => {
-    expect(
+  it('should throw a TypeError on unknown provider', () => {
+    const create = () =>
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      () => new Routing('unknown' as any, {} as any)
-    ).toThrow('Unknown routing provider: unknown');
+      new Routing('unknown' as any, {} as any);
+    expect(create).toThrow(TypeError);
+    expect(create).toThrow('Unknown routing provider: unknown');
+  });
+
+  it('names a Symbol provider in the TypeError instead of crashing on it', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(() => new Routing(Symbol('x') as any, {} as any)).toThrow(
+      'Unknown routing provider: Symbol(x)',
+    );
+  });
+
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['a string', 'key'],
+  ])('throws a TypeError at construction for a %s config', (_label, config) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const create = () => new Routing('osrm', config as any);
+    expect(create).toThrow(TypeError);
+    expect(create).toThrow('Routing requires a config object');
   });
 
   it('should propagate ConnectorError from underlying connector', async () => {

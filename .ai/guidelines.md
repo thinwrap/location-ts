@@ -71,4 +71,5 @@ Full reasoning lives in [`ARCHITECTURE.md`](./ARCHITECTURE.md); the short list:
 - **Normalize at the wire layer.** Distance → meters, duration → seconds, coordinates → `{ lat, lng }`, geometry → Google precision-5 polyline. The four `Polyline` utilities are locked at v1.0.
 - **Per-connector locality.** `mapVendorError` and any outlier translation live inside `src/providers/<id>/` — never in `BaseConnector`. No casing-transform layer; keys are forwarded verbatim.
 - **`ProviderCode`**: 6 canonical + 7 location-extended values, surfaced via `ConnectorError`; the raw `Retry-After` rides in `e.cause` (no top-level `retryAfterSeconds`).
+- **Two kinds of failure.** Operation failures (vendor, transport, bad request data, `unsupported_*`) are `ConnectorError`; API misuse (unknown provider, missing config, a value outside a closed vocabulary) is a `TypeError`. A new connector calls the shared `validate*Options` helper first and adds its rows to `src/error-contract.spec.ts` (see CONVENTIONS).
 - **OSRM** requires an explicit `baseUrl` and validates it at the top of each operation (not in the constructor).

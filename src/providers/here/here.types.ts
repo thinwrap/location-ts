@@ -14,6 +14,16 @@ export interface HereRouteResponse {
          */
         baseDuration?: number;
       };
+      /**
+       * Where the section ends. `place.waypoint` is the index of the request
+       * `via` this place corresponds to; HERE omits it for the origin, the
+       * destination and stops the router added itself (e.g. a ferry terminal).
+       */
+      arrival?: {
+        place?: {
+          waypoint?: number;
+        };
+      };
     }>;
   }>;
 }
@@ -129,8 +139,12 @@ export interface HereAutocompleteResponse {
 export interface HereIsolineResponse {
   isolines: Array<{
     range: { type: string; value: number };
+    /** A MultiPolygon: one entry per disconnected part, rings as flexible polylines. */
     polygons: Array<{
       outer: string;
+      inner?: string[];
     }>;
+    /** Ferry-style links joining disconnected parts; left in `raw`. */
+    connections?: unknown[];
   }>;
 }

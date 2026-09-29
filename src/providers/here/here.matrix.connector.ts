@@ -8,9 +8,18 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
-import { mergePassthrough } from '../../utils';
+import {
+  isFiniteNumber,
+  isRecord,
+  malformedResponseError,
+  mergePassthrough,
+  readPollingTimeoutMs,
+} from '../../utils';
+import { assertNonEmptyMatrix, validateMatrixOptions } from '../../utils/validate-options';
 import { assertFiniteCoordinate } from '../../utils/coordinate';
+import { isTrafficRequested } from '../../utils/traffic';
 import type { HereConfig } from './here.config';
+import { HERE_MATRIX_ATTRIBUTES } from './here.defaults';
 import type { HereMatrixResponse, HereTransportMode } from './here.types';
 
 const MATRIX_URL = 'https://matrix.router.hereapi.com/v8/matrix';
@@ -30,9 +39,8 @@ export interface HereMatrixOptions extends IMatrixOptions {
   /**
    * When set, overrides the base `travelMode` mapping at the wire level.
    * Matrix v8 publishes the same eight values as Routing v8, so this shares
-   * {@link HereTransportMode} rather than restating a narrower list — the
-   * inline union that used to live here had drifted and silently rejected
-   * `taxi`, `bus` and `privateBus`, all of which the service accepts.
+   * {@link HereTransportMode} rather than restating the list, so the two
+   * cannot drift apart.
    */
   transportMode?: HereTransportMode;
 }
@@ -44,11 +52,11 @@ declare module '../../types/matrix.interface' {
 }
 
 /**
- * HERE Matrix v8 connector — architectural outlier #1 for Matrix.
+ * HERE Matrix v8 connector — the always-async matrix connector.
  *
  * HERE Matrix v8 is ALWAYS async — every request runs through a three-call
- * submit-poll-retrieve cycle. (async polling locality), the polling
- * loop lives entirely inside this connector with no shared middleware.
+ * submit-poll-retrieve cycle. The polling loop lives entirely inside this
+ * connector with no shared middleware.
  *
  *   1. `POST https://matrix.router.hereapi.com/v8/matrix?async=true&apiKey=...`
  *      submits the job; HERE returns `matrixId` + `statusUrl`.
@@ -59,7 +67,9 @@ declare module '../../types/matrix.interface' {
  * `cells[]`.
  *
  * Polling deadline override: `options._passthrough.body.timeoutMs`
- * (consumer-supplied, in milliseconds). Per the baseline-coverage rule,
+ * (consumer-supplied: a finite number of milliseconds greater than 0, anything
+ * else is refused as `invalid_request` before the submit). Per the
+ * baseline-coverage rule,
  * fields ≤33% of providers use go to `_passthrough` not the base
  * interface — `timeoutMs` is HERE+TomTom only.
  *
@@ -96,6 +106,8 @@ export class HereMatrixConnector
   }
 
   async matrix(options: IMatrixOptions): Promise<IMatrixResult> {
+    validateMatrixOptions(options, 'HERE Matrix');
+    assertNonEmptyMatrix(options, 'HERE Matrix');
     // Reject NaN/non-finite coordinates before they serialize into the JSON
     // body (JSON.stringify(NaN) === "null" would silently corrupt the request)
     // and before the submit round-trip. Out-of-range but finite lat/lng pass
@@ -103,9 +115,11 @@ export class HereMatrixConnector
     for (const coord of [...options.origins, ...options.destinations]) {
       assertFiniteCoordinate(coord, 'HERE Matrix');
     }
+    const deadlineMs =
+      readPollingTimeoutMs(options._passthrough, 'HERE Matrix') ?? POLL_DEFAULT_DEADLINE_MS;
 
     const { matrixId, statusUrl } = await this.submit(options);
-    const resultUrl = await this.poll(matrixId, statusUrl, options);
+    const resultUrl = await this.poll(matrixId, statusUrl, deadlineMs);
     return this.retrieve(resultUrl, options);
   }
 
@@ -122,7 +136,7 @@ export class HereMatrixConnector
         lng: d.lng,
       })),
       regionDefinition: { type: 'autoCircle' },
-      matrixAttributes: ['travelTimes', 'distances'],
+      matrixAttributes: [...HERE_MATRIX_ATTRIBUTES],
     };
 
     const profile = this.resolveTransportMode(options);
@@ -134,8 +148,32 @@ export class HereMatrixConnector
       body.avoid = { features: ['tollRoad'] };
     }
 
-    if (options.departureTime) {
-      body.departureTime = options.departureTime.toISOString();
+    // Matrix v8, like Routing v8, applies live traffic whenever `departureTime`
+    // is omitted (it assumes "now"), which contradicts the normalized
+    // `trafficMode: 'none'` default. `departureTime: "any"` drops dynamic
+    // traffic but keeps long-term closures; when the caller supplies a time,
+    // `any` would discard it, so `traffic.mode: "disabled"` is sent instead,
+    // which HERE documents as ignoring long-term closures too. A time set in
+    // `_passthrough.body` counts as well: a passthrough `departureTime` would
+    // replace `any` and bring live traffic back, and HERE rejects
+    // `departureTime: "any"` combined with `arrivalTime` with HTTP 400. These
+    // are defaults only — `_passthrough.body` is deep-merged over them.
+    const departureTime = options.departureTime?.toISOString();
+    const passthroughBody = options._passthrough?.body;
+    // A passthrough `departureTime: "any"` is the caller asking for `any`
+    // itself, so it keeps the closure-preserving default.
+    const passthroughSetsTime =
+      (passthroughBody?.departureTime !== undefined && passthroughBody.departureTime !== 'any') ||
+      passthroughBody?.arrivalTime !== undefined;
+    if (isTrafficRequested(options.trafficMode)) {
+      if (departureTime !== undefined) body.departureTime = departureTime;
+    } else if (departureTime !== undefined) {
+      body.departureTime = departureTime;
+      body.traffic = { mode: 'disabled' };
+    } else if (passthroughSetsTime) {
+      body.traffic = { mode: 'disabled' };
+    } else {
+      body.departureTime = 'any';
     }
 
     const headers: Record<string, string> = {};
@@ -200,13 +238,13 @@ export class HereMatrixConnector
   private async poll(
     matrixId: string,
     statusUrl: string,
-    options: IMatrixOptions,
+    deadlineMs: number,
   ): Promise<string> {
     // Validate the provider-supplied statusUrl before ever attaching the API
-    // key to it (WI-3): reject non-HERE hosts / malformed URLs up front.
+    // key to it: reject non-HERE hosts / malformed URLs up front, so a tampered
+    // submit response cannot send the key elsewhere.
     this.assertHereApiUrl(statusUrl, 'statusUrl');
 
-    const deadlineMs = this.resolveDeadlineMs(options);
     const deadlineAt = Date.now() + deadlineMs;
 
     let delayMs = POLL_INITIAL_DELAY_MS;
@@ -225,17 +263,22 @@ export class HereMatrixConnector
         Math.round(delayMs * POLL_BACKOFF_MULTIPLIER),
       );
 
-      const statusResponse = await this.hereGet(statusUrl, {
+      // `redirect: 'manual'` keeps HERE's 303s OBSERVABLE (status + Location)
+      // so each hop decides whether the apiKey goes along; the base transport
+      // still supplies the timeout, error sanitization and the rebuild of an
+      // HTTP error a host dispatcher threw.
+      const statusResponse = await this.sendGet(statusUrl, {
         query: { apiKey: this.config.apiKey },
+        redirect: 'manual',
       });
 
       // Real HERE v8 behavior: on completion the poll returns `303 See Other`
       // with `Location: <resultUrl>` and a body `{status:"completed",
       // resultUrl}`. This MUST be handled BEFORE the generic non-2xx guard
-      // below (a 303 is not `ok`, so it would otherwise raise). `pollGet` uses
-      // `redirect: 'manual'` so the 303 is observable here rather than
-      // surfacing as a thrown network error (the base transport forces
-      // `redirect: 'error'`, which turns the redirect into a failure).
+      // below (a 303 is not `ok`, so it would otherwise raise). The poll opts
+      // into `redirect: 'manual'` so the 303 is observable here rather than
+      // surfacing as a thrown network error (the base transport's default
+      // `redirect: 'error'` turns a redirect into a failure).
       if (statusResponse.status === 303) {
         const body = (await statusResponse.json().catch(() => null)) as
           | Record<string, unknown>
@@ -298,8 +341,8 @@ export class HereMatrixConnector
     resultUrl: string,
     options: IMatrixOptions,
   ): Promise<IMatrixResult> {
-    // Validate the provider-supplied resultUrl before attaching the API key
-    // (WI-3): reject non-HERE hosts / malformed URLs up front.
+    // Validate the provider-supplied resultUrl before attaching the API key:
+    // reject non-HERE hosts / malformed URLs up front.
     this.assertHereApiUrl(resultUrl, 'resultUrl');
 
     // Step 3a: GET the (validated hereapi.com) resultUrl WITH the apiKey. HERE
@@ -307,11 +350,12 @@ export class HereMatrixConnector
     // `Accept-Encoding: gzip` (406 Not Acceptable without). On success HERE does
     // NOT return the payload inline — it responds `303 See Other` with
     // `Location: <pre-signed S3 URL>`. We read that redirect MANUALLY
-    // (redirect:'manual', via hereGet) rather than auto-following, so the
-    // apiKey is never forwarded off the HERE host to the storage backend.
-    let response = await this.hereGet(resultUrl, {
+    // (redirect:'manual') rather than auto-following, so the apiKey is never
+    // forwarded off the HERE host to the storage backend.
+    let response = await this.sendGet(resultUrl, {
       query: { apiKey: this.config.apiKey },
       headers: { 'Accept-Encoding': 'gzip' },
+      redirect: 'manual',
     });
 
     // Step 3b: follow the single redirect hop to the pre-signed result URL,
@@ -350,8 +394,9 @@ export class HereMatrixConnector
           cause: null,
         });
       }
-      response = await this.hereGet(location, {
+      response = await this.sendGet(location, {
         headers: { 'Accept-Encoding': 'gzip' },
+        redirect: 'manual',
       });
     }
 
@@ -360,7 +405,7 @@ export class HereMatrixConnector
     }
 
     const data = await this.readMatrixBody(response);
-    if (data === null || data.matrix === undefined || data.matrix === null) {
+    if (data === null || typeof data !== 'object' || !isRecord(data.matrix)) {
       throw new ConnectorError({
         message: 'HERE Matrix retrieve missing matrix payload',
         statusCode: response.status,
@@ -376,27 +421,23 @@ export class HereMatrixConnector
 
     // HERE lays out the flat travelTimes/distances arrays row-major by the
     // dimensions IT returns, so index with the vendor's numDestinations as the
-    // row stride. NOTE (loc-CR #34/#62/#98, 2026-05-29): when HERE de-dupes /
-    // region-clamps and its destination count differs from the request, a flat
-    // stride cannot recover the true request↔vendor index mapping — resolving
-    // that correctly needs the HERE response contract and is DEFERRED to a
-    // follow-up rather than guessed here.
+    // row stride. When HERE de-dupes / region-clamps and its destination count
+    // differs from the request, a flat stride cannot recover the true
+    // request↔vendor index mapping; nothing in HERE's documented response
+    // carries that mapping, so it is not guessed here.
     const stride =
       typeof numDestinations === 'number' && numDestinations > 0
         ? numDestinations
         : destCount;
 
-    // LOC-CP-1 (loc-CR #79/#85/#99): verify the flat travelTimes/distances
-    // arrays are long enough to cover every (origin, destination) index BEFORE
-    // flattening. The highest index read below is `(originCount - 1) * stride +
-    // (destCount - 1)`, so each array must hold at least that many + 1 entries.
-    // A short/sparse vendor payload (HERE omitting unreachable entries, or a
-    // truncated array) would otherwise be silently zero-filled by the `?? 0`
-    // cell reads — returning WRONG cells with no signal. We surface a typed
-    // ConnectorError instead (mirrors the missing-matrix-payload guard above).
-    // This does NOT attempt to recover the request↔vendor index mapping when
-    // HERE de-dupes/region-clamps (still deferred per #34/#62/#98 note above) —
-    // it only rejects payloads too short to flatten safely. No
+    // Verify the flat travelTimes/distances arrays are long enough to cover
+    // every (origin, destination) index BEFORE flattening. The highest index
+    // read below is `(originCount - 1) * stride + (destCount - 1)`, so each
+    // array must hold at least that many + 1 entries. A short/sparse vendor
+    // payload (HERE omitting unreachable entries, or a truncated array) would
+    // otherwise yield WRONG cells with no signal. This does not recover the
+    // request↔vendor index mapping when HERE de-dupes/region-clamps (see
+    // above) — it only rejects payloads too short to flatten safely. No
     // 'invalid_response' ProviderCode exists in error.types.ts; 'unknown' is
     // the closest existing value for a malformed provider body.
     const expectedLength =
@@ -404,15 +445,17 @@ export class HereMatrixConnector
         ? (originCount - 1) * stride + destCount
         : 0;
     if (
-      (travelTimes?.length ?? 0) < expectedLength ||
-      (distances?.length ?? 0) < expectedLength
+      !Array.isArray(travelTimes) ||
+      !Array.isArray(distances) ||
+      travelTimes.length < expectedLength ||
+      distances.length < expectedLength
     ) {
       const message =
         `HERE Matrix returned arrays too short for the requested ` +
         `${originCount}×${destCount} dimensions (stride ${stride})`;
       throw new ConnectorError({
         message,
-        statusCode: null,
+        statusCode: response.status,
         providerCode: 'unknown',
         providerMessage: message,
         cause: data,
@@ -432,59 +475,23 @@ export class HereMatrixConnector
         if (errorCode !== undefined && errorCode !== 0 && errorCode !== 3) {
           continue;
         }
-        const cell: IMatrixCell = {
-          originIndex: oi,
-          destinationIndex: di,
-          durationSeconds: travelTimes?.[index] ?? 0,
-          distanceMeters: distances?.[index] ?? 0,
-        };
-        cells.push(cell);
+        const durationSeconds: unknown = travelTimes[index];
+        const distanceMeters: unknown = distances[index];
+        // A usable cell (error code 0/3 or none) must carry both numbers; a
+        // null there is a body we cannot read, never a 0 m / 0 s cell.
+        if (!isFiniteNumber(durationSeconds) || !isFiniteNumber(distanceMeters)) {
+          throw malformedResponseError(
+            'HERE Matrix',
+            `cell ${oi}→${di} is not a number`,
+            response.status,
+            data,
+          );
+        }
+        cells.push({ originIndex: oi, destinationIndex: di, durationSeconds, distanceMeters });
       }
     }
 
     return { cells, raw: data };
-  }
-
-  /**
-   * Connector-local GET for the async poll + retrieve steps. Unlike
-   * {@link BaseConnector.sendGet} — which forces `redirect: 'error'` so a
-   * redirect never silently re-sends auth to the target — this uses
-   * `redirect: 'manual'` so HERE's async redirects are OBSERVABLE (status +
-   * `Location` header readable) instead of surfacing as a thrown network error.
-   * Both HERE async hops are `303 See Other`: the poll completion redirects to
-   * the resultUrl, and the resultUrl redirects to a pre-signed S3 object URL.
-   * `manual` does NOT follow the redirect, so this connector decides — per hop —
-   * whether to attach the apiKey (only to validated hereapi.com hosts) before
-   * fetching the next URL. Mirrors the base transport's error sanitization (a
-   * leaky BYO-fetch message could embed the key-bearing URL, so it is never
-   * propagated verbatim). Kept local per the per-connector-locality invariant.
-   */
-  private async hereGet(
-    url: string,
-    options?: {
-      query?: Record<string, string>;
-      headers?: Record<string, string>;
-    },
-  ): Promise<Response> {
-    const qs = options?.query
-      ? new URLSearchParams(options.query).toString()
-      : '';
-    const separator = url.includes('?') ? '&' : '?';
-    const finalUrl = qs.length === 0 ? url : `${url}${separator}${qs}`;
-    try {
-      return await this.fetchImpl(finalUrl, {
-        method: 'GET',
-        redirect: 'manual',
-        headers: options?.headers,
-      });
-    } catch (err) {
-      throw new ConnectorError({
-        message: 'Network request failed',
-        statusCode: null,
-        providerCode: 'provider_unavailable',
-        cause: { raw: { name: (err as Error)?.name } },
-      });
-    }
   }
 
   /**
@@ -555,23 +562,6 @@ export class HereMatrixConnector
     } catch {
       return null;
     }
-  }
-
-  /**
-   * Resolve the polling deadline (ms). Honors
-   * `options._passthrough.body.timeoutMs` when present and positive,
-   * else falls back to 60 s default.
-   */
-  private resolveDeadlineMs(options: IMatrixOptions): number {
-    const raw = options._passthrough?.body?.timeoutMs;
-    if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
-      return raw;
-    }
-    if (typeof raw === 'string') {
-      const parsed = parseInt(raw, 10);
-      if (Number.isFinite(parsed) && parsed > 0) return parsed;
-    }
-    return POLL_DEFAULT_DEADLINE_MS;
   }
 
   /**

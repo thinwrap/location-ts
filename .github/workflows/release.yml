@@ -8,8 +8,8 @@ name: Publish to npm
 # trusted publishing means no NPM_TOKEN is consumed. The npm trusted publisher
 # for @thinwrap/location must reference THIS filename (release.yml).
 #
-# Trigger: push of a `v*.*.*` tag to any branch (branch protection on `main`
-# ensures the tag's commit is on a protected branch).
+# Trigger: push of a `v*.*.*` tag. Branch protection does not cover tags, so
+# the job refuses to publish unless the tagged commit is on `main`.
 
 on:
   push:
@@ -29,13 +29,27 @@ jobs:
     name: publish @thinwrap/location
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0    # full history for the on-main ancestry check
 
-      - uses: actions/setup-node@v6
+      # Tags bypass branch protection; without this, a tag on any commit
+      # (for example on an unmerged branch) would publish to npm.
+      - name: Verify the tagged commit is on main
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tagged commit $GITHUB_SHA is not on main; refusing to publish."
+            exit 1
+          fi
+          echo "Tagged commit $GITHUB_SHA is on main."
+
+      # No `cache: npm` here: the cache is shared with every run on main, so a
+      # poisoned entry would flow into the build that gets signed with provenance.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
-          cache: npm
 
       # OIDC trusted publishing requires npm >= 11.5.1; Node 20 bundles npm 10.
       # Pinned to 11.x because npm@latest is now 12.x, which requires Node >= 22.22

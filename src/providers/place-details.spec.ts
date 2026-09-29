@@ -67,9 +67,9 @@ describe('placeDetails — endpoints and normalization', () => {
     });
 
     expect(urlOf()).toContain('https://places.googleapis.com/v1/places/ChIJ1');
-    expect(result.candidate.location).toEqual({ lat: 37.7825, lng: -122.4059 });
-    expect(result.candidate.placeId).toBe('ChIJ1');
-    expect(result.candidate.viewport).toEqual({
+    expect(result.candidate!.location).toEqual({ lat: 37.7825, lng: -122.4059 });
+    expect(result.candidate!.placeId).toBe('ChIJ1');
+    expect(result.candidate!.viewport).toEqual({
       southwest: { lat: 37.78, lng: -122.41 },
       northeast: { lat: 37.79, lng: -122.4 },
     });
@@ -91,7 +91,32 @@ describe('placeDetails — endpoints and normalization', () => {
 
     expect(urlOf()).toContain('https://lookup.search.hereapi.com/v1/lookup');
     expect(queryOf().get('id')).toBe('here:pds:place:1');
-    expect(result.candidate.location).toEqual({ lat: 52.5163, lng: 13.3777 });
+    expect(result.candidate!.location).toEqual({ lat: 52.5163, lng: 13.3777 });
+    // The address is `address.label`; the POI title is the place's name.
+    expect(result.candidate!.formattedAddress).toBe('Pariser Platz, 10117 Berlin');
+  });
+
+  it('HERE lookup puts the title in name and address.label in formattedAddress', async () => {
+    mockFetch.mockResolvedValueOnce(
+      resp({
+        title: 'Empire State Building',
+        id: 'here:pds:place:esb',
+        address: {
+          label: 'Empire State Building, 20 W 34th St, New York, NY 10118, United States',
+        },
+        position: { lat: 40.74844, lng: -73.98566 },
+      }),
+    );
+
+    const result = await new HereGeocodingConnector({ apiKey: 'k' }).placeDetails({
+      placeId: 'here:pds:place:esb',
+      include: ['name'],
+    });
+
+    expect(result.name).toBe('Empire State Building');
+    expect(result.candidate!.formattedAddress).toBe(
+      'Empire State Building, 20 W 34th St, New York, NY 10118, United States',
+    );
   });
 
   it('Mapbox GETs /searchbox/v1/retrieve/{id}', async () => {
@@ -117,7 +142,7 @@ describe('placeDetails — endpoints and normalization', () => {
     expect(urlOf()).toContain(
       'https://api.mapbox.com/search/searchbox/v1/retrieve/mb1',
     );
-    expect(result.candidate.location).toEqual({ lat: 37.7825, lng: -122.4059 });
+    expect(result.candidate!.location).toEqual({ lat: 37.7825, lng: -122.4059 });
   });
 
   // Google and Mapbox both bill Autocomplete/Search Box PER SESSION, closed by
@@ -188,7 +213,7 @@ describe('placeDetails — endpoints and normalization', () => {
 
     expect(urlOf()).toContain('https://api.tomtom.com/search/2/place.json');
     expect(queryOf().get('entityId')).toBe('tt1');
-    expect(result.candidate.location).toEqual({ lat: 52.36, lng: 4.885 });
+    expect(result.candidate!.location).toEqual({ lat: 52.36, lng: 4.885 });
   });
 
   // Live-verified: magicKey ALONE resolves. The docs pair it with SingleLine; the
@@ -212,7 +237,7 @@ describe('placeDetails — endpoints and normalization', () => {
     const q = queryOf();
     expect(q.get('magicKey')).toBe('mk-abc');
     expect(q.has('SingleLine')).toBe(false);
-    expect(result.candidate.location).toEqual({ lat: 52.36, lng: 4.885 });
+    expect(result.candidate!.location).toEqual({ lat: 52.36, lng: 4.885 });
   });
 });
 
@@ -328,13 +353,14 @@ describe('placeDetails — the `name` opt-in', () => {
     });
 
     expect(result.name).toBeUndefined();
-    expect(result.candidate.formattedAddress).toBe('Amsterdam');
+    expect(result.candidate!.formattedAddress).toBe('Amsterdam');
   });
 });
 
 describe('placeDetails — Mapbox session billing', () => {
   // Search Box bills per SESSION: suggest + retrieve with the SAME token is one
-  // billable session, a missing or fresh token makes it two.
+  // billable session. `session_token` is REQUIRED on /retrieve, so a missing
+  // token is replaced by a generated UUIDv4 (a session of its own).
   it('forwards sessionToken as session_token', async () => {
     mockFetch.mockResolvedValueOnce(
       resp({
@@ -352,7 +378,7 @@ describe('placeDetails — Mapbox session billing', () => {
     expect(queryOf().get('session_token')).toBe('sess-123');
   });
 
-  it('omits session_token entirely when none is given', async () => {
+  it('sends a generated UUIDv4 session_token when none is given', async () => {
     mockFetch.mockResolvedValueOnce(
       resp({
         features: [
@@ -365,53 +391,152 @@ describe('placeDetails — Mapbox session billing', () => {
       placeId: 'mb1',
     });
 
-    // Not sent as an empty string, which Mapbox would treat as a new session.
-    expect(queryOf().has('session_token')).toBe(false);
+    expect(queryOf().get('session_token')).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+  });
+
+  it('lets _passthrough.query.session_token win over the typed sessionToken', async () => {
+    mockFetch.mockResolvedValueOnce(
+      resp({
+        features: [
+          { geometry: { coordinates: [2, 1] }, properties: { mapbox_id: 'mb1' } },
+        ],
+      }),
+    );
+
+    await new MapboxGeocodingConnector({ accessToken: 'pk' }).placeDetails({
+      placeId: 'mb1',
+      sessionToken: 'typed',
+      _passthrough: { query: { session_token: 'from-passthrough' } },
+    });
+
+    expect(queryOf().get('session_token')).toBe('from-passthrough');
   });
 });
 
 describe('placeDetails — no usable result', () => {
+  // A place id that no longer resolves (places close, ids expire) is an answer,
+  // not a failure: the candidate is null — never a fabricated (0,0) — and `raw`
+  // still carries what the vendor said.
   it.each([
     [
-      'Google',
+      'Google (place without a location)',
+      () =>
+        new GoogleGeocodingConnector({ apiKey: 'k' }).placeDetails({ placeId: 'p', include: ['name'] }),
+      resp({ id: 'p', formattedAddress: 'x', displayName: { text: 'Gone' } }),
+    ],
+    [
+      'Google (404 NOT_FOUND)',
       () => new GoogleGeocodingConnector({ apiKey: 'k' }).placeDetails({ placeId: 'p' }),
-      { id: 'p', formattedAddress: 'x' },
+      resp({ error: { code: 404, message: 'Place not found', status: 'NOT_FOUND' } }, 404),
     ],
     [
-      'HERE',
+      'HERE (item without a position)',
+      () =>
+        new HereGeocodingConnector({ apiKey: 'k' }).placeDetails({ placeId: 'h', include: ['name'] }),
+      resp({ title: 'x', id: 'h' }),
+    ],
+    [
+      'HERE (lookup 404)',
       () => new HereGeocodingConnector({ apiKey: 'k' }).placeDetails({ placeId: 'h' }),
-      { title: 'x', id: 'h' },
+      resp({ status: 404, title: 'Requested id could not be found.' }, 404),
     ],
     [
-      'Mapbox',
+      'Mapbox (no feature)',
       () =>
         new MapboxGeocodingConnector({ accessToken: 'pk' }).placeDetails({ placeId: 'm' }),
-      { features: [] },
+      resp({ features: [] }),
     ],
     [
-      'TomTom',
+      'Mapbox (feature without coordinates)',
+      () =>
+        new MapboxGeocodingConnector({ accessToken: 'pk' }).placeDetails({ placeId: 'm', include: ['name'] }),
+      resp({ features: [{ properties: { mapbox_id: 'm', name: 'Gone' } }] }),
+    ],
+    [
+      'TomTom (no result)',
       () => new TomTomGeocodingConnector({ apiKey: 'k' }).placeDetails({ placeId: 't' }),
-      { results: [] },
+      resp({ results: [] }),
     ],
     [
-      'Esri',
+      'Esri (no candidate)',
       () => new EsriGeocodingConnector({ apiKey: 'k' }).placeDetails({ placeId: 'e' }),
-      { candidates: [] },
+      resp({ candidates: [] }),
     ],
-  ])('%s raises no_route rather than a (0,0) candidate', async (_p, run, body) => {
-    mockFetch.mockResolvedValueOnce(resp(body));
+    [
+      'Mapbox (retrieve 404)',
+      () =>
+        new MapboxGeocodingConnector({ accessToken: 'pk' }).placeDetails({ placeId: 'm' }),
+      resp({ message: { error: 'No data found for requested ID' } }, 404),
+    ],
+  ])('%s returns a null candidate with the vendor body in raw', async (_p, run, response) => {
+    const body = (await response.clone().json()) as unknown;
+    mockFetch.mockResolvedValueOnce(response);
 
-    const err = await run().then(
-      () => {
-        throw new Error('expected a ConnectorError');
-      },
-      (e: unknown) => e as ConnectorError,
-    );
+    const result = await run();
 
-    expect(err).toBeInstanceOf(ConnectorError);
-    expect(err.providerCode).toBe('no_route');
-    // Above all: no fabricated Null-Island coordinate reached the caller.
-    expect(err.message).not.toContain('0,0');
+    expect(result.candidate).toBeNull();
+    expect(result.name).toBeUndefined();
+    expect(result.raw).toEqual(body);
+  });
+
+  // A malformed id the vendor rejects as invalid is still the caller's mistake.
+  it.each([
+    [
+      'Google 400 INVALID_ARGUMENT',
+      () => new GoogleGeocodingConnector({ apiKey: 'k' }).placeDetails({ placeId: 'bad' }),
+      resp({ error: { code: 400, message: 'Not a valid Place ID: bad', status: 'INVALID_ARGUMENT' } }, 400),
+    ],
+    [
+      'HERE 400',
+      () => new HereGeocodingConnector({ apiKey: 'k' }).placeDetails({ placeId: 'bad' }),
+      resp({ status: 400, title: 'Illegal input for parameter id' }, 400),
+    ],
+    // Live: Places v1 answers a well-formed but unknown id with this too.
+    [
+      'Google 400 "not valid" for an unknown id',
+      () => new GoogleGeocodingConnector({ apiKey: 'k' }).placeDetails({ placeId: 'ChIJunknown' }),
+      resp({ error: { code: 400, message: 'The provided Place ID: ChIJunknown is not valid.', status: 'INVALID_ARGUMENT' } }, 400),
+    ],
+    [
+      'Esri magicKey from an earlier release',
+      () => new EsriGeocodingConnector({ apiKey: 'k' }).placeDetails({ placeId: 'stale' }),
+      resp({
+        error: {
+          code: 400,
+          message: 'Unable to complete operation.',
+          details: ['MagicKey was not generated from the current release and is no longer valid'],
+        },
+      }),
+    ],
+    [
+      'Esri invalid magicKey',
+      () => new EsriGeocodingConnector({ apiKey: 'k' }).placeDetails({ placeId: 'bad' }),
+      resp({
+        error: {
+          code: 400,
+          message: 'Unable to complete operation.',
+          details: ['magicKey entered is invalid'],
+        },
+      }),
+    ],
+  ])('%s stays invalid_request', async (_p, run, response) => {
+    mockFetch.mockResolvedValueOnce(response);
+    await expect(run()).rejects.toMatchObject({ providerCode: 'invalid_request' });
+  });
+
+  it('a Google 404 without a Places envelope is still "not found"', async () => {
+    mockFetch.mockResolvedValueOnce(new Response('', { status: 404 }));
+    const result = await new GoogleGeocodingConnector({ apiKey: 'k' }).placeDetails({ placeId: 'p' });
+    expect(result.candidate).toBeNull();
+  });
+
+  it('an unparseable 2xx body stays an unknown error rather than "not found"', async () => {
+    mockFetch.mockResolvedValueOnce(new Response('not json', { status: 200 }));
+    await expect(
+      new TomTomGeocodingConnector({ apiKey: 'k' }).placeDetails({ placeId: 't' }),
+    ).rejects.toBeInstanceOf(ConnectorError);
   });
 });
 
@@ -428,7 +553,7 @@ describe('placeDetails — facade', () => {
     const geocoding = new Geocoding('google', { apiKey: 'k' });
     const result = await geocoding.placeDetails({ placeId: 'p1' });
 
-    expect(result.candidate.location).toEqual({ lat: 1, lng: 2 });
+    expect(result.candidate!.location).toEqual({ lat: 1, lng: 2 });
   });
 
   // The `placeDetails?` optionality on IGeocodingConnector exists so adding the

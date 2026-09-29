@@ -11,12 +11,23 @@ import { ConnectorError } from '../../types';
 import {
   encodePolyline,
   invertWaypointPositions,
+  isFiniteNumber,
+  isRecord,
+  malformedResponseError,
   mergePassthrough,
+  optionalArray,
 } from '../../utils';
+import { validateRoutingOptions } from '../../utils/validate-options';
 import { assertFiniteCoordinate } from '../../utils/coordinate';
+import { isTrafficRequested } from '../../utils/traffic';
 import type { EsriConfig } from './esri.config';
 import { resolveEsriBearerToken } from './esri.config';
-import { mapEsriTravelMode, esriTimeAttributeFor } from './esri.travel-modes';
+import {
+  ESRI_ROUTING_ACCUMULATE_ATTRIBUTES_DRIVING,
+  ESRI_ROUTING_ACCUMULATE_ATTRIBUTES_WALKING,
+} from './esri.defaults';
+import { esriTimeAttributeFor, esriTravelModeForm } from './esri.travel-modes';
+import { esriEpochMillis } from './esri.time';
 import type {
   EsriRouteFeatureAttributes,
   EsriRouteResponse,
@@ -48,11 +59,10 @@ const METERS_PER_MILE = 1609.344;
  *
  * Polyline rebuilding is inline: `routes.features[0].geometry.paths` arrives
  * as `[[[lng, lat], ...]]` (ESRI lng-first, NOT polyline-encoded). We flatMap
- * to `LatLng[]` and re-encode via {@link encodePolyline} (Google precision-5
- *). locked this call-site shape.
+ * to `LatLng[]` and re-encode via {@link encodePolyline} (Google precision-5).
  *
- * Token lifecycle (~120 min for `arcgisToken`) is consumer-owned (the wrapper holds no state); documented in the per-connector README
- *
+ * Token lifecycle (~120 min for `arcgisToken`) is consumer-owned (the wrapper
+ * holds no state); documented in the per-connector README.
  */
 export class EsriRoutingConnector
   extends BaseConnector
@@ -65,6 +75,7 @@ export class EsriRoutingConnector
   }
 
   async route(options: IRoutingOptions): Promise<IRoutingResult> {
+    validateRoutingOptions(options, 'ESRI Routing');
     const waypoints = options.waypoints;
     if (waypoints.length < 2) {
       throw new ConnectorError({
@@ -80,7 +91,12 @@ export class EsriRoutingConnector
     // Legs come from the `stops` cumulative costs rather than the `directions`
     // output: Esri documents that output as superseded, and its `esriDMT*` maneuver
     // values are not enumerated in the REST reference at all.
-    const timeAttribute = esriTimeAttributeFor(options.travelMode);
+    // Selected by the same rule as the travel mode itself (`esriTimeAttributeFor`),
+    // so the accumulated time attribute always matches the active impedance.
+    const accumulate =
+      esriTimeAttributeFor(options.travelMode) === 'WalkTime'
+        ? ESRI_ROUTING_ACCUMULATE_ATTRIBUTES_WALKING
+        : ESRI_ROUTING_ACCUMULATE_ATTRIBUTES_DRIVING;
     const form: Record<string, string> = {
       f: 'json',
       token: resolveEsriBearerToken(this.config),
@@ -91,10 +107,15 @@ export class EsriRoutingConnector
       // ships the whole turn-by-turn payload.
       returnDirections: 'false',
       // Produces the `Cumul_<attr>` fields; no `impedanceAttributeName` required.
-      accumulateAttributeNames: `${timeAttribute},Kilometers`,
+      accumulateAttributeNames: accumulate.join(','),
       // Only `paths` is read; the `...WithMeasure` variant adds an m-value per point.
       outputLines: 'esriNAOutputLineTrueShape',
       outSR: '4326',
+      // The service default (`true`) silently drops a stop it cannot snap to the
+      // network and routes through the rest — a route that skips a requested
+      // waypoint. `false` makes it fail with the in-body "unlocated" error that
+      // `mapVendorError` classifies as `no_route`.
+      ignoreInvalidLocations: 'false',
     };
 
     // ESRI findBestSequence optimizes an OPEN route (optionally preserving the
@@ -110,29 +131,44 @@ export class EsriRoutingConnector
       });
     }
 
-    if (options.optimize === true) {
+    const optimize = wantsOptimization(options);
+    if (optimize) {
       form.findBestSequence = 'true';
-      if (options.optimizeFixedOrigin === true) {
-        form.preserveFirstStop = 'true';
-      }
-      if (options.optimizeFixedDestination === true) {
-        form.preserveLastStop = 'true';
-      }
+      // Both preserve flags are always sent: `findBestSequence` defaults BOTH to
+      // true (live: order [0,1,2,3] with neither sent, [2,3,0,1] with both
+      // false), so a single fixed end is only honoured by freeing the other one
+      // explicitly. Neither or both fixed keeps both ends, matching plain
+      // `optimize` on every other provider.
+      const fixedOrigin = options.optimizeFixedOrigin === true;
+      const fixedDestination = options.optimizeFixedDestination === true;
+      const onlyOneFixed = fixedOrigin !== fixedDestination;
+      form.preserveFirstStop = !onlyOneFixed || fixedOrigin ? 'true' : 'false';
+      form.preserveLastStop = !onlyOneFixed || fixedDestination ? 'true' : 'false';
     }
 
-    const travelMode = mapEsriTravelMode(options.travelMode, 'Routing');
-    if (travelMode !== undefined) {
-      form.travelMode = travelMode;
-    }
+    Object.assign(
+      form,
+      esriTravelModeForm(options.travelMode, 'Routing', buildRestrictions(options)),
+    );
 
-    const restrictions = buildRestrictions(options);
-    if (restrictions !== '') {
-      form.restrictionAttributeNames = restrictions;
-    }
-
-    if (options.departureTime) {
-      // ESRI accepts epoch milliseconds for `startTime`.
-      form.startTime = String(options.departureTime.getTime());
+    // Esri applies traffic whenever a start time is sent: `now` means live
+    // traffic, an explicit time means historical (typical) traffic for that
+    // time. With no start time it uses "static road speeds based on average
+    // historical speeds or posted speed limits" — the time-independent model
+    // `'none'` promises — so under `'none'` the time is never sent, and with
+    // traffic but no time `now` is sent (Esri otherwise solves without traffic).
+    // Validated even when dropped: an invalid Date is a caller bug either way.
+    // A passthrough `startTime` still wins (merged below).
+    const startTime =
+      options.departureTime !== undefined
+        ? esriEpochMillis(options.departureTime, 'Routing')
+        : undefined;
+    if (isTrafficRequested(options.trafficMode)) {
+      form.startTime = startTime ?? 'now';
+      // Epoch milliseconds are a UTC instant; without `startTimeIsUTC` ESRI
+      // reads them in the first stop's local time zone. Esri forces it to true
+      // for `now`, so sending it there too is harmless.
+      form.startTimeIsUTC = 'true';
     }
 
     // Body merge (form fields) + headers merge + query merge. Passthrough.body
@@ -197,8 +233,12 @@ export class EsriRoutingConnector
     status: number,
     options: IRoutingOptions,
   ): IRoutingResult {
-    const feature = data.routes?.features?.[0];
-    if (!feature) {
+    const features = optionalArray(isRecord(data.routes) ? data.routes.features : undefined);
+    if (features === null) {
+      throw malformedResponseError('ESRI Routing', '`routes.features` is not a list', status, data);
+    }
+    const feature = features[0] as EsriRouteResponse['routes']['features'][number] | undefined;
+    if (feature === undefined) {
       // ESRI's OBSERVED no-route path is the in-body `error` envelope handled in
       // `route()` (an unlocated stop), not an empty featureset. This branch is
       // therefore a shape ESRI has not been seen to produce — classify it with
@@ -213,42 +253,63 @@ export class EsriRoutingConnector
       });
     }
 
-    const attrs: EsriRouteFeatureAttributes = feature.attributes ?? {};
+    if (!isRecord(feature)) {
+      throw malformedResponseError('ESRI Routing', 'the route feature is not an object', status, data);
+    }
+    const attrs: EsriRouteFeatureAttributes = isRecord(feature.attributes) ? feature.attributes : {};
 
     // Legs and totals share one source, so they always reconcile.
-    const cumulative = readCumulativeStopCosts(data.stops?.features);
+    const timeAttribute = esriTimeAttributeFor(options.travelMode);
+    const cumulative = readCumulativeStopCosts(data.stops?.features, timeAttribute);
 
     // Fallback: a stop that failed to locate carries no cumulative cost, and a
     // service configured without the accumulate attributes returns none at all.
     const totalDistanceMeters =
       cumulative?.totalDistanceMeters ?? readRouteTotalDistanceMeters(attrs);
     const totalDurationSeconds =
-      cumulative?.totalDurationSeconds ?? readRouteTotalDurationSeconds(attrs);
+      cumulative?.totalDurationSeconds ?? readRouteTotalDurationSeconds(attrs, timeAttribute);
+    // Neither source carried the cost: reporting 0 m / 0 s would be a plausible,
+    // silently wrong route.
+    if (totalDistanceMeters === null || totalDurationSeconds === null) {
+      throw malformedResponseError(
+        'ESRI Routing',
+        'no cumulative stop costs and no route totals',
+        status,
+        data,
+      );
+    }
 
     const legs =
       cumulative?.legs ??
       evenSplitLegs(waypoints.length, totalDistanceMeters, totalDurationSeconds);
 
-    // Inline paths → LatLng[] → precision-5 polyline (inline
-    // replacement). ESRI `paths` is `[[[lng, lat], ...]]`.
-    const allPoints: LatLng[] = (feature.geometry?.paths ?? []).flatMap(
-      (path) =>
-        path
-          .filter(
-            (point): point is number[] =>
-              Array.isArray(point) && point.length >= 2,
-          )
-          .map(([lng, lat]) => ({ lat: lat as number, lng: lng as number })),
-    );
+    // ESRI `paths` is `[[[lng, lat], ...]]` → LatLng[] → precision-5 polyline.
+    // A point missing a coordinate is a body we cannot read, never a (0,0) or
+    // silently dropped vertex.
+    const paths = optionalArray(feature.geometry?.paths);
+    if (paths === null) {
+      throw malformedResponseError('ESRI Routing', '`geometry.paths` is not a list', status, data);
+    }
+    const allPoints: LatLng[] = [];
+    for (const path of paths) {
+      if (!Array.isArray(path)) {
+        throw malformedResponseError('ESRI Routing', 'a path is not a list', status, data);
+      }
+      for (const point of path) {
+        if (!Array.isArray(point) || !isFiniteNumber(point[0]) || !isFiniteNumber(point[1])) {
+          throw malformedResponseError('ESRI Routing', 'a path point has no x/y', status, data);
+        }
+        allPoints.push({ lat: point[1], lng: point[0] });
+      }
+    }
     const polyline = encodePolyline(allPoints);
 
     // Optimized routes only. Stops are always fetched now, so without this gate an
     // unoptimized route would report a useless identity permutation. Emitting an
     // ordering for unoptimized calls is a separate decision, for all six providers.
-    const waypointOrder =
-      options.optimize === true
-        ? extractWaypointOrder(data.stops?.features, waypoints.length)
-        : undefined;
+    const waypointOrder = wantsOptimization(options)
+      ? extractWaypointOrder(data.stops?.features, waypoints.length)
+      : undefined;
 
     return {
       legs,
@@ -385,12 +446,20 @@ function buildStopsFeatureSet(waypoints: LatLng[]): {
   };
 }
 
-function buildRestrictions(options: IRoutingOptions): string {
+function buildRestrictions(options: IRoutingOptions): string[] {
   const restrictions: string[] = [];
   if (options.avoidTolls) restrictions.push('Avoid Toll Roads');
   if (options.avoidFerries) restrictions.push('Avoid Ferries');
   if (options.avoidHighways) restrictions.push('Avoid Limited Access Roads');
-  return restrictions.join(',');
+  return restrictions;
+}
+
+function wantsOptimization(options: IRoutingOptions): boolean {
+  return (
+    options.optimize === true ||
+    options.optimizeFixedOrigin === true ||
+    options.optimizeFixedDestination === true
+  );
 }
 
 function stringifyFormValue(value: unknown): string {
@@ -414,7 +483,9 @@ function stringifyFormValue(value: unknown): string {
  *    they must be sorted by `Sequence`. Without it an optimized route yields
  *    negative legs.
  * 2. The field name carries the active impedance — `Cumul_TravelTime` driving,
- *    `Cumul_WalkTime` walking — so the keys are discovered, not hardcoded.
+ *    `Cumul_WalkTime` walking — so the time key is chosen from `timeAttribute`
+ *    (the attribute this request accumulated), with shape-based discovery as the
+ *    fallback when a caller replaced the accumulate list.
  *
  * Returns `null` when the values are unusable: fewer than two stops, a stop that
  * failed to locate (`Status != 0` carries no cumulative cost), a non-monotonic
@@ -422,6 +493,7 @@ function stringifyFormValue(value: unknown): string {
  */
 function readCumulativeStopCosts(
   features: Array<{ attributes: EsriStopFeatureAttributes }> | undefined,
+  timeAttribute: string,
 ):
   | { legs: IRoutingLeg[]; totalDistanceMeters: number; totalDurationSeconds: number }
   | null {
@@ -429,14 +501,23 @@ function readCumulativeStopCosts(
 
   // Sequence is 1-based; sorting by it puts the stops in route order.
   const ordered = features
-    .map((f) => f.attributes ?? {})
+    .map((f): EsriStopFeatureAttributes => (isRecord(f) && isRecord(f.attributes) ? f.attributes : {}))
     .filter((a) => typeof a.Sequence === 'number')
     .sort((a, b) => (a.Sequence as number) - (b.Sequence as number));
   if (ordered.length !== features.length || ordered.length < 2) return null;
 
+  // A caller may append to `accumulateAttributeNames`, adding more `Cumul_*`
+  // columns (a second distance such as `Miles`, or another time attribute). So
+  // the time column is the one for the active impedance when present, and a
+  // distance column is never mistaken for it.
   const keys = Object.keys(ordered[0]!).filter((k) => k.startsWith('Cumul_'));
-  const distanceKey = keys.find((k) => /Kilometers|Miles$/.test(k));
-  const timeKey = keys.find((k) => k !== distanceKey);
+  const isDistance = (k: string): boolean => /Kilometers|Miles$/.test(k);
+  const distanceKey = keys.includes('Cumul_Kilometers')
+    ? 'Cumul_Kilometers'
+    : keys.find(isDistance);
+  const timeKey = keys.includes(`Cumul_${timeAttribute}`)
+    ? `Cumul_${timeAttribute}`
+    : keys.find((k) => !isDistance(k));
   if (distanceKey === undefined || timeKey === undefined) return null;
 
   const toMeters = distanceKey.endsWith('Miles') ? METERS_PER_MILE : 1000;
@@ -470,33 +551,41 @@ function readCumulativeStopCosts(
 }
 
 /**
- * The route's total distance in meters. Matched by shape, because the attribute is
- * suffixed with the active distance attribute (`Total_Kilometers` / `Total_Miles`)
- * and this service emits no `Total_Length`.
+ * The route's total distance in meters, or `null` when there is none. Matched by
+ * shape, because the attribute is suffixed with the active distance attribute
+ * (`Total_Kilometers` / `Total_Miles`) and this service emits no `Total_Length`.
  */
-function readRouteTotalDistanceMeters(attrs: EsriRouteFeatureAttributes): number {
+function readRouteTotalDistanceMeters(attrs: EsriRouteFeatureAttributes): number | null {
   if (typeof attrs.Total_Length === 'number') return attrs.Total_Length;
   if (typeof attrs.Total_Kilometers === 'number') return attrs.Total_Kilometers * 1000;
   const record = attrs as Record<string, unknown>;
   const miles = record.Total_Miles;
   if (typeof miles === 'number') return miles * METERS_PER_MILE;
-  return 0;
+  return null;
 }
 
 /**
- * The route's total duration in seconds. Same shape-based match: any `Total_*` that
+ * The route's total duration in seconds, or `null` when there is none. Same
+ * shape-based match: any `Total_*` that
  * is not a distance attribute is the time one, in minutes (`Total_TravelTime`
  * driving, `Total_WalkTime` walking, `Total_TruckTravelTime` for a truck mode).
  */
-function readRouteTotalDurationSeconds(attrs: EsriRouteFeatureAttributes): number {
+function readRouteTotalDurationSeconds(
+  attrs: EsriRouteFeatureAttributes,
+  timeAttribute: string,
+): number | null {
   if (typeof attrs.Total_Time === 'number') return attrs.Total_Time * MINUTES_TO_SECONDS;
   const record = attrs as Record<string, unknown>;
+  // The active impedance's total wins over any other time total a caller's
+  // appended accumulate attribute adds.
+  const own = record[`Total_${timeAttribute}`];
+  if (typeof own === 'number') return own * MINUTES_TO_SECONDS;
   for (const [key, value] of Object.entries(record)) {
     if (!key.startsWith('Total_')) continue;
     if (/Kilometers|Miles|Length/.test(key)) continue;
     if (typeof value === 'number') return value * MINUTES_TO_SECONDS;
   }
-  return 0;
+  return null;
 }
 
 /** Even split of the totals, used when per-stop cumulative costs are unavailable. */

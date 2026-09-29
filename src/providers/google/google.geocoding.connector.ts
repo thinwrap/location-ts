@@ -14,9 +14,15 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
-import { mergePassthrough } from '../../utils';
-import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
+import { isRecord, malformedResponseError, mergePassthrough, optionalArray } from '../../utils';
+import { validatePlaceDetailsOptions } from '../../utils/validate-options';
+import { assertFiniteCoordinate, assertFiniteNumber, formatCoord } from '../../utils/coordinate';
 import type { GoogleConfig } from './google.config';
+import {
+  GOOGLE_PLACE_DETAILS_FIELD_MASK,
+  GOOGLE_PLACE_DETAILS_FIELD_MASK_NAME,
+} from './google.defaults';
+import { mapGoogleReason, readGoogleErrorReason } from './google.error-reason';
 import type {
   GoogleGeocodeResponse,
   GooglePlacesAutocompleteNewResponse,
@@ -31,9 +37,8 @@ const PLACES_AUTOCOMPLETE_NEW_URL =
  * Google Geocoding + Places Autocomplete NEW connector.
  *
  * - Forward/reverse geocode → `GET https://maps.googleapis.com/maps/api/geocode/json`
- *   with `key=` query auth. `countryFilter` translates mechanically into
- * Google's `components=country:XX|country:YY` parameter (outlier per
- * translation lives in this connector, NOT in shared utils).
+ *   with `key=` query auth. A single-entry `countryFilter` becomes Google's
+ *   `components=country:XX`; more than one entry is refused (see `geocode`).
  * - Autocomplete → `POST https://places.googleapis.com/v1/places:autocomplete`
  *   (Places Autocomplete NEW API) with `X-Goog-Api-Key` header auth and a JSON
  *   body. Different host + auth than the legacy `/place/autocomplete/json`.
@@ -73,6 +78,19 @@ export class GoogleGeocodingConnector
         }
       }
     }
+    // `components` filters are ANDed, not ORed: live, `country:US|country:CA`
+    // applies only the first country and pads the answer with junk (Windsor →
+    // Windsor CT only; CA|US → Windsor ON only; Mississauga + US|CA → [Mississauga
+    // ON, "United States" country fallback]). A multi-country filter cannot be
+    // honoured, so refuse it rather than silently apply one country.
+    if (options.countryFilter !== undefined && options.countryFilter.length > 1) {
+      throw new ConnectorError({
+        message: 'Google Geocoding does not support more than one countryFilter entry',
+        statusCode: null,
+        providerCode: 'unsupported_option',
+        providerMessage: `Google Geocoding applies only the first of several components=country: filters; pass a single countryFilter entry (received ${options.countryFilter.length})`,
+      });
+    }
     const components = options.countryFilter
       ?.map((code) => `country:${code}`)
       .join('|');
@@ -106,9 +124,7 @@ export class GoogleGeocodingConnector
     this.enforceGoogleStatus(response, body);
 
     return {
-      candidates: (body?.results ?? [])
-        .map((r) => normalizeCandidate(r))
-        .filter((c): c is IGeocodeCandidate => c !== null),
+      candidates: normalizeResultList(body, 'Google Geocoding', response.status),
       raw: body,
     };
   }
@@ -151,9 +167,7 @@ export class GoogleGeocodingConnector
 
     // reverse-geocode mirrors forward shape (`candidates[]`).
     return {
-      candidates: (body?.results ?? [])
-        .map((r) => normalizeCandidate(r))
-        .filter((c): c is IGeocodeCandidate => c !== null),
+      candidates: normalizeResultList(body, 'Google reverse-geocode', response.status),
       raw: body,
     };
   }
@@ -232,6 +246,8 @@ export class GoogleGeocodingConnector
       // Fail fast on NaN/non-finite coordinates before a network round-trip.
       // Out-of-range lat/lng passes through verbatim (thin-wrapper philosophy).
       assertFiniteCoordinate(options.location, 'Google autocomplete');
+      // JSON.stringify turns a NaN radius into `null`.
+      if (options.radius !== undefined) assertFiniteNumber(options.radius, 'Google autocomplete radius');
       const locationBias: Record<string, unknown> = {
         circle: {
           center: {
@@ -270,13 +286,32 @@ export class GoogleGeocodingConnector
         response,
         mapPlacesNewError(respBody),
         'Google Places autocomplete failed',
+        respBody,
       );
     }
 
+    if (!isRecord(respBody)) {
+      throw malformedResponseError(
+        'Google Places autocomplete',
+        'the body is not a JSON object',
+        response.status,
+        respBody,
+      );
+    }
+    const suggestions = optionalArray(respBody.suggestions);
+    if (suggestions === null) {
+      throw malformedResponseError(
+        'Google Places autocomplete',
+        '`suggestions` is not a list',
+        response.status,
+        respBody,
+      );
+    }
     const predictions: IAutocompletePrediction[] = [];
-    for (const s of respBody?.suggestions ?? []) {
+    for (const s of suggestions as NonNullable<GooglePlacesAutocompleteNewResponse['suggestions']>) {
+      if (!isRecord(s)) continue;
       const pred = s.placePrediction;
-      if (!pred) continue;
+      if (!isRecord(pred)) continue;
       const entry: IAutocompletePrediction = {
         description: pred.text?.text ?? '',
       };
@@ -324,7 +359,6 @@ export class GoogleGeocodingConnector
     });
   }
 
-  /** Build a `ConnectorError` for a non-2xx HTTP response. */
   /**
    * Resolve a Google `placeId` to a full candidate.
    *
@@ -343,14 +377,12 @@ export class GoogleGeocodingConnector
   async placeDetails(
     options: IPlaceDetailsOptions & { sessionToken?: string },
   ): Promise<IPlaceDetailsResult> {
+    validatePlaceDetailsOptions(options);
     const wantsName = options.include?.includes('name') === true;
 
     const fieldMask = [
-      'id',
-      'formattedAddress',
-      'location',
-      'viewport',
-      ...(wantsName ? ['displayName'] : []),
+      ...GOOGLE_PLACE_DETAILS_FIELD_MASK,
+      ...(wantsName ? GOOGLE_PLACE_DETAILS_FIELD_MASK_NAME : []),
     ].join(',');
 
     const headers: Record<string, string> = {
@@ -381,10 +413,21 @@ export class GoogleGeocodingConnector
     > | null;
 
     if (!response.ok) {
+      const envelope = mapPlacesNewError(body);
+      // Google answers an id it cannot resolve (a closed place, an expired id)
+      // with 404 `NOT_FOUND`: no place, not a failure. A malformed id is a 400
+      // `INVALID_ARGUMENT` and stays an error below.
+      if (
+        response.status === 404 &&
+        (envelope?.status === undefined || envelope.status === 'NOT_FOUND')
+      ) {
+        return { candidate: null, raw: body };
+      }
       throw this.toConnectorError(
         response,
-        mapPlacesNewError(body),
+        envelope,
         'Google Place Details failed',
+        body,
       );
     }
     if (body === null) {
@@ -401,14 +444,9 @@ export class GoogleGeocodingConnector
     const lat = location?.latitude;
     const lng = location?.longitude;
     if (typeof lat !== 'number' || typeof lng !== 'number') {
-      // Same rule as the geocode candidates: never fabricate a (0,0) location.
-      throw new ConnectorError({
-        message: 'Google Place Details returned no location',
-        statusCode: response.status,
-        providerCode: 'no_route',
-        providerMessage: 'Google Place Details returned no location',
-        cause: body,
-      });
+      // Same rule as the geocode candidates: a place without coordinates is no
+      // usable place, never a fabricated (0,0) one.
+      return { candidate: null, raw: body };
     }
 
     const candidate: IGeocodeCandidate = {
@@ -451,23 +489,36 @@ export class GoogleGeocodingConnector
     };
   }
 
+  /**
+   * Build a `ConnectorError` for a non-2xx HTTP response.
+   *
+   * `placesBody` is the undecoded Places (New) error envelope, when there is
+   * one. Its `google.rpc.ErrorInfo` reason wins over every status: Places
+   * answers an invalid key with HTTP 400 `INVALID_ARGUMENT` + reason
+   * `API_KEY_INVALID` (live), which the status mapping would misread as
+   * `invalid_request`.
+   */
   private toConnectorError(
     response: Response,
     body: { error_message?: string; status?: string } | null,
     fallbackMessage: string,
+    placesBody?: unknown,
   ): ConnectorError {
     const retryAfter = response.headers.get('retry-after');
     const cause =
       retryAfter !== null ? { ...(body ?? {}), retryAfter } : body;
+    const reasonCode = mapGoogleReason(readGoogleErrorReason(placesBody));
     return new ConnectorError({
       message: body?.error_message ?? `${fallbackMessage}: ${response.status}`,
       statusCode: response.status,
       // `mapVendorError` reads only the envelope status, which a destroyed body
       // cannot supply — so the status-only fallback would confidently return a
       // code it has no evidence for. Say `unknown` instead.
-      providerCode: isErrorBodyUnavailable(body)
-        ? 'unknown'
-        : this.mapVendorError(response.status, body?.status),
+      providerCode:
+        reasonCode ??
+        (isErrorBodyUnavailable(body)
+          ? 'unknown'
+          : this.mapVendorError(response.status, body?.status)),
       providerMessage: this.formatProviderMessage(
         body?.error_message ?? null,
         retryAfter,
@@ -478,16 +529,24 @@ export class GoogleGeocodingConnector
 
   /**
    * Map (HTTP status, in-body Google status) → canonical {@link ProviderCode}.
-   * + combine transport-layer status with Google's in-body
-   * `status` field.
+   * The in-body `status` wins: Geocoding reports its failures on HTTP 200.
    */
   private mapVendorError(
     httpStatus: number,
     googleStatus: string | undefined,
   ): ProviderCode {
+    // Google's Geocoding statuses, per its documented meanings:
+    // `OVER_DAILY_LIMIT` is a key/billing problem ("The API key is missing or
+    // invalid. Billing has not been enabled … A self-imposed usage cap has been
+    // exceeded. The provided method of payment is no longer valid") — fixed by
+    // the account owner, not by waiting — while `OVER_QUERY_LIMIT` is "over
+    // your quota". `UNKNOWN_ERROR` is "a server error. The request may succeed
+    // if you try again".
     if (googleStatus === 'REQUEST_DENIED') return 'auth_failed';
+    if (googleStatus === 'OVER_DAILY_LIMIT') return 'auth_failed';
     if (googleStatus === 'OVER_QUERY_LIMIT') return 'rate_limited';
     if (googleStatus === 'INVALID_REQUEST') return 'invalid_request';
+    if (googleStatus === 'UNKNOWN_ERROR') return 'provider_unavailable';
 
     if (httpStatus === 401) return 'auth_failed';
     if (httpStatus === 403) return 'auth_failed';
@@ -519,14 +578,34 @@ export class GoogleGeocodingConnector
 }
 
 /**
+ * The candidates of a geocode body whose status already passed
+ * `enforceGoogleStatus`. An absent `results` is Google's `ZERO_RESULTS` shape;
+ * a `results` that is not a list is a body we cannot read.
+ */
+function normalizeResultList(
+  body: GoogleGeocodeResponse | null,
+  label: string,
+  statusCode: number,
+): IGeocodeCandidate[] {
+  const results = optionalArray(body?.results);
+  if (results === null) {
+    throw malformedResponseError(label, '`results` is not a list', statusCode, body);
+  }
+  return results
+    .map((r) =>
+      isRecord(r) ? normalizeCandidate(r as GoogleGeocodeResponse['results'][number]) : null,
+    )
+    .filter((c): c is IGeocodeCandidate => c !== null);
+}
+
+/**
  * Normalize one Google geocode result row into a unified {@link IGeocodeCandidate}.
  * `viewport` is populated when Google returns one (5/5 native).
  *
  * Returns `null` (the caller skips the row) when `geometry.location.lat`/`lng`
  * are absent or non-numeric — never fabricate a Null-Island (0,0) candidate,
- * and never let a missing node surface as a raw `TypeError`. Mirrors the
- * null-skip idiom of the other four geocoding connectors and the location-php
- * sibling.
+ * and never let a missing node surface as a raw `TypeError`. Same null-skip
+ * rule as the other four geocoding connectors.
  */
 function normalizeCandidate(
   r: GoogleGeocodeResponse['results'][number],

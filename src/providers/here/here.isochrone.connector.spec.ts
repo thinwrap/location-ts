@@ -234,3 +234,103 @@ describe('HereIsochroneConnector', () => {
     expect(caught?.message).toBe('HERE Isochrone returned a malformed response body');
   });
 });
+
+describe('HereIsochroneConnector — multi-part isolines, holes and winding', () => {
+  // Minimal 2D flexible-polyline encoder (precision 5) for fixtures, per
+  // https://github.com/heremaps/flexible-polyline.
+  const CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  const unsigned = (value: number): string => {
+    let out = '';
+    let v = value;
+    while (v > 0x1f) {
+      out += CHARS[(v & 0x1f) | 0x20];
+      v = Math.floor(v / 32);
+    }
+    return out + CHARS[v];
+  };
+  const signed = (v: number) => unsigned(v < 0 ? ~(v << 1) : v << 1);
+  /** Encodes `[lng, lat]` positions (open ring — HERE does not repeat the first point). */
+  const flex = (ring: number[][]): string => {
+    let out = unsigned(1) + unsigned(5);
+    let prevLat = 0;
+    let prevLng = 0;
+    for (const [lng, lat] of ring) {
+      const la = Math.round(lat! * 1e5);
+      const ln = Math.round(lng! * 1e5);
+      out += signed(la - prevLat) + signed(ln - prevLng);
+      prevLat = la;
+      prevLng = ln;
+    }
+    return out;
+  };
+
+  // Closed [lng, lat] squares wound counter-clockwise (RFC 7946 exterior).
+  const A_CCW = [[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]];
+  const HOLE_A_CCW = [[2, 2], [4, 2], [4, 4], [2, 4], [2, 2]];
+  const B_CCW = [[20, 0], [30, 0], [30, 10], [20, 10], [20, 0]];
+  const cw = (ring: number[][]) => [...ring].reverse();
+  const open = (ring: number[][]) => ring.slice(0, -1);
+
+  const signedArea = (ring: number[][]) =>
+    ring.slice(0, -1).reduce((sum, [x1, y1], i) => {
+      const [x2, y2] = ring[i + 1]!;
+      return sum + x1! * y2! - x2! * y1!;
+    }, 0);
+
+  async function run(polygons: unknown) {
+    mockFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ isolines: [{ range: { type: 'time', value: 600 }, polygons }] }),
+        { status: 200 },
+      ),
+    );
+    return new HereIsochroneConnector(defaultConfig).isochrone({
+      center: { lat: 5, lng: 5 },
+      type: 'time',
+      values: [600],
+    });
+  }
+
+  it('returns a MultiPolygon with every part when an isoline has several polygons', async () => {
+    const result = await run([
+      { outer: flex(open(A_CCW)), inner: [flex(open(HOLE_A_CCW))] },
+      { outer: flex(open(B_CCW)) },
+    ]);
+    expect(result.contours[0]!.geometry).toEqual({
+      type: 'MultiPolygon',
+      coordinates: [[A_CCW, cw(HOLE_A_CCW)], [B_CCW]],
+    });
+  });
+
+  it('keeps a single part a Polygon, with its hole, winding normalized', async () => {
+    // Exterior sent clockwise and hole counter-clockwise: both must flip.
+    const result = await run([{ outer: flex(open(cw(A_CCW))), inner: [flex(open(HOLE_A_CCW))] }]);
+    const geometry = result.contours[0]!.geometry;
+    expect(geometry.type).toBe('Polygon');
+    const [exterior, hole] = geometry.coordinates as number[][][];
+    expect(signedArea(exterior!)).toBeGreaterThan(0);
+    expect(signedArea(hole!)).toBeLessThan(0);
+    expect(exterior![0]).toEqual(exterior![exterior!.length - 1]);
+    expect(hole![0]).toEqual(hole![hole!.length - 1]);
+    expect(geometry.coordinates).toHaveLength(2);
+  });
+
+  it.each([
+    ['a part without an outer ring', [{ inner: [] }, { outer: flex(open(A_CCW)) }]],
+    ['a part with an empty outer ring', [{ outer: '' }, { outer: flex(open(A_CCW)) }]],
+    ['a part with an undecodable outer ring', [{ outer: flex(open(A_CCW)) }, { outer: 'B' }]],
+    ['an inner that is not a list', [{ outer: flex(open(A_CCW)), inner: 'x' }]],
+    ['an inner entry that is not a string', [{ outer: flex(open(A_CCW)), inner: [1] }]],
+    ['an undecodable inner entry', [{ outer: flex(open(A_CCW)), inner: ['!!'] }]],
+  ])('drops %s and keeps the usable rest', async (_label, polygons) => {
+    const result = await run(polygons);
+    expect(result.contours[0]!.geometry).toEqual({ type: 'Polygon', coordinates: [A_CCW] });
+  });
+
+  it.each([
+    ['an empty polygons list', []],
+    ['no usable part at all', [{ outer: '' }, { inner: [flex(open(HOLE_A_CCW))] }]],
+  ])('raises unknown for %s', async (_label, polygons) => {
+    await expect(run(polygons)).rejects.toMatchObject({ providerCode: 'unknown', statusCode: 200 });
+  });
+});

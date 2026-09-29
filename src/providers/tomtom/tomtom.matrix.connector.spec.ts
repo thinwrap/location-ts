@@ -56,7 +56,7 @@ function succeededResp(): Response {
 
 /**
  * Build a list of `count` coordinates so we can synthesize an `origins ×
- * destinations` matrix above the 2500-cell threshold without enumerating each
+ * destinations` matrix above the 100-cell sync threshold without enumerating each
  * pair by hand.
  */
 function coords(count: number): LatLng[] {
@@ -69,7 +69,7 @@ function coords(count: number): LatLng[] {
 /**
  * Build a COMPLETE `data[]` payload covering every cell of an `numOrigins ×
  * numDestinations` grid. Threshold-driven dispatch tests need a payload that
- * satisfies the LOC-CP-1 coverage guard for their (necessarily large) grids.
+ * reads as a full answer for their (necessarily large) grids.
  */
 function fullDataResp(numOrigins: number, numDestinations: number): Response {
   const data: Array<{
@@ -100,9 +100,9 @@ describe('TomTomMatrixConnector', () => {
     expect(connector.providerId).toBe('tomtom');
   });
 
-  // ===== sync dispatch (cell count <= 2500) =====
+  // ===== sync dispatch (cell count <= 100) =====
 
-  it('should dispatch sync POST when cell count <= 2500 and parse data[] directly', async () => {
+  it('should dispatch sync POST when cell count <= 100 and parse data[] directly', async () => {
     mockFetch.mockResolvedValueOnce(syncBodyResp());
 
     const result = await connector.matrix({
@@ -205,9 +205,8 @@ describe('TomTomMatrixConnector', () => {
     expect((body.options as Record<string, unknown>).travelMode).toBe(expected);
   });
 
-  // cycling is absent from TomTom Matrix v2; the baseline audit requires
-  // a typed unsupported_travel_mode error rather than silently degrading to
-  // 'bicycle' (loc-CR #115).
+  // cycling is absent from TomTom Matrix v2, so it raises a typed
+  // unsupported_travel_mode error rather than silently degrading to 'bicycle'.
   it('should throw unsupported_travel_mode for cycling', async () => {
     await expect(
       connector.matrix({
@@ -238,17 +237,17 @@ describe('TomTomMatrixConnector', () => {
     ]);
   });
 
-  // ===== async dispatch (cell count > 2500) =====
+  // ===== async dispatch (cell count > 100) =====
 
-  it('should dispatch async submit → poll → retrieve when cell count > 2500', async () => {
+  it('should dispatch async submit → poll → retrieve when cell count > 100', async () => {
     mockFetch
       .mockResolvedValueOnce(submitResp('job-xyz'))
       .mockResolvedValueOnce(pendingResp())
       .mockResolvedValueOnce(succeededResp())
-      // Full 51×51 payload so the LOC-CP-1 coverage guard is satisfied.
+      // Full 51×51 payload, so every requested cell is present.
       .mockResolvedValueOnce(fullDataResp(51, 51));
 
-    // 51 × 51 = 2601 cells, just above the threshold
+    // 51 × 51 = 2601 cells, well above the sync threshold
     const origins = coords(51);
     const destinations = coords(51);
 
@@ -306,18 +305,38 @@ describe('TomTomMatrixConnector', () => {
     expect(result.cells).toHaveLength(2601);
   });
 
-  it('should use sync path exactly at the 2500-cell boundary', async () => {
-    mockFetch.mockResolvedValueOnce(fullDataResp(50, 50));
+  it('should use sync path exactly at the 100-cell boundary', async () => {
+    mockFetch.mockResolvedValueOnce(fullDataResp(10, 10));
 
-    // 50 × 50 = 2500 — boundary; should stay sync (single fetch, sync URL)
+    // 10 × 10 = 100 — TomTom's default synchronous maximum; stays sync
+    // (single fetch, sync URL).
     await connector.matrix({
-      origins: coords(50),
-      destinations: coords(50),
+      origins: coords(10),
+      destinations: coords(10),
     });
 
     expect(mockFetch).toHaveBeenCalledOnce();
     const [url] = mockFetch.mock.calls[0]!;
-    expect(url as string).not.toContain('/async');
+    expect(url as string).toBe('https://api.tomtom.com/routing/matrix/2?key=test-key');
+  });
+
+  it('should switch to the async path at 101 cells', async () => {
+    mockFetch
+      .mockResolvedValueOnce(submitResp('job-101'))
+      .mockResolvedValueOnce(succeededResp())
+      .mockResolvedValueOnce(fullDataResp(101, 1));
+
+    // 101 × 1 = 101 — one cell past the synchronous maximum.
+    const result = await connector.matrix({
+      origins: coords(101),
+      destinations: coords(1),
+    });
+
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+    expect(mockFetch.mock.calls[0]![0] as string).toContain(
+      'https://api.tomtom.com/routing/matrix/2/async',
+    );
+    expect(result.cells).toHaveLength(101);
   });
 
   // ===== polling deadline =====
@@ -349,6 +368,28 @@ describe('TomTomMatrixConnector', () => {
     expect(caught?.statusCode).toBeNull();
     expect(caught?.providerMessage).toContain('job-timeout');
     expect((caught?.cause as { jobId?: string })?.jobId).toBe('job-timeout');
+  });
+
+  // A deadline that is not a finite positive number of milliseconds is refused
+  // rather than coerced (parseInt of a string) or replaced by the 60 s default.
+  it.each([
+    ['a numeric string', '5000'],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['zero', 0],
+    ['a negative number', -1],
+    ['null', null],
+  ])('rejects timeoutMs given as %s before any request', async (_label, timeoutMs) => {
+    for (const size of [2, 51]) {
+      await expect(
+        connector.matrix({
+          origins: coords(size),
+          destinations: coords(size),
+          _passthrough: { body: { timeoutMs } },
+        }),
+      ).rejects.toMatchObject({ providerCode: 'invalid_request', statusCode: null });
+    }
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('should strip timeoutMs from the submit body (wrapper-side knob)', async () => {
@@ -502,6 +543,74 @@ describe('TomTomMatrixConnector', () => {
     expect(caught?.providerCode).toBe('unknown');
   });
 
+  // ===== trafficMode =====
+
+  // `traffic` is always sent: TomTom's default is `historical`, so `'live'`
+  // has to be asked for.
+  it.each([
+    ['unset', undefined, 'historical'],
+    ['none', 'none' as const, 'historical'],
+    ['live', 'live' as const, 'live'],
+  ])('sends options.traffic for trafficMode %s', async (_label, trafficMode, expected) => {
+    for (const size of [1, 11]) {
+      mockFetch.mockReset();
+      if (size === 1) {
+        mockFetch.mockResolvedValueOnce(syncBodyResp());
+      } else {
+        mockFetch
+          .mockResolvedValueOnce(submitResp('job-traffic'))
+          .mockResolvedValueOnce(succeededResp())
+          .mockResolvedValueOnce(fullDataResp(11, 11));
+      }
+      await connector.matrix({
+        origins: coords(size),
+        destinations: coords(size),
+        ...(trafficMode !== undefined ? { trafficMode } : {}),
+      });
+      const body = JSON.parse(mockFetch.mock.calls[0]![1]!.body as string) as {
+        options: Record<string, unknown>;
+      };
+      expect(body.options.traffic).toBe(expected);
+    }
+  });
+
+  // TomTom rejects `traffic: live` with `departAt: any`, its own default.
+  it('departs now for a live request without a departure time', async () => {
+    mockFetch.mockResolvedValueOnce(syncBodyResp());
+    await connector.matrix({
+      origins: coords(1),
+      destinations: coords(1),
+      trafficMode: 'live',
+    });
+    const body = JSON.parse(mockFetch.mock.calls[0]![1]!.body as string) as {
+      options: Record<string, unknown>;
+    };
+    expect(body.options.departAt).toBe('now');
+  });
+
+  it('keeps the caller departure time on a live request', async () => {
+    mockFetch.mockResolvedValueOnce(syncBodyResp());
+    await connector.matrix({
+      origins: coords(1),
+      destinations: coords(1),
+      trafficMode: 'live',
+      departureTime: new Date('2026-10-01T08:00:00Z'),
+    });
+    const body = JSON.parse(mockFetch.mock.calls[0]![1]!.body as string) as {
+      options: Record<string, unknown>;
+    };
+    expect(body.options).toMatchObject({
+      traffic: 'live',
+      departAt: '2026-10-01T08:00:00.000Z',
+    });
+  });
+
+  it('keeps 100 cells on the sync endpoint whatever the traffic mode', async () => {
+    mockFetch.mockResolvedValueOnce(fullDataResp(10, 10));
+    await connector.matrix({ origins: coords(10), destinations: coords(10), trafficMode: 'live' });
+    expect(mockFetch.mock.calls[0]![0] as string).not.toContain('/async');
+  });
+
   // ===== _passthrough merge (mergePassthrough 4-arg form) =====
 
   it('should deep-merge _passthrough body and shallow-merge headers + query', async () => {
@@ -511,7 +620,7 @@ describe('TomTomMatrixConnector', () => {
       origins: [{ lat: 0, lng: 0 }],
       destinations: [{ lat: 1, lng: 1 }],
       _passthrough: {
-        body: { options: { traffic: true } },
+        body: { options: { vehicleMaxSpeed: 80 } },
         headers: { 'X-Custom': 'val' },
         query: { extraParam: 'extraVal' },
       },
@@ -520,8 +629,8 @@ describe('TomTomMatrixConnector', () => {
     const [url, init] = mockFetch.mock.calls[0]!;
     const body = JSON.parse(init!.body as string) as Record<string, unknown>;
     // deep-merge: connector's options.travelMode preserved, passthrough's
-    // traffic layered on top
-    expect(body.options).toMatchObject({ travelMode: 'car', traffic: true });
+    // field layered on top
+    expect(body.options).toMatchObject({ travelMode: 'car', vehicleMaxSpeed: 80 });
     expect((init?.headers as Record<string, string>)?.['X-Custom']).toBe('val');
     expect(url as string).toContain('extraParam=extraVal');
   });
@@ -540,14 +649,42 @@ describe('TomTomMatrixConnector', () => {
     ).rejects.toBeInstanceOf(ConnectorError);
   });
 
-  // LOC-CP-1 (loc-CR #100) — sparse-matrix coverage guard (cells dropped for
-  // lacking routeSummary previously yielded a silent sparse matrix)
+  // A cell without routeSummary is a failed pair: omitted, never zero-filled.
+  // A body without a readable `data` list is not an empty matrix, on either
+  // path.
+  describe('malformed 2xx bodies', () => {
+    it.each([
+      ['no data field', { statistics: {} }],
+      ['a non-array data', { data: { originIndex: 0 } }],
+      ['a null cell', { data: [null] }],
+      [
+        'a summary without numbers',
+        { data: [{ originIndex: 0, destinationIndex: 0, routeSummary: { lengthInMeters: 1 } }] },
+      ],
+    ])('raises unknown for %s on the sync path', async (_label, body) => {
+      mockFetch.mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
+      await expect(
+        connector.matrix({ origins: [{ lat: 0, lng: 0 }], destinations: [{ lat: 1, lng: 1 }] }),
+      ).rejects.toMatchObject({ providerCode: 'unknown', statusCode: 200, cause: body });
+    });
+
+    it('raises unknown for a retrieve body without data on the async path', async () => {
+      mockFetch
+        .mockResolvedValueOnce(submitResp('job-empty'))
+        .mockResolvedValueOnce(succeededResp())
+        .mockResolvedValueOnce(new Response('{}', { status: 200 }));
+      await expect(
+        connector.matrix({ origins: coords(11), destinations: coords(11) }),
+      ).rejects.toMatchObject({ providerCode: 'unknown' });
+    });
+  });
+
   describe('matrix sparse-cell omission', () => {
     it('omits an unroutable cell (returns a sparse, indexed result) rather than throwing', async () => {
       // 1×2 grid requested, but only one cell carries a routeSummary; the other
       // is unreachable (detailedError). The unroutable pair is OMITTED — each
-      // returned cell is indexed, so the consumer can tell which pairs exist.
-      // (Parity with Mapbox/OSRM/HERE/Google; supersedes the loc-CR #100 throw.)
+      // returned cell is indexed, so the consumer can tell which pairs exist,
+      // the same cell-omission rule as Mapbox/OSRM/HERE/Google.
       const body = {
         data: [
           {

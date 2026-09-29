@@ -58,6 +58,67 @@ export const ESRI_WALKING_TRAVEL_MODE = {
 } as const;
 
 /**
+ * Canonical ArcGIS World **"Walking Distance"** travel-mode object, for distance
+ * isochrones.
+ *
+ * `solveServiceArea` reads `defaultBreaks` in the impedance's units, and a travel
+ * mode overrides the request-level `impedanceAttributeName` — so a walking
+ * distance isochrone needs a walking mode whose impedance is `Kilometers`, or its
+ * kilometer breaks would be read as walk-time minutes. This is Esri's published
+ * definition, verbatim (it differs from "Walking Time" in more than the
+ * impedance: its own id, description and restriction usages).
+ *
+ * Source: ArcGIS REST API "Retrieve travel modes" reference.
+ */
+export const ESRI_WALKING_DISTANCE_TRAVEL_MODE = {
+  attributeParameterValues: [
+    {
+      attributeName: 'Avoid Private Roads',
+      parameterName: 'Restriction Usage',
+      value: 'AVOID_MEDIUM',
+    },
+    {
+      attributeName: 'Walking',
+      parameterName: 'Restriction Usage',
+      value: 'PROHIBITED',
+    },
+    {
+      attributeName: 'Preferred for Pedestrians',
+      parameterName: 'Restriction Usage',
+      value: 'PREFER_LOW',
+    },
+    {
+      attributeName: 'WalkTime',
+      parameterName: 'Walking Speed (km/h)',
+      value: 5,
+    },
+    {
+      attributeName: 'Avoid Roads Unsuitable for Pedestrians',
+      parameterName: 'Restriction Usage',
+      value: 'AVOID_HIGH',
+    },
+  ],
+  description:
+    'Follows paths and roads that allow pedestrian traffic and finds solutions that optimize travel distance.',
+  distanceAttributeName: 'Kilometers',
+  id: 'yFuMFwIYblqKEefX',
+  impedanceAttributeName: 'Kilometers',
+  name: 'Walking Distance',
+  restrictionAttributeNames: [
+    'Avoid Private Roads',
+    'Avoid Roads Unsuitable for Pedestrians',
+    'Preferred for Pedestrians',
+    'Walking',
+  ],
+  simplificationTolerance: 2,
+  simplificationToleranceUnits: 'esriMeters',
+  timeAttributeName: 'WalkTime',
+  type: 'WALK',
+  useHierarchy: false,
+  uturnAtJunctions: 'esriNFSBAllowBacktrack',
+} as const;
+
+/**
  * Time-impedance attribute names ESRI reports for the travel modes this wrapper
  * can request. The OD Cost Matrix names its cost columns after the active
  * impedance (`TravelTime` for driving, `WalkTime` for walking), so the matrix
@@ -79,9 +140,46 @@ export function mapEsriTravelMode(
   mode: 'driving' | 'walking' | 'cycling' | undefined,
   op: string,
 ): string | undefined {
+  const travelMode = esriTravelModeObject(mode, op);
+  return travelMode === undefined ? undefined : JSON.stringify(travelMode);
+}
+
+/**
+ * The `travelMode` and `restrictionAttributeNames` form values for a request
+ * carrying the normalized avoid flags as Esri restriction names.
+ *
+ * Where the request sends a travel mode, the restrictions must go INSIDE it:
+ * Esri takes a travel mode's own `restrictionAttributeNames` wholesale and
+ * silently ignores the request-level parameter beside it (live: walking +
+ * `restrictionAttributeNames=Avoid Ferries` → Esri's warning lists only the
+ * mode's "Avoid Private Roads"; the same name appended inside the mode is
+ * honoured). The mode's own restrictions are kept — they are what makes it a
+ * walking mode — and the result is deduplicated. On the service default
+ * (driving, no travel mode sent) the request-level parameter is the one read.
+ */
+export function esriTravelModeForm(
+  mode: 'driving' | 'walking' | 'cycling' | undefined,
+  op: string,
+  restrictions: readonly string[],
+): { travelMode?: string; restrictionAttributeNames?: string } {
+  const travelMode = esriTravelModeObject(mode, op);
+  if (travelMode === undefined) {
+    return restrictions.length > 0
+      ? { restrictionAttributeNames: restrictions.join(',') }
+      : {};
+  }
+  if (restrictions.length === 0) return { travelMode: JSON.stringify(travelMode) };
+  const names = [...new Set([...travelMode.restrictionAttributeNames, ...restrictions])];
+  return { travelMode: JSON.stringify({ ...travelMode, restrictionAttributeNames: names }) };
+}
+
+function esriTravelModeObject(
+  mode: 'driving' | 'walking' | 'cycling' | undefined,
+  op: string,
+): typeof ESRI_WALKING_TRAVEL_MODE | undefined {
   switch (mode) {
     case 'walking':
-      return JSON.stringify(ESRI_WALKING_TRAVEL_MODE);
+      return ESRI_WALKING_TRAVEL_MODE;
     case 'cycling':
       throw new ConnectorError({
         message: `ESRI ${op} does not support travelMode "cycling"`,

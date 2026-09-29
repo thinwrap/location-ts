@@ -15,6 +15,7 @@ Requires Node.js ≥18 (uses native `fetch`).
 ```typescript
 import { Routing, ConnectorError } from '@thinwrap/location';
 
+// Construction errors (unknown provider, missing config) are bugs, thrown as TypeError.
 const routing = new Routing('google', { apiKey: process.env.GOOGLE_KEY! });
 
 try {
@@ -43,13 +44,13 @@ request. All three default to the lean option; you opt up explicitly.
 | Option | Default | What it changes |
 |---|---|---|
 | `polylineQuality` | `'simplified'` | Geometry fidelity. `'detailed'` returned a **30x larger** polyline on Mapbox and **31x** on OSRM in measurement, with identical distances and durations. Honoured by Google/Mapbox/OSRM; silently ignored by HERE/TomTom/Esri, which expose no equivalent knob. |
-| `trafficMode` | `'none'` | Whether to route against live traffic. `'live'` selects a **Pro-tier SKU** on Google, so it is never enabled implicitly — not even by passing `departureTime`. |
+| `trafficMode` | `'none'` | Whether durations reflect traffic. `'traffic'` selects a **Pro-tier SKU** on Google and **Time-Aware Routing** billing on HERE, so it is never enabled implicitly — not even by passing `departureTime`. Applies to routing and matrix; see [Traffic and departure time](#traffic-and-departure-time). |
 | `include` | `[]` | Which optional output fields to fetch. Each token maps 1:1 onto one optional result field. |
 
 ```typescript
 const result = await routing.route({
   waypoints,
-  trafficMode: 'live',                        // opt into traffic-aware routing
+  trafficMode: 'traffic',                     // opt into traffic-aware routing
   polylineQuality: 'detailed',                // opt into full geometry
   include: ['durationWithoutTraffic'],        // opt into the extra output field
 });
@@ -65,6 +66,39 @@ const congestion =
 `durationWithoutTraffic` is native on Google (`staticDuration`), HERE (`baseDuration`) and
 TomTom (`noTrafficTravelTimeInSeconds`); Mapbox, OSRM and Esri do not return it, so the
 field stays absent there rather than being faked.
+
+### Traffic and departure time
+
+`trafficMode` (routing and matrix) takes two values:
+
+- `'none'` (default): no time-of-day traffic. Durations come from the provider's
+  time-independent speed model. A `departureTime` never adds traffic here; where the provider
+  would read the time as a traffic input, the connector drops the time or disables traffic.
+  Each provider has its own static model (free-flow on HERE and OSRM, a time-independent
+  historical average on Google, Esri and Mapbox), so `'none'` durations still differ between
+  providers.
+- `'traffic'`: the traffic expected at `departureTime`. That is live conditions close to now
+  and typical or predicted conditions for later times. With no `departureTime`, it uses the
+  traffic now.
+
+`'live'` is a **deprecated** alias of `'traffic'` and behaves identically. It stays accepted,
+but new code should use `'traffic'`.
+
+| Provider | `'none'` | `'traffic'` |
+|---|---|---|
+| Google (routes, matrix) | exact: `TRAFFIC_UNAWARE`, the time is not sent (Google rejects a time on an unaware request) | exact: `TRAFFIC_AWARE` + the time. **Pro SKU** |
+| HERE (routes, matrix, optimize) | exact: `departureTime=any`, or `traffic[mode]=disabled` when a time is given | exact: HERE's default + the time. **Time-Aware Routing SKU** on routing |
+| Esri (routing, matrix) | exact: the time is not sent | exact: the time, or `now` |
+| Mapbox Directions | exact: `driving`, the time is dropped | exact: `driving-traffic` + `depart_at` |
+| Mapbox Matrix | exact: `driving`, the time is dropped | `driving-traffic`; with a time on driving → `unsupported_field` (Matrix `depart_at` is a sign-up beta) |
+| Mapbox Optimization (`optimize`) | exact: the time is dropped | **ignored**: no traffic profile exists; with a time on driving → `unsupported_field` |
+| TomTom routing | **approximate**: `traffic=false`. TomTom has no time-independent routing mode, so its typical (historic) traffic for the departure time, or for now, is still included | exact: `traffic=true` + `departAt` |
+| TomTom matrix | exact: `historical` + `departAt: any`, the time is dropped | exact: `live` + the time, or `now` |
+| OSRM | exact: static profile speeds; a time has no effect | **ignored**: OSRM has no request-time traffic |
+
+Walking and cycling have no traffic model on any provider, so `'traffic'` does not change them
+(on Mapbox Matrix and Optimization a `departureTime` is then dropped, not rejected).
+`_passthrough` is merged last and still overrides any of these parameters.
 
 ## Autocomplete → place details
 
@@ -85,8 +119,17 @@ for (const p of predictions) {
 }
 
 const { candidate } = await geocoding.placeDetails({ placeId: predictions[0]!.placeId! });
-console.log(candidate.location); // → { lat, lng }
+if (candidate === null) {
+  // The provider no longer resolves this id (places close, ids expire).
+} else {
+  console.log(candidate.location); // → { lat, lng }
+}
 ```
+
+`candidate` is `null` when the provider answers "not found" for the id or returns the place
+without a location — an answer to branch on, like geocoding's `candidates: []`, never a
+fabricated `(0,0)`; `raw` still carries the vendor's body. An id the provider rejects as
+invalid stays an `invalid_request` error (Google Places answers an unknown id that way too).
 
 `placeId` values are **provider-scoped** — a Google place id is meaningless to Mapbox.
 Use the same facade for both calls.
@@ -105,15 +148,16 @@ Note this is the *opposite* of Compute Routes, whose SKU is driven by request
 
 **Mapbox Search Box bills per session, not per request.** A `suggest` and the
 `retrieve` that follows count as one billable session only when they carry the same
-`session_token`; omitting it doubles the bill:
+`session_token`; without one the connector sends a fresh token per call, so each call
+bills as its own session:
 
 ```typescript
 const sessionToken = crypto.randomUUID();          // one per user interaction
-await mapbox.autocomplete({ input, _passthrough: { query: { session_token: sessionToken } } });
+await mapbox.autocomplete({ input, sessionToken });
 await mapbox.placeDetails({ placeId, sessionToken });
 ```
 
-The wrapper cannot generate or remember that token — it holds no state — so
+The wrapper cannot remember that token across calls — it holds no state — so
 threading it through is the consumer's job.
 
 ### `structuredFormat` support
@@ -161,6 +205,10 @@ const tracingFetch: typeof fetch = async (url, init) => {
 const routing = new Routing('google', { apiKey: process.env.GOOGLE_KEY! }, tracingFetch);
 ```
 
+Without one, the connectors use `globalThis.fetch`, bound to `globalThis` — runtimes such as
+Cloudflare Workers throw "Illegal invocation" when fetch is called with any other receiver.
+A `fetch` you pass is invoked exactly as given.
+
 **Contract: a non-2xx must be RETURNED as a `Response`, not thrown.** That is plain
 fetch semantics, and it is what lets each connector map the status to a `providerCode`
 (429 → `rate_limited`, 401 → `auth_failed`, …) and read the vendor's message.
@@ -195,9 +243,25 @@ a single `await matrix(input)`).
 
 ## Error handling
 
-Every failure surfaces as `ConnectorError` with a typed `providerCode`. Compose your
-own retry strategy from `e.providerCode` and `e.cause` (which carries the raw
-`Retry-After` header where the vendor sets one).
+Every **operation** failure rejects with `ConnectorError` and a typed `providerCode`: a
+vendor error, a transport failure, a timeout, or request data the library refuses before
+sending it (non-finite coordinates, too few waypoints, an invalid `Date`, a malformed country
+code, …; those carry `statusCode: null`). Compose your own retry strategy from
+`e.providerCode` and `e.cause` (which carries the raw `Retry-After` header where the vendor
+sets one).
+
+Misusing the API itself is a bug in your code, not a runtime failure, and is deliberately
+*not* a `ConnectorError`: it is a `TypeError`. The facade constructor throws it synchronously
+for an unknown provider (or one without that operation) or a missing config; the operation
+rejects with it for a value outside a string-literal union, such as `travelMode: 'flying'`, an
+unknown `include` token or a `departureTime` that is not a `Date`. Validate end-user input
+against those unions at your own boundary rather than catching the `TypeError`.
+
+That includes a 2xx the connector cannot interpret — an unparseable body, a missing or
+mistyped field, a route without legs, an isochrone without a polygon: it raises `unknown`
+(or `no_route` for a route with no legs) with the vendor body on `cause`, rather than
+leaking a raw `TypeError` or returning zeros and empty lists the provider never sent. A
+well-formed "zero results" answer stays an empty result.
 
 ```typescript
 import { ConnectorError } from '@thinwrap/location';
@@ -212,7 +276,7 @@ try {
       case 'invalid_request':         /* fix payload                         */ break;
       case 'invalid_recipient':       /* fix destination                     */ break;
       case 'provider_unavailable':    /* transient 5xx — your retry strategy */ break;
-      case 'unsupported_field':       /* drop OSRM-incompatible field         */ break;
+      case 'unsupported_field':       /* drop the field the provider lacks    */ break;
       case 'unsupported_option':      /* drop OSRM-incompatible option        */ break;
       case 'unsupported_travel_mode': /* fall back to a supported travel mode */ break;
       case 'profile_not_configured':  /* compile the OSRM profile             */ break;
@@ -247,8 +311,8 @@ The providers agree on nothing here. Google answers HTTP **200** with the `route
 absent; HERE 200 with `routes: []` plus a `notices[].code`; Mapbox `code: "NoRoute"` on
 either 200 or 422; OSRM the same codes on a **400**; TomTom a 400 with
 `detailedError.code`; Esri a 200 whose in-body `error.code: 400` names an **unlocated**
-stop in `details[]`. Branching on "no usable route" used to mean reimplementing all six.
-Now:
+stop in `details[]`. One code covers all six, so branching on "no usable route" does not
+mean reimplementing them:
 
 ```typescript
 if (e instanceof ConnectorError && e.providerCode === 'no_route') {
@@ -277,20 +341,63 @@ seconds count is woven into `e.providerMessage` (`…; retry after N seconds`). 
 When the normalized input doesn't expose a vendor-specific field, forward arbitrary
 keys via `_passthrough`. The wrapper deep-merges `body`, shallow-merges `headers` and
 `query`. Consumer values win on conflict. Keys are forwarded verbatim — no casing
-transformation.
+transformation. Header names are matched case-insensitively, as HTTP defines them: a
+passthrough `x-goog-fieldmask` replaces the connector's `X-Goog-FieldMask` (and your spelling
+is the one sent) instead of both going out and being joined into one value.
 
 ```typescript
+import { GOOGLE_ROUTES_FIELD_MASK } from '@thinwrap/location';
+
 await routing.route({
   waypoints: [origin, destination],
   _passthrough: {
     body:    { languageCode: 'fr', units: 'IMPERIAL' },
-    headers: { 'X-Goog-FieldMask': 'routes.legs.distanceMeters,routes.duration' },
+    headers: { 'X-Goog-FieldMask': [...GOOGLE_ROUTES_FIELD_MASK, 'routes.travelAdvisory'].join(',') },
     query:   { region: 'us' },
   },
 });
 ```
 
+A header or query value — and a body array — is replaced whole, so a list-valued
+one (Google's `X-Goog-FieldMask`, HERE's `return` and `matrixAttributes`, Mapbox and
+OSRM matrix `annotations`, Esri's `accumulateAttributeNames`) **replaces** the
+connector's list rather than adding to it. That is what lets you drop a default; to
+add to one, spread the published constant as above (`GOOGLE_ROUTES_FIELD_MASK`,
+`GOOGLE_MATRIX_FIELD_MASK`, `GOOGLE_PLACE_DETAILS_FIELD_MASK`, `HERE_ROUTING_RETURN`,
+`HERE_MATRIX_ATTRIBUTES`, `MAPBOX_MATRIX_ANNOTATIONS`, `OSRM_TABLE_ANNOTATIONS`,
+`ESRI_ROUTING_ACCUMULATE_ATTRIBUTES_DRIVING` / `_WALKING`,
+`ESRI_MATRIX_ACCUMULATE_ATTRIBUTES`, plus the Google conditional groups). A
+replacement list that leaves out a default value empties or zeroes the normalized
+output it feeds, or makes the call raise `unknown` — see "Replacing a default list"
+in the [Google](src/providers/google/README.md#replacing-a-default-list),
+[HERE](src/providers/here/README.md#replacing-a-default-list),
+[Mapbox](src/providers/mapbox/README.md#replacing-a-default-list),
+[OSRM](src/providers/osrm/README.md#replacing-a-default-list) and
+[ESRI](src/providers/esri/README.md#replacing-a-default-list) READMEs.
+
 Each per-connector README documents its vendor-specific `_passthrough` examples.
+
+## Isochrone contours
+
+Each contour's `geometry` is a GeoJSON `Polygon` for one connected area — the common case — or a
+`MultiPolygon` holding every part when the provider returns several disconnected areas for the
+break (an island reached by ferry, a region split by water; HERE and ESRI document this).
+The nesting depth differs, so read `geometry.type` before indexing `coordinates`:
+
+```typescript
+import { Isochrone } from '@thinwrap/location';
+
+const { contours } = await new Isochrone('here', { apiKey: 'YOUR_KEY' }).isochrone({
+  center: { lat: 60.17, lng: 24.94 }, type: 'time', values: [900],
+});
+for (const { geometry } of contours) {
+  const polygons = geometry.type === 'MultiPolygon' ? geometry.coordinates : [geometry.coordinates];
+  // each polygon is [exterior, ...holes], every ring closed and in [lng, lat] order
+}
+```
+
+On every provider, holes are kept and rings are wound per RFC 7946 (exterior counter-clockwise,
+holes clockwise), whatever winding the provider used.
 
 ## Polyline utilities
 

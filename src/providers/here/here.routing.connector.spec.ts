@@ -117,9 +117,8 @@ describe('HereRoutingConnector', () => {
 
       expect(result.totalDistanceMeters).toBe(8000);
       expect(result.totalDurationSeconds).toBe(480);
-      expect(result.legs).toHaveLength(2);
-      expect(result.legs[0]!.distanceMeters).toBe(5000);
-      expect(result.legs[1]!.distanceMeters).toBe(3000);
+      // Two waypoints = one leg, however many sections HERE split it into.
+      expect(result.legs).toEqual([{ distanceMeters: 8000, durationSeconds: 480 }]);
       expect(typeof result.polyline).toBe('string');
       expect(result.polyline.length).toBeGreaterThan(0);
     });
@@ -203,6 +202,117 @@ describe('HereRoutingConnector', () => {
       expect(parseUrlParams(mockFetch.mock.calls[1]![0] as string).get('transportMode')).toBe(
         'bicycle',
       );
+    });
+  });
+
+  // HERE applies live traffic when `departureTime` is omitted and bills such a
+  // request as Time-Aware Routing, so the normalized `trafficMode: 'none'`
+  // default has to be spelled out on the wire.
+  describe('trafficMode on /v8/routes', () => {
+    const TWO_POINTS = [
+      { lat: 0, lng: 0 },
+      { lat: 1, lng: 1 },
+    ];
+
+    async function routesQuery(
+      options: Omit<Parameters<HereRoutingConnector['route']>[0], 'waypoints'>,
+    ): Promise<URLSearchParams> {
+      mockFetch.mockResolvedValueOnce(buildRouteResponse());
+      await connector.route({ waypoints: TWO_POINTS, ...options });
+      return parseUrlParams(mockFetch.mock.calls[0]![0] as string);
+    }
+
+    it('sends departureTime=any and no traffic[mode] by default', async () => {
+      const params = await routesQuery({});
+      expect(params.getAll('departureTime')).toEqual(['any']);
+      expect(params.has('traffic[mode]')).toBe(false);
+    });
+
+    it("treats an explicit 'none' the same as the default", async () => {
+      const params = await routesQuery({ trafficMode: 'none' });
+      expect(params.getAll('departureTime')).toEqual(['any']);
+      expect(params.has('traffic[mode]')).toBe(false);
+    });
+
+    it('keeps the caller departureTime and disables traffic when not live', async () => {
+      const params = await routesQuery({
+        departureTime: new Date('2026-09-27T08:30:00Z'),
+      });
+      expect(params.getAll('departureTime')).toEqual(['2026-09-27T08:30:00.000Z']);
+      expect(params.get('traffic[mode]')).toBe('disabled');
+    });
+
+    it("sends neither departureTime nor traffic[mode] on 'live' without a time", async () => {
+      const params = await routesQuery({ trafficMode: 'live' });
+      expect(params.has('departureTime')).toBe(false);
+      expect(params.has('traffic[mode]')).toBe(false);
+    });
+
+    it("sends only the ISO departureTime on 'live' with a time", async () => {
+      const params = await routesQuery({
+        trafficMode: 'live',
+        departureTime: new Date('2026-09-27T08:30:00Z'),
+      });
+      expect(params.getAll('departureTime')).toEqual(['2026-09-27T08:30:00.000Z']);
+      expect(params.has('traffic[mode]')).toBe(false);
+    });
+
+    it('lets _passthrough.query override the traffic defaults', async () => {
+      const params = await routesQuery({
+        departureTime: new Date('2026-09-27T08:30:00Z'),
+        _passthrough: { query: { 'traffic[mode]': 'default' } },
+      });
+      expect(params.getAll('traffic[mode]')).toEqual(['default']);
+      expect(params.getAll('departureTime')).toEqual(['2026-09-27T08:30:00.000Z']);
+    });
+
+    // HERE answers `departureTime=any` + `arrivalTime` with HTTP 400.
+    it('disables traffic instead of sending any when passthrough sets arrivalTime', async () => {
+      const params = await routesQuery({
+        _passthrough: { query: { arrivalTime: '2026-09-27T09:00:00Z' } },
+      });
+      expect(params.has('departureTime')).toBe(false);
+      expect(params.getAll('arrivalTime')).toEqual(['2026-09-27T09:00:00Z']);
+      expect(params.get('traffic[mode]')).toBe('disabled');
+    });
+
+    // Without this, the caller's time would replace `any` and HERE would apply
+    // live traffic, billing the request as Time-Aware Routing.
+    it('disables traffic when passthrough sets departureTime', async () => {
+      const params = await routesQuery({
+        _passthrough: { query: { departureTime: '2026-09-27T08:30:00Z' } },
+      });
+      expect(params.getAll('departureTime')).toEqual(['2026-09-27T08:30:00Z']);
+      expect(params.get('traffic[mode]')).toBe('disabled');
+    });
+
+    // `disabled` would also drop long-term closures, which `any` keeps.
+    it('keeps the default when passthrough sets departureTime=any', async () => {
+      const params = await routesQuery({ _passthrough: { query: { departureTime: 'any' } } });
+      expect(params.getAll('departureTime')).toEqual(['any']);
+      expect(params.has('traffic[mode]')).toBe(false);
+    });
+
+    it('applies the default to the /v8/routes call of the optimize flow', async () => {
+      mockFetch
+        .mockResolvedValueOnce(buildSequenceResponse())
+        .mockResolvedValueOnce(buildRouteResponse());
+      await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+          { lat: 2, lng: 2 },
+          { lat: 3, lng: 3 },
+        ],
+        optimize: true,
+      });
+      const sequenceParams = parseUrlParams(mockFetch.mock.calls[0]![0] as string);
+      const routesParams = parseUrlParams(mockFetch.mock.calls[1]![0] as string);
+      // findsequence2 carries traffic in its `mode` string, not these params.
+      expect(sequenceParams.get('mode')).toBe('fastest;car;traffic:disabled');
+      expect(sequenceParams.has('departureTime')).toBe(false);
+      expect(routesParams.getAll('departureTime')).toEqual(['any']);
+      expect(routesParams.has('traffic[mode]')).toBe(false);
     });
   });
 
@@ -382,7 +492,7 @@ describe('HereRoutingConnector', () => {
       expect(result.polyline).toBe(encodePolyline(decoded));
     });
 
-    it('sums section length/duration into totals', async () => {
+    it('sums section length/duration into totals (one leg without a via)', async () => {
       mockFetch.mockResolvedValueOnce(
         buildRouteResponse({
           sections: [
@@ -401,9 +511,111 @@ describe('HereRoutingConnector', () => {
 
       expect(result.totalDistanceMeters).toBe(5555);
       expect(result.totalDurationSeconds).toBe(710);
+      expect(result.legs).toEqual([{ distanceMeters: 5555, durationSeconds: 710 }]);
+    });
+  });
+
+  // HERE v8: a section spans consecutive waypoints "or an implicit change of mode
+  // like a ferry section in a driving route" (TransitSection is only used for
+  // ferries and car shuttles). `arrival.place.waypoint` is present only for a
+  // place that is a request `via` — never for origin/destination or stops the
+  // router added — so it, not the section count, delimits legs.
+  describe('sections → legs', () => {
+    function hereSection(
+      type: 'vehicle' | 'transit',
+      length: number,
+      duration: number,
+      arrivalPlace: Record<string, unknown>,
+      baseDuration?: number,
+    ): Record<string, unknown> {
+      return {
+        id: `${type}-${length}`,
+        type,
+        ...(type === 'transit' ? { transport: { mode: 'ferry' } } : { transport: { mode: 'car' } }),
+        departure: { place: { type: 'place', location: { lat: 0, lng: 0 } } },
+        arrival: { place: { type: 'place', location: { lat: 1, lng: 1 }, ...arrivalPlace } },
+        polyline: FLEX_POLYLINE,
+        summary: {
+          length,
+          duration,
+          ...(baseDuration !== undefined ? { baseDuration } : {}),
+        },
+      };
+    }
+
+    function respondWith(sections: Array<Record<string, unknown>>): void {
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({ routes: [{ id: 'r1', sections }] }), { status: 200 }),
+      );
+    }
+
+    it('2 waypoints with car / ferry / car sections → 1 leg with summed values', async () => {
+      respondWith([
+        hereSection('vehicle', 12000, 900, {}, 800),
+        hereSection('transit', 30000, 3600, {}, 3600),
+        hereSection('vehicle', 8000, 600, {}, 500),
+      ]);
+
+      const result = await connector.route({
+        waypoints: [
+          { lat: 54.3, lng: 10.1 },
+          { lat: 59.9, lng: 10.7 },
+        ],
+        include: ['durationWithoutTraffic'],
+      });
+
       expect(result.legs).toEqual([
-        { distanceMeters: 1234, durationSeconds: 56 },
-        { distanceMeters: 4321, durationSeconds: 654 },
+        { distanceMeters: 50000, durationSeconds: 5100, durationWithoutTrafficSeconds: 4900 },
+      ]);
+      expect(result.totalDistanceMeters).toBe(50000);
+      expect(result.totalDurationSeconds).toBe(5100);
+      expect(result.totalDurationWithoutTrafficSeconds).toBe(4900);
+      // The polyline still covers every section, ferry included.
+      expect(decodePolyline(result.polyline).length).toBeGreaterThan(0);
+    });
+
+    it('3 waypoints (1 via) with a ferry in the first half → 2 legs', async () => {
+      respondWith([
+        hereSection('vehicle', 12000, 900, {}),
+        hereSection('transit', 30000, 3600, {}),
+        // Arrives at the via: the request's `via` index 0.
+        hereSection('vehicle', 5000, 400, { waypoint: 0 }),
+        hereSection('vehicle', 7000, 500, {}),
+      ]);
+
+      const result = await connector.route({
+        waypoints: [
+          { lat: 54.3, lng: 10.1 },
+          { lat: 57.0, lng: 10.4 },
+          { lat: 59.9, lng: 10.7 },
+        ],
+      });
+
+      expect(result.legs).toEqual([
+        { distanceMeters: 47000, durationSeconds: 4900 },
+        { distanceMeters: 7000, durationSeconds: 500 },
+      ]);
+      expect(result.totalDistanceMeters).toBe(54000);
+      expect(result.totalDurationSeconds).toBe(5400);
+    });
+
+    it('keeps sections 1:1 when none carries a waypoint marker and counts match', async () => {
+      respondWith([
+        hereSection('vehicle', 1000, 60, {}),
+        hereSection('vehicle', 2000, 120, {}),
+      ]);
+
+      const result = await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+          { lat: 2, lng: 2 },
+        ],
+      });
+
+      expect(result.legs).toEqual([
+        { distanceMeters: 1000, durationSeconds: 60 },
+        { distanceMeters: 2000, durationSeconds: 120 },
       ]);
     });
   });
@@ -469,8 +681,7 @@ describe('HereRoutingConnector', () => {
 
     // `bus` and `privateBus` are distinct modes at HERE, not synonyms: `bus`
     // may use bus-exclusive streets, `privateBus` only where a waypoint sits
-    // on one. Before this was typed, a caller wanting a licensed bus had to
-    // go through `_passthrough.query`.
+    // on one — so both are typed, rather than left to `_passthrough.query`.
     it('forwards bus and privateBus to /v8/routes', async () => {
       for (const mode of ['bus', 'privateBus'] as const) {
         mockFetch.mockResolvedValueOnce(buildRouteResponse());
@@ -778,28 +989,25 @@ describe('HereRoutingConnector', () => {
   });
 
   describe('malformed 200 body normalization', () => {
-    // A contract-violating 200 body (section missing `summary`) must normalize
-    // to safe defaults, not escape as an unwrapped TypeError.
-    it('normalizes a 200 body with a section missing summary to defaults', async () => {
-      mockFetch.mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({ routes: [{ sections: [{ polyline: '' }] }] }),
-          { status: 200 },
-        ),
-      );
-
-      const result = await connector.route({
-        waypoints: [
-          { lat: 52.5, lng: 13.4 },
-          { lat: 52.6, lng: 13.5 },
-        ],
-      });
-
-      expect(result.legs).toEqual([
-        { distanceMeters: 0, durationSeconds: 0 },
-      ]);
-      expect(result.totalDistanceMeters).toBe(0);
-      expect(result.totalDurationSeconds).toBe(0);
+    // A section without its summary must not be summed as 0 m / 0 s into a
+    // plausible leg, and a null route or section must not escape as a TypeError.
+    it.each([
+      ['a section missing summary', { routes: [{ sections: [{ polyline: '' }] }] }],
+      ['a summary missing duration', { routes: [{ sections: [{ summary: { length: 10 } }] }] }],
+      ['a null section', { routes: [{ sections: [null] }] }],
+      ['a null route', { routes: [null] }],
+      ['a route without sections', { routes: [{}] }],
+      ['a non-list routes', { routes: 'nope' }],
+    ])('raises a ConnectorError for %s', async (_label, body) => {
+      mockFetch.mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
+      await expect(
+        connector.route({
+          waypoints: [
+            { lat: 52.5, lng: 13.4 },
+            { lat: 52.6, lng: 13.5 },
+          ],
+        }),
+      ).rejects.toMatchObject({ name: 'ConnectorError', statusCode: 200 });
     });
   });
 });

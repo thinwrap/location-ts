@@ -93,6 +93,58 @@ describe('HereGeocodingConnector', () => {
       });
     });
 
+    // Live geocode "Empire State Building, New York": the POI's `title` is its
+    // name; `address.label` is the address.
+    const EMPIRE_STATE_ITEM = {
+      title: 'Empire State Building',
+      id: 'here:pds:place:840dr5ru-4bd2f1c7f0f8417ca8ee3e1a0d8f6b5f',
+      resultType: 'place',
+      address: {
+        label: 'Empire State Building, 20 W 34th St, New York, NY 10118, United States',
+        houseNumber: '20',
+        street: 'W 34th St',
+        city: 'New York',
+      },
+      position: { lat: 40.74844, lng: -73.98566 },
+    };
+
+    it('uses address.label, not the POI title, as formattedAddress', async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({ items: [EMPIRE_STATE_ITEM] }), { status: 200 }),
+      );
+
+      const result = await connector.geocode({ address: 'Empire State Building, New York' });
+
+      expect(result.candidates[0]!.formattedAddress).toBe(
+        'Empire State Building, 20 W 34th St, New York, NY 10118, United States',
+      );
+    });
+
+    it('uses address.label for reverse geocoding too', async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({ items: [EMPIRE_STATE_ITEM] }), { status: 200 }),
+      );
+
+      const result = await connector.reverseGeocode({ location: { lat: 40.74844, lng: -73.98566 } });
+
+      expect(result.candidates[0]!.formattedAddress).toContain('20 W 34th St');
+    });
+
+    it('falls back to the title only when address.label is absent', async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [{ title: 'Somewhere', position: { lat: 1, lng: 2 }, id: 'here:x' }],
+          }),
+          { status: 200 },
+        ),
+      );
+
+      const result = await connector.geocode({ address: 'Somewhere' });
+
+      expect(result.candidates[0]!.formattedAddress).toBe('Somewhere');
+    });
+
     it('falls back to address.label when title is absent', async () => {
       mockFetch.mockResolvedValueOnce(
         new Response(
@@ -152,8 +204,8 @@ describe('HereGeocodingConnector', () => {
         expect(url as string).toContain('in=countryCode%3AUSA%2CCAN');
       });
 
-      // The alpha-2→alpha-3 map now covers all ISO 3166-1 codes (loc-CR #141),
-      // so only genuinely non-ISO codes (e.g. user-assigned 'XX') raise.
+      // The alpha-2→alpha-3 map covers all ISO 3166-1 codes, so only genuinely
+      // non-ISO codes (e.g. user-assigned 'XX') raise.
       it('raises invalid_request for non-ISO alpha-2 codes', async () => {
         await expect(
           connector.geocode({

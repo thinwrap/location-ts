@@ -104,20 +104,23 @@ describe('GoogleGeocodingConnector', () => {
       });
     });
 
-    // outlier translation — `countryFilter: ['US', 'CA']` becomes
-    // Google's `components=country:US|country:CA` (pipe-separated key:value
-    // pairs). Translation lives in the connector, NOT in shared utils.
-    it('should translate countryFilter into components=country:XX|country:YY (outlier)', async () => {
+    it('should translate a single countryFilter entry into components=country:XX', async () => {
       mockFetch.mockResolvedValueOnce(buildGeocodeResponse());
 
-      await connector.geocode({
-        address: 'Springfield',
-        countryFilter: ['US', 'CA'],
-      });
+      await connector.geocode({ address: 'Windsor', countryFilter: ['CA'] });
 
       const [url] = mockFetch.mock.calls[0]!;
-      const params = parseUrlParams(url as string);
-      expect(params.get('components')).toBe('country:US|country:CA');
+      expect(parseUrlParams(url as string).get('components')).toBe('country:CA');
+    });
+
+    // Live: `components=country:US|country:CA` applies only the FIRST country
+    // (Windsor → Windsor CT only; CA|US → Windsor ON only) and pads with junk
+    // ("Mississauga" + US|CA → [Mississauga ON, "United States"]). No OR exists.
+    it('should reject more than one countryFilter entry with unsupported_option, before any request', async () => {
+      await expect(
+        connector.geocode({ address: 'Windsor', countryFilter: ['US', 'CA'] }),
+      ).rejects.toMatchObject({ providerCode: 'unsupported_option', statusCode: null });
+      expect(mockFetch).not.toHaveBeenCalled();
     });
 
     it('should omit components when countryFilter is undefined or empty', async () => {
@@ -203,6 +206,27 @@ describe('GoogleGeocodingConnector', () => {
       });
     });
 
+    // Google documents what each means: a key/billing problem and a
+    // retryable server error — not an unclassifiable `unknown`.
+    it.each([
+      ['OVER_DAILY_LIMIT', 'auth_failed'],
+      ['UNKNOWN_ERROR', 'provider_unavailable'],
+    ])('maps body.status === %s to %s', async (status, expected) => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({ status, results: [] }), { status: 200 }),
+      );
+      await expect(connector.geocode({ address: 'x' })).rejects.toMatchObject({
+        providerCode: expected,
+        statusCode: 200,
+      });
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({ status, results: [] }), { status: 200 }),
+      );
+      await expect(
+        connector.reverseGeocode({ location: { lat: 1, lng: 2 } }),
+      ).rejects.toMatchObject({ providerCode: expected });
+    });
+
     it('should throw ConnectorError with invalid_request on body.status === INVALID_REQUEST', async () => {
       mockFetch.mockResolvedValueOnce(
         new Response(
@@ -276,8 +300,7 @@ describe('GoogleGeocodingConnector', () => {
 
   // Google is documented to always populate `geometry.location`, but a
   // malformed row must never surface as a raw TypeError from the normalizer nor
-  // as a fabricated (0,0) "Null Island" candidate. Skip the row instead — the
-  // behaviour the location-php sibling already has.
+  // as a fabricated (0,0) "Null Island" candidate. Skip the row instead.
   describe('malformed result rows', () => {
     function buildResults(results: unknown[]) {
       return new Response(JSON.stringify({ status: 'OK', results }), {
@@ -546,6 +569,82 @@ describe('GoogleGeocodingConnector', () => {
         name: 'ConnectorError',
         providerCode: 'provider_unavailable',
         statusCode: 500,
+      });
+    });
+  });
+
+  // Live Places (New) autocomplete with an invalid key: HTTP 400,
+  // `error.status=INVALID_ARGUMENT`, `error.details[].reason=API_KEY_INVALID`.
+  describe('Places (New) ErrorInfo reasons', () => {
+    const invalidKeyBody = {
+      error: {
+        code: 400,
+        message: 'API key not valid. Please pass a valid API key.',
+        status: 'INVALID_ARGUMENT',
+        details: [
+          {
+            '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+            reason: 'API_KEY_INVALID',
+            domain: 'googleapis.com',
+            metadata: { service: 'places.googleapis.com' },
+          },
+          {
+            '@type': 'type.googleapis.com/google.rpc.LocalizedMessage',
+            locale: 'en-US',
+            message: 'API key not valid. Please pass a valid API key.',
+          },
+        ],
+      },
+    };
+
+    it('autocomplete maps HTTP 400 API_KEY_INVALID to auth_failed', async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify(invalidKeyBody), { status: 400 }),
+      );
+      await expect(connector.autocomplete({ input: 'Dizengoff' })).rejects.toMatchObject({
+        providerCode: 'auth_failed',
+        statusCode: 400,
+        providerMessage: 'API key not valid. Please pass a valid API key.',
+      });
+    });
+
+    it('placeDetails maps HTTP 400 API_KEY_INVALID to auth_failed', async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify(invalidKeyBody), { status: 400 }),
+      );
+      await expect(connector.placeDetails({ placeId: 'ChIJ' })).rejects.toMatchObject({
+        providerCode: 'auth_failed',
+        statusCode: 400,
+      });
+    });
+
+    it('autocomplete maps RATE_LIMIT_EXCEEDED to rate_limited', async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 429,
+              status: 'RESOURCE_EXHAUSTED',
+              details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'RATE_LIMIT_EXCEEDED' }],
+            },
+          }),
+          { status: 429 },
+        ),
+      );
+      await expect(connector.autocomplete({ input: 'x' })).rejects.toMatchObject({
+        providerCode: 'rate_limited',
+      });
+    });
+
+    it('autocomplete keeps a reason-less HTTP 400 INVALID_ARGUMENT as invalid_request', async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { code: 400, message: 'bad input', status: 'INVALID_ARGUMENT' } }),
+          { status: 400 },
+        ),
+      );
+      await expect(connector.autocomplete({ input: 'x' })).rejects.toMatchObject({
+        providerCode: 'invalid_request',
       });
     });
   });

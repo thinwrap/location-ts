@@ -275,8 +275,41 @@ describe('MapboxGeocodingConnector', () => {
       expect(parseUrlParams(url as string).has('country')).toBe(false);
     });
 
-    // UUID session_token generated per call via crypto.randomUUID
-    it('should generate a session_token via crypto.randomUUID per call', async () => {
+    // Search Box: session_token is required on /suggest; the caller's typed
+    // sessionToken is forwarded, a UUIDv4 generated only when it is absent.
+    it('should forward a caller-supplied sessionToken instead of generating one', async () => {
+      mockFetch.mockResolvedValueOnce(buildSearchboxResponse());
+      const uuidSpy = vi.spyOn(webcrypto, 'randomUUID');
+
+      await connector.autocomplete({
+        input: 'coffee',
+        sessionToken: '3f2a1c58-9b4e-4d7a-8e21-6c5f0b7d9a34',
+      });
+
+      expect(uuidSpy).not.toHaveBeenCalled();
+      const [url] = mockFetch.mock.calls[0]!;
+      expect(parseUrlParams(url as string).get('session_token')).toBe(
+        '3f2a1c58-9b4e-4d7a-8e21-6c5f0b7d9a34',
+      );
+    });
+
+    it('should carry one sessionToken across autocomplete and placeDetails', async () => {
+      mockFetch
+        .mockResolvedValueOnce(buildSearchboxResponse())
+        .mockResolvedValueOnce(buildV6Response());
+      const sessionToken = '3f2a1c58-9b4e-4d7a-8e21-6c5f0b7d9a34';
+
+      await connector.autocomplete({ input: 'coff', sessionToken });
+      await connector.placeDetails({ placeId: 'dXJuOm1ieHBsYzphZGRyZXNz', sessionToken });
+
+      const suggest = parseUrlParams(mockFetch.mock.calls[0]![0] as string);
+      const retrieve = parseUrlParams(mockFetch.mock.calls[1]![0] as string);
+      expect(mockFetch.mock.calls[1]![0] as string).toContain('/searchbox/v1/retrieve/');
+      expect(suggest.get('session_token')).toBe(sessionToken);
+      expect(retrieve.get('session_token')).toBe(sessionToken);
+    });
+
+    it('should generate a session_token via crypto.randomUUID when none is supplied', async () => {
       mockFetch.mockResolvedValueOnce(buildSearchboxResponse());
       const uuidSpy = vi
         .spyOn(webcrypto, 'randomUUID')

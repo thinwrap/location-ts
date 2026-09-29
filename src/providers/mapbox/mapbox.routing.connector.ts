@@ -11,11 +11,18 @@ import {
   assertRouteHasLegs,
   encodePolyline,
   invertWaypointPositions,
+  isFiniteNumber,
+  isRecord,
   joinCoords,
+  malformedResponseError,
   mergePassthrough,
+  optionalArray,
 } from '../../utils';
+import { validateRoutingOptions } from '../../utils/validate-options';
 import { toIsoSeconds } from '../../utils/datetime';
+import { isTrafficRequested } from '../../utils/traffic';
 import type { MapboxConfig } from './mapbox.config';
+import { classifyMapboxEnvelopeCode, withRetryAfter } from './mapbox.envelope';
 
 const DIRECTIONS_URL = 'https://api.mapbox.com/directions/v5/mapbox';
 const OPTIMIZED_TRIPS_URL = 'https://api.mapbox.com/optimized-trips/v1/mapbox';
@@ -53,6 +60,7 @@ export class MapboxRoutingConnector
   }
 
   async route(options: IRoutingOptions): Promise<IRoutingResult> {
+    validateRoutingOptions(options, 'Mapbox Routing');
     if (options.waypoints.length < 2) {
       throw new ConnectorError({
         message: 'Mapbox Routing requires at least two waypoints',
@@ -78,13 +86,13 @@ export class MapboxRoutingConnector
       const errBody = (await response.json().catch(() => null)) as
         | Record<string, unknown>
         | null;
-      throw this.mapVendorError(response.status, errBody);
+      throw this.mapVendorError(response.status, errBody, response.headers.get('retry-after'));
     }
 
     const data = (await response.json().catch(() => null)) as
       | MapboxRoutingResponse
       | null;
-    if (data === null) {
+    if (!isRecord(data)) {
       throw new ConnectorError({
         message: 'Mapbox returned a malformed response body',
         statusCode: response.status,
@@ -98,7 +106,7 @@ export class MapboxRoutingConnector
       throw new ConnectorError({
         message: `Mapbox returned code: ${data.code}`,
         statusCode: response.status,
-        providerCode: this.mapBodyCode(data.code),
+        providerCode: this.mapBodyCode(String(data.code)),
         providerMessage: `Mapbox returned code: ${data.code}`,
         cause: data,
       });
@@ -106,13 +114,15 @@ export class MapboxRoutingConnector
 
     // `/optimized-trips/v1` returns the routes under `trips`; `/directions/v5`
     // returns them under `routes`. Normalize.
-    const routes =
-      (data.routes && data.routes.length > 0
-        ? data.routes
-        : (data.trips ?? [])) || [];
+    const directionsRoutes = optionalArray(data.routes);
+    const trips = optionalArray(data.trips);
+    if (directionsRoutes === null || trips === null) {
+      throw malformedResponseError('Mapbox Routing', '`routes`/`trips` is not a list', response.status, data);
+    }
+    const routes = directionsRoutes.length > 0 ? directionsRoutes : trips;
 
-    const route = routes[0];
-    if (!route) {
+    const route = routes[0] as MapboxRoutingRouteRaw | null | undefined;
+    if (route === undefined) {
       throw new ConnectorError({
         message: 'Mapbox returned no routes',
         statusCode: response.status,
@@ -124,16 +134,36 @@ export class MapboxRoutingConnector
       });
     }
 
-    const legs = (route.legs ?? []).map((leg) => ({
-      distanceMeters: leg.distance ?? 0,
-      durationSeconds: leg.duration ?? 0,
+    // A route or leg without its distance/duration would otherwise be reported
+    // as 0 m / 0 s — Mapbox always sends both, so absence is a body we cannot
+    // read, not a zero.
+    if (!isRecord(route) || !isFiniteNumber(route.distance) || !isFiniteNumber(route.duration)) {
+      throw malformedResponseError(
+        'Mapbox Routing',
+        'the first route has no distance/duration',
+        response.status,
+        data,
+      );
+    }
+    const rawLegs = optionalArray(route.legs);
+    if (
+      rawLegs === null ||
+      rawLegs.some(
+        (leg) => !isRecord(leg) || !isFiniteNumber(leg.distance) || !isFiniteNumber(leg.duration),
+      )
+    ) {
+      throw malformedResponseError('Mapbox Routing', 'a leg has no distance/duration', response.status, data);
+    }
+    const legs = (rawLegs as Required<MapboxRoutingLegRaw>[]).map((leg) => ({
+      distanceMeters: leg.distance,
+      durationSeconds: leg.duration,
     }));
-    assertRouteHasLegs(legs.length, options.waypoints.length, 'Mapbox Routing', data);
+    assertRouteHasLegs(legs.length, options.waypoints.length, 'Mapbox Routing', data, response.status);
 
     // Normalize the geometry to precision-5, decoding according to the
     // `geometries` value actually sent — NOT the connector's default, which
     // `_passthrough.query` may have overridden.
-    const polyline = normalizeGeometry(route.geometry, geometries);
+    const polyline = normalizeGeometry((route as MapboxRoutingRouteRaw).geometry, geometries);
 
     let waypointOrder: number[] | undefined;
     if (useOptimized && Array.isArray(data.waypoints)) {
@@ -153,8 +183,8 @@ export class MapboxRoutingConnector
 
     return {
       legs,
-      totalDistanceMeters: route.distance ?? 0,
-      totalDurationSeconds: route.duration ?? 0,
+      totalDistanceMeters: route.distance,
+      totalDurationSeconds: route.duration,
       polyline,
       waypointOrder,
       raw: data,
@@ -171,8 +201,13 @@ export class MapboxRoutingConnector
     options: IRoutingOptions,
     profile: string,
   ): Promise<MapboxDispatch> {
+    // Traffic is a PROFILE on Mapbox, not a flag. Directions accepts
+    // `driving-traffic` (with `depart_at`); walking and cycling have no traffic
+    // variant, so `trafficMode` does not affect them.
+    const traffic = profile === 'driving' && isTrafficRequested(options.trafficMode);
+    const directionsProfile = traffic ? 'driving-traffic' : profile;
     const coords = joinCoords(options.waypoints, 'lnglat', ';');
-    const url = `${DIRECTIONS_URL}/${profile}/${coords}`;
+    const url = `${DIRECTIONS_URL}/${directionsProfile}/${coords}`;
 
     const baseQuery: Record<string, string> = {
       access_token: this.config.accessToken,
@@ -180,10 +215,16 @@ export class MapboxRoutingConnector
       overview: mapboxOverview(options),
     };
 
-    const excludes = buildExcludes(options);
+    const excludes = buildExcludes(options, profile);
     if (excludes) baseQuery.exclude = excludes;
 
-    if (options.departureTime) {
+    // `depart_at` is sent only with traffic. On plain `driving` it is not
+    // neutral: Mapbox then predicts the duration "based on historical travel
+    // data" for that time, which is time-of-day traffic under another name, and
+    // `'none'` promises time-independent durations — so the time is dropped.
+    // Mapbox documents `depart_at` for the driving profiles only; walking and
+    // cycling durations do not depend on the time of day.
+    if (options.departureTime && traffic) {
       // Mapbox documents `depart_at` as one of exactly three ISO 8601 forms,
       // none carrying milliseconds — so seconds precision, not toISOString().
       baseQuery.depart_at = toIsoSeconds(options.departureTime);
@@ -208,17 +249,20 @@ export class MapboxRoutingConnector
    * and builds the `lng,lat;…` path. The `source`/`destination`/`roundtrip`
    * query params select the optimization shape.
    *
-   * Optimization v1 (OSRM-trip-based) requires that a non-roundtrip request fix
-   * at least one endpoint — `source=any` + `destination=any` + `roundtrip=false`
-   * is rejected. So plain `optimize` (and the both-fixed case) keeps BOTH
-   * endpoints and reorders the intermediates, matching Google/TomTom/HERE/Esri;
-   * the fixed-origin/-destination flags pin just their endpoint and free the
-   * other; `isRoundTrip` returns to the first waypoint.
+   * Optimization v1 (OSRM-trip-based) accepts a non-roundtrip request only as
+   * `source=first` + `destination=last`; every other `roundtrip=false`
+   * combination is documented as unsupported. So plain `optimize` (and the
+   * both-fixed case) keeps BOTH endpoints and reorders the intermediates,
+   * matching Google/TomTom/HERE/Esri; a single fixed endpoint on an open route
+   * is refused up front (see {@link validateOptimizedCompat}); `isRoundTrip`
+   * returns to the first waypoint.
    */
   private async dispatchOptimized(
     options: IRoutingOptions,
     profile: string,
   ): Promise<MapboxDispatch> {
+    validateOptimizedCompat(options);
+
     const coords = joinCoords(options.waypoints, 'lnglat', ';');
     const url = `${OPTIMIZED_TRIPS_URL}/${profile}/${coords}`;
 
@@ -230,35 +274,19 @@ export class MapboxRoutingConnector
     };
 
     if (options.isRoundTrip === true) {
-      // Round trip returns to the first waypoint.
+      // Round trip returns to the first waypoint. Optimization v1 also honours
+      // a fixed last stop on a round trip (live: roundtrip=true&source=any&
+      // destination=last → 200 Ok), so optimizeFixedDestination is forwarded.
       baseQuery.source = 'first';
-    } else if (
-      options.optimizeFixedOrigin === true &&
-      options.optimizeFixedDestination !== true
-    ) {
-      baseQuery.source = 'first';
-      baseQuery.destination = 'any';
-    } else if (
-      options.optimizeFixedDestination === true &&
-      options.optimizeFixedOrigin !== true
-    ) {
-      baseQuery.source = 'any';
-      baseQuery.destination = 'last';
+      if (options.optimizeFixedDestination === true) {
+        baseQuery.destination = 'last';
+      }
     } else {
       // Plain `optimize`, or both endpoints fixed: keep origin first and
-      // destination last, reorder the middle (the only any/any alternative that
-      // v1 accepts for a non-roundtrip request).
+      // destination last, reorder the middle (the only open-route combination
+      // v1 accepts).
       baseQuery.source = 'first';
       baseQuery.destination = 'last';
-    }
-
-    const excludes = buildExcludes(options);
-    if (excludes) baseQuery.exclude = excludes;
-
-    if (options.departureTime) {
-      // Mapbox documents `depart_at` as one of exactly three ISO 8601 forms,
-      // none carrying milliseconds — so seconds precision, not toISOString().
-      baseQuery.depart_at = toIsoSeconds(options.departureTime);
     }
 
     const merged = mergePassthrough(
@@ -282,6 +310,7 @@ export class MapboxRoutingConnector
   private mapVendorError(
     status: number,
     body: Record<string, unknown> | null,
+    retryAfter: string | null,
   ): ConnectorError {
     const code = typeof body?.code === 'string' ? body.code : '';
     const vendorMessage =
@@ -297,16 +326,12 @@ export class MapboxRoutingConnector
     } else if (status === 429) {
       providerCode = 'rate_limited';
     } else if (status === 422) {
-      // Live-verified: Mapbox serves its no-route envelope with HTTP 422, so the
-      // envelope code — not the status — decides whether this is "no route" or a
-      // malformed request.
-      if (code === 'NoRoute' || code === 'NoTrips' || code === 'NoSegment') {
-        providerCode = 'no_route';
-      } else if (code === 'ProcessingError') {
-        providerCode = 'unknown';
-      } else {
-        providerCode = 'unknown';
-      }
+      // Mapbox serves BOTH its no-route envelope and its request-validation
+      // failures with HTTP 422 (live: cycling `exclude=toll` → 422
+      // `{"code":"InvalidInput","message":"exclude value must be one of: …"}`),
+      // so the envelope code decides; a code the table does not know is a
+      // request Mapbox refused.
+      providerCode = classifyMapboxEnvelopeCode(code) ?? 'invalid_request';
     } else if (status >= 500 && status < 600) {
       providerCode = 'provider_unavailable';
     } else if (status === 400) {
@@ -322,36 +347,27 @@ export class MapboxRoutingConnector
           ? `Mapbox returned code: ${code}`
           : `Mapbox routing failed: HTTP ${status}`;
 
+    // Retry-After is surfaced like every other connector: parsed seconds in
+    // the message, the raw header on `cause.retryAfter`.
     return new ConnectorError({
       message,
       statusCode: status,
       providerCode,
-      providerMessage: message,
-      cause: body ?? undefined,
+      providerMessage: withRetryAfter(message, retryAfter),
+      cause: retryAfter !== null ? { ...(body ?? {}), retryAfter } : (body ?? undefined),
     });
   }
 
   /**
    * Map a 200-OK envelope error code (`data.code !== 'Ok'`) to ProviderCode.
    * Mapbox occasionally returns HTTP 200 with a non-Ok envelope code such as
-   * `NoRoute`, `NoSegment`, or `ProcessingError`.
+   * `NoRoute`, `NoSegment`, or `ProcessingError`; Optimization v1 answers an
+   * unimplemented source/destination/roundtrip combination with 200
+   * `NotImplemented` (reachable only via a passthrough override, since the
+   * pre-flight check refuses those).
    */
   private mapBodyCode(code: string): ProviderCode {
-    switch (code) {
-      // The request was well-formed and Mapbox answered — there is simply no
-      // connecting route (or no road near a coordinate to snap to). A business
-      // outcome to branch on, not a client bug.
-      case 'NoRoute':
-      case 'NoTrips':
-      case 'NoSegment':
-        return 'no_route';
-      case 'InvalidInput':
-        return 'invalid_request';
-      case 'ProcessingError':
-        return 'unknown';
-      default:
-        return 'unknown';
-    }
+    return classifyMapboxEnvelopeCode(code) ?? 'unknown';
   }
 
   private mapProfile(mode?: 'driving' | 'walking' | 'cycling'): string {
@@ -426,11 +442,79 @@ function mapboxOverview(options: IRoutingOptions): string {
   return options.polylineQuality === 'detailed' ? 'full' : 'simplified';
 }
 
-function buildExcludes(options: IRoutingOptions): string {
+/**
+ * Reject optimize inputs Optimization v1 cannot express, before any request.
+ *
+ * - `roundtrip=false` works only as `source=first` + `destination=last`; a single
+ *   fixed endpoint (first/any, any/last) is unsupported, and pinning the free end
+ *   too would silently change what was asked for.
+ * - The endpoint takes no `exclude` and no `depart_at` — its optional parameters
+ *   are annotations, approaches, bearings, destination, distributions,
+ *   geometries, language, overview, radiuses, source, steps and roundtrip, and
+ *   "unrecognized options in the query string result in an InvalidInput error".
+ *
+ * Traffic: Optimization v1 has no `driving-traffic` profile, so `'traffic'` is
+ * ignored (documented) rather than rejected. A `departureTime` is rejected only
+ * with traffic on driving — the one case where the time would have meant
+ * something. Under `'none'` it has no effect by definition, and walking and
+ * cycling have no traffic model, so there the time is dropped.
+ */
+function validateOptimizedCompat(options: IRoutingOptions): void {
+  const fixedOrigin = options.optimizeFixedOrigin === true;
+  const fixedDestination = options.optimizeFixedDestination === true;
+  if (options.isRoundTrip !== true && fixedOrigin !== fixedDestination) {
+    const flag = fixedOrigin ? 'optimizeFixedOrigin' : 'optimizeFixedDestination';
+    throw new ConnectorError({
+      message: `Mapbox Optimization does not support ${flag} alone on an open route`,
+      statusCode: null,
+      providerCode: 'unsupported_option',
+      providerMessage:
+        'Mapbox Optimization v1 supports an open route (roundtrip=false) only with both endpoints fixed; set both optimizeFixedOrigin and optimizeFixedDestination, or isRoundTrip',
+    });
+  }
+
+  for (const flag of ['avoidTolls', 'avoidFerries', 'avoidHighways'] as const) {
+    if (options[flag] === true) {
+      throw new ConnectorError({
+        message: `Mapbox Optimization does not support ${flag}`,
+        statusCode: null,
+        providerCode: 'unsupported_option',
+        providerMessage: `Mapbox Optimization v1 has no exclude parameter, so ${flag} cannot be honoured on an optimized route`,
+      });
+    }
+  }
+
+  const driving = options.travelMode === undefined || options.travelMode === 'driving';
+  if (
+    options.departureTime !== undefined &&
+    driving &&
+    isTrafficRequested(options.trafficMode)
+  ) {
+    throw new ConnectorError({
+      message: 'Mapbox Optimization does not support departureTime with driving traffic',
+      statusCode: null,
+      providerCode: 'unsupported_field',
+      providerMessage:
+        'Mapbox Optimization v1 has no depart_at parameter, so departureTime cannot be honoured on an optimized route',
+    });
+  }
+}
+
+/**
+ * The Directions `exclude` value for the avoid flags on `profile`.
+ *
+ * Walking and cycling accept only `ferry` of the three (live: `exclude=toll` or
+ * `motorway` → 422 "exclude value must be one of: ferry, cash_only_tolls, …").
+ * Dropping toll/motorway there loses nothing: the cycling profile already
+ * avoids highways, walking follows sidewalks and trails, and tolls do not apply
+ * to either.
+ */
+function buildExcludes(options: IRoutingOptions, profile: string): string {
+  const motorized = profile === 'driving';
   const excludes: string[] = [];
-  if (options.avoidTolls) excludes.push('toll');
+  if (options.avoidTolls && motorized) excludes.push('toll');
   if (options.avoidFerries) excludes.push('ferry');
-  if (options.avoidHighways) excludes.push('motorway');
+  if (options.avoidHighways && motorized) excludes.push('motorway');
   return excludes.join(',');
 }
 

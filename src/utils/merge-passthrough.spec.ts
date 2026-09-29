@@ -32,6 +32,16 @@ describe('mergePassthrough', () => {
     expect(result.headers).toEqual({ 'X-A': '1', 'X-B': '99', 'X-C': '3' });
   });
 
+  it('replaces a connector header that differs only in case, keeping the caller spelling', () => {
+    const result = mergePassthrough({}, { 'X-Goog-FieldMask': 'routes.duration', 'X-Goog-Api-Key': 'k' }, {
+      headers: { 'x-goog-fieldmask': 'routes.distanceMeters' },
+    });
+    expect(result.headers).toEqual({
+      'X-Goog-Api-Key': 'k',
+      'x-goog-fieldmask': 'routes.distanceMeters',
+    });
+  });
+
   it('shallow-merges query, last-write-wins', () => {
     const result = mergePassthrough({}, {}, { query: { b: '99', c: '3' } }, { a: '1', b: '2' });
     expect(result.query).toEqual({ a: '1', b: '99', c: '3' });

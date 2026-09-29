@@ -9,11 +9,18 @@ import { ConnectorError } from '../../types';
 import {
   assertRouteHasLegs,
   invertWaypointPositions,
+  isFiniteNumber,
+  isRecord,
   joinCoords,
+  malformedResponseError,
   mergePassthrough,
+  optionalArray,
 } from '../../utils';
+import { validateRoutingOptions } from '../../utils/validate-options';
 import { validateOsrmBaseUrl } from './osrm.base-url';
-import type { OsrmConfig, OsrmExcludeClass } from './osrm.config';
+import type { OsrmConfig } from './osrm.config';
+import { classifyOsrmEnvelopeCode } from './osrm.envelope';
+import { resolveOsrmExcludes } from './osrm.exclude';
 import type { OsrmRouteResponse } from './osrm.types';
 
 /**
@@ -32,9 +39,14 @@ import type { OsrmRouteResponse } from './osrm.types';
  * before any HTTP work. The pre-flight checks raise typed
  * {@link ConnectorError} with `statusCode: null` for the location-extended
  * ProviderCode values:
- *   - `'unsupported_field'`   — `departureTime` set.
- *   - `'unsupported_option'`  — any of `avoidTolls | avoidFerries | avoidHighways` set.
- *   - `'invalid_request'`     — invalid `/trip` combo (source=any, destination=any, roundtrip=false).
+ *   - `'unsupported_option'`  — any of `avoidTolls | avoidFerries | avoidHighways` set
+ *                               without the matching declared exclude class.
+ *
+ * Traffic and departure time: OSRM routes on static profile speeds and has no
+ * time parameter; traffic would need a rebuilt graph (`osrm-contract` with
+ * edge-weight updates), not a request option. `trafficMode: 'traffic'` is
+ * therefore ignored, and `departureTime` with it. Under `'none'` a departure
+ * time has no effect by definition, so neither is rejected.
  *
  * the dispatch logic + error classification live entirely inside
  * this connector — there is no shared translator middleware. There
@@ -56,13 +68,21 @@ export class OsrmRoutingConnector
   }
 
   async route(options: IRoutingOptions): Promise<IRoutingResult> {
+    validateRoutingOptions(options, 'OSRM Routing');
     // Validated at CALL time, not construction time: a facade built at module
-    // load from environment config should not throw at import. Matches the
-    // location-go / location-py siblings, which already validate here.
+    // load from environment config should not throw at import.
     const baseUrl = validateOsrmBaseUrl(this.config);
 
-    // pre-flight validation runs synchronously before any HTTP call.
-    this.validateOsrmCompat(options);
+    // Pre-flight validation runs synchronously before any HTTP call; the first
+    // unsupported avoid flag wins.
+    //
+    // An open trip with exactly one fixed endpoint is deliberately NOT rejected:
+    // OSRM Trip accepts `source=first&destination=any` and
+    // `source=any&destination=last` with `roundtrip=false` since v5.27
+    // (osrm-backend `trip.cpp` `IsSupportedParameterCombination` =
+    // `roundtrip || fixed_start || fixed_end`). An older self-hosted build
+    // answers `NotImplemented`, which maps to `unsupported_option`.
+    const excludes = resolveOsrmExcludes(options, this.config);
 
     const waypoints = options.waypoints;
     if (waypoints.length < 2) {
@@ -89,18 +109,15 @@ export class OsrmRoutingConnector
 
     // `steps` and `annotations` are deliberately NOT sent on /route: nothing in
     // `IRoutingResult` reads them, and leg `distance`/`duration` are present
-    // regardless of `annotations`. (The Table service is different — it forces
+    // regardless of `annotations`. (The Table service is different — it sends
     // `annotations=duration,distance` because that IS what populates the cells.)
     const baseQuery: Record<string, string> = {
       overview: options.polylineQuality === 'detailed' ? 'full' : 'simplified',
       geometries: 'polyline',
     };
 
-    // Only classes the operator declared AND the caller asked for; validation
-    // above has already rejected any undeclared request.
-    const excludes = OSRM_AVOID_FLAGS.filter(
-      ([flag]) => options[flag] === true,
-    ).map(([, excludeClass]) => excludeClass);
+    // Only classes the operator declared AND the caller asked for; any
+    // undeclared request was already rejected above.
     if (excludes.length > 0) {
       baseQuery.exclude = excludes.join(',');
     }
@@ -110,10 +127,10 @@ export class OsrmRoutingConnector
       let source = options.optimizeFixedOrigin === true ? 'first' : 'any';
       let destination = options.optimizeFixedDestination === true ? 'last' : 'any';
       // OSRM rejects source=any + destination=any together with roundtrip=false
-      // (HTTP 400 NotImplemented). A plain `optimize` (neither endpoint fixed,
-      // open route) therefore keeps the input's first & last fixed and reorders
-      // the middle — matching the Mapbox Optimization v1 sibling. Every other
-      // combo (any fixed endpoint, or roundtrip=true) is already legal.
+      // (HTTP 400 NotImplemented) — the only unsupported combination. A plain
+      // `optimize` (neither endpoint fixed, open route) therefore keeps the
+      // input's first & last fixed and reorders the middle. first/any and
+      // any/last are sent as-is: OSRM >= 5.27 honours a single fixed end.
       if (!roundtrip && source === 'any' && destination === 'any') {
         source = 'first';
         destination = 'last';
@@ -144,7 +161,7 @@ export class OsrmRoutingConnector
     const data = (await response.json().catch(() => null)) as
       | OsrmRouteResponse
       | null;
-    if (data === null) {
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) {
       throw new ConnectorError({
         message: 'OSRM routing returned a malformed response body',
         statusCode: response.status,
@@ -165,12 +182,31 @@ export class OsrmRoutingConnector
       throw this.mapInBodyError(data, useTrip, response.status);
     }
 
+    // OSRM always sends a route's and each leg's distance and duration; one
+    // that is missing would otherwise surface as `undefined` in a numeric field.
     const route = routes[0];
-    const legs = (route.legs ?? []).map((leg) => ({
+    if (!isRecord(route) || !isFiniteNumber(route.distance) || !isFiniteNumber(route.duration)) {
+      throw malformedResponseError(
+        'OSRM routing',
+        'the first route has no distance/duration',
+        response.status,
+        data,
+      );
+    }
+    const rawLegs = optionalArray(route.legs);
+    if (
+      rawLegs === null ||
+      rawLegs.some(
+        (leg) => !isRecord(leg) || !isFiniteNumber(leg.distance) || !isFiniteNumber(leg.duration),
+      )
+    ) {
+      throw malformedResponseError('OSRM routing', 'a leg has no distance/duration', response.status, data);
+    }
+    const legs = (rawLegs as Array<{ distance: number; duration: number }>).map((leg) => ({
       distanceMeters: leg.distance,
       durationSeconds: leg.duration,
     }));
-    assertRouteHasLegs(legs.length, waypoints.length, 'OSRM routing', data);
+    assertRouteHasLegs(legs.length, waypoints.length, 'OSRM routing', data, response.status);
 
     // OSRM `geometries=polyline` returns precision-5 — no re-encoding.
     const polyline = typeof route.geometry === 'string' ? route.geometry : '';
@@ -199,42 +235,6 @@ export class OsrmRoutingConnector
       ...(waypointOrder !== undefined ? { waypointOrder } : {}),
       raw: data,
     };
-  }
-
-  /**
-   * Pre-flight validation raising typed {@link ConnectorError}
-   * with `statusCode: null` for OSRM-incompatible inputs. Runs at the top of
-   * `.route()` before any HTTP work.
-   *
-   * Order matters: `departureTime` first, then the three avoid-flags (first
-   * one set wins), then the invalid `/trip` combination check.
-   */
-  private validateOsrmCompat(options: IRoutingOptions): void {
-    if (options.departureTime !== undefined) {
-      throw new ConnectorError({
-        message: 'OSRM does not support departureTime',
-        statusCode: null,
-        providerCode: 'unsupported_field',
-        providerMessage: 'OSRM does not support departureTime',
-      });
-    }
-
-    // Whether an avoid-flag works depends on the OPERATOR'S build, not on OSRM:
-    // `exclude=toll` is rejected as `InvalidValue` by the public demo build and
-    // honoured by a self-hosted instance with the class compiled in. So the
-    // capability is declared in config, and anything not declared is still
-    // rejected up front rather than sent and bounced with an opaque error.
-    const supported = this.config?.supportedExcludeClasses ?? [];
-    for (const [flag, excludeClass] of OSRM_AVOID_FLAGS) {
-      if (options[flag] === true && !supported.includes(excludeClass)) {
-        throw new ConnectorError({
-          message: `OSRM does not support ${flag}`,
-          statusCode: null,
-          providerCode: 'unsupported_option',
-          providerMessage: `${flag} requires an OSRM build with the '${excludeClass}' exclude class compiled in; declare it via OsrmConfig.supportedExcludeClasses`,
-        });
-      }
-    }
   }
 
   /**
@@ -284,7 +284,7 @@ export class OsrmRoutingConnector
     // and InvalidValue all arrive as 400). So the envelope code — not the status
     // — is what distinguishes "no route exists" from "your request was wrong",
     // and it must be read here rather than only on the 200 path.
-    const classified = classifyOsrmEnvelopeCode(body, useTrip);
+    const classified = classifyOsrmEnvelopeCode(body, useTrip ? 'trip' : 'route');
     if (classified !== null) return classified;
 
     if (httpStatus === 400 || httpStatus === 404) return 'invalid_request';
@@ -319,7 +319,7 @@ export class OsrmRoutingConnector
     const isEmptyOk = code === 'Ok';
     const providerCode = isEmptyOk
       ? 'no_route'
-      : (classifyOsrmEnvelopeCode(body, useTrip) ?? 'unknown');
+      : (classifyOsrmEnvelopeCode(body, useTrip ? 'trip' : 'route') ?? 'unknown');
 
     const providerMessage =
       message !== '' && !isEmptyOk
@@ -373,62 +373,6 @@ export class OsrmRoutingConnector
  * cleanly here can still be absent server-side — hence the
  * `'profile_not_configured'` classification.
  */
-/**
- * Classify an OSRM envelope `code` into a {@link ProviderCode}, or `null` when
- * the body carries no code this connector recognizes (so the caller falls back
- * to HTTP-status mapping).
- *
- * Shared by both error paths because OSRM does not distinguish them: the codes
- * below arrive with a 4xx status in practice, and the same code on a 200 means
- * the same thing.
- *
- * - `NoRoute` / `NoSegment` / `NoTrips` → `no_route`: the request was
- *   well-formed and the server answered, there simply is no connecting route
- *   (or no road near a coordinate to snap to). A business outcome, not a bug.
- * - `InvalidQuery` / `InvalidOptions` / `InvalidValue` → `invalid_request`.
- *
- * A `NoRoute` whose message carries an explicit "profile not found" signal is
- * `profile_not_configured` instead — an operator error, not a missing route.
- * Missing profiles are NOT inferred from a generic `NoRoute` (too brittle).
- */
-function classifyOsrmEnvelopeCode(
-  body: { code?: unknown; message?: unknown } | null,
-  useTrip: boolean,
-): ProviderCode | null {
-  if (body === null) return null;
-  const code = typeof body.code === 'string' ? body.code : '';
-  const message = typeof body.message === 'string' ? body.message : '';
-
-  switch (code) {
-    case 'NoRoute':
-    case 'NoSegment':
-      return message !== '' && /profile\s+not\s+found/i.test(message)
-        ? 'profile_not_configured'
-        : 'no_route';
-    case 'NoTrips':
-      // A `/trip`-endpoint outcome. On a `/route` dispatch it should never
-      // occur, so an unexpected one stays unclassified rather than being
-      // reported as a routing outcome.
-      return useTrip ? 'no_route' : null;
-    case 'InvalidQuery':
-    case 'InvalidOptions':
-    case 'InvalidValue':
-      return 'invalid_request';
-    default:
-      return null;
-  }
-}
-
-/**
- * The normalized avoid-flag → OSRM `exclude` class mapping. Ordered, so the
- * first unsupported flag is the one reported.
- */
-const OSRM_AVOID_FLAGS: ReadonlyArray<[keyof IRoutingOptions, OsrmExcludeClass]> = [
-  ['avoidTolls', 'toll'],
-  ['avoidFerries', 'ferry'],
-  ['avoidHighways', 'motorway'],
-];
-
 function mapProfile(mode?: 'driving' | 'walking' | 'cycling'): string {
   switch (mode) {
     case 'walking':

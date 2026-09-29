@@ -16,19 +16,41 @@ import type { TrafficMode } from './routing.interface';
  * @see MatrixOptionsFor
  */
 export interface IMatrixOptions {
+  /** At least one entry; an empty list rejects with `ConnectorError` `invalid_request`. */
   origins: LatLng[];
+  /** At least one entry; an empty list rejects with `ConnectorError` `invalid_request`. */
   destinations: LatLng[];
+  /** Defaults to `'driving'`; any other value rejects with a `TypeError`. */
   travelMode?: 'driving' | 'walking' | 'cycling';
   avoidTolls?: boolean;
+  /**
+   * A value that is not a `Date` rejects with a `TypeError`; an invalid `Date`
+   * rejects with `ConnectorError` `invalid_request`, on every provider.
+   */
   departureTime?: Date;
 
   /**
-   * Whether to compute cells against live traffic. Defaults to `'none'`.
+   * Whether cells reflect the traffic expected at `departureTime` (`'traffic'`)
+   * or no time-of-day traffic at all (`'none'`, the default). `'live'` is a
+   * deprecated alias of `'traffic'`. See {@link TrafficMode}.
    *
    * Opt-in for the same reason as on routing — and the stakes are higher here.
    * Google's Route Matrix bills **per element**, so a traffic-aware 10x10 request
-   * moves 100 billed elements onto the Pro-tier SKU, not one. Passing
-   * `departureTime` alone therefore does NOT enable traffic; ask for it.
+   * moves 100 billed elements onto the Pro-tier SKU, not one. HERE Matrix bills
+   * one rate either way but applies live traffic whenever no departure time is
+   * sent, so its connector disables traffic explicitly to honour this default.
+   * Passing `departureTime` alone therefore does NOT enable traffic; ask for it.
+   *
+   * TomTom has no "no traffic" value: `'none'` sends `traffic: "historical"`
+   * with `departAt: "any"` (a time-independent average; the caller's time is
+   * dropped), and `'traffic'` sends `traffic: "live"`, departing `now` when no
+   * `departureTime` is given (TomTom rejects live traffic with `departAt: any`).
+   * Mapbox's `'traffic'` selects the `driving-traffic` profile, which cannot be
+   * combined with a `departureTime` (Matrix `depart_at` is a sign-up beta); on
+   * walking/cycling, which have no traffic model, the time is simply dropped.
+   * OSRM has no traffic model and ignores it.
+   *
+   * A value outside {@link TrafficMode} rejects with a `TypeError`.
    */
   trafficMode?: TrafficMode;
 
@@ -44,8 +66,7 @@ export interface IMatrixOptions {
  * are omitted from `cells[]` (the consumer can still inspect `result.raw`
  * for power-use).
  *
- * Distances normalized to meters; durations normalized to seconds
- * *
+ * Distances normalized to meters; durations normalized to seconds.
  */
 export interface IMatrixCell {
   originIndex: number;

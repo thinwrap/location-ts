@@ -25,13 +25,37 @@ export function assertFiniteCoordinate(
 }
 
 /**
+ * Reject a NaN / non-finite scalar that goes on the wire beside coordinates
+ * (an autocomplete `radius`), for the same reason as
+ * {@link assertFiniteCoordinate}: it would serialize as `NaN`, `Infinity` or a
+ * JSON `null`, which the provider misreads or rejects.
+ *
+ * @throws {TypeError} when `value` is not a number (misuse of the API).
+ * @throws {ConnectorError} `providerCode: 'invalid_request'` when it is NaN or infinite.
+ */
+export function assertFiniteNumber(value: unknown, context: string): void {
+  if (typeof value !== 'number') {
+    throw new TypeError(`${context} must be a number (received ${typeof value})`);
+  }
+  if (!Number.isFinite(value)) {
+    const message = `${context} must be a finite number`;
+    throw new ConnectorError({
+      message,
+      statusCode: null,
+      providerCode: 'invalid_request',
+      providerMessage: message,
+    });
+  }
+}
+
+/**
  * Format a single coordinate component as a fixed-notation decimal string,
  * never exponential.
  *
  * `String(v)` / template interpolation renders `0 < |v| < 1e-6` in exponential
  * notation (e.g. `String(0.0000003) === '3e-7'`), which providers reject or
- * misparse on the wire. This mirrors the Go sibling's
- * `strconv.FormatFloat(f, 'f', -1, 64)` shortest-fixed-point behavior.
+ * misparse on the wire. This is shortest-fixed-point formatting (Go's
+ * `strconv.FormatFloat(f, 'f', -1, 64)`).
  *
  * Ordinary coordinates and integers are returned byte-identical to `String(v)`:
  * `String(v)` is already the shortest round-tripping decimal and only reaches

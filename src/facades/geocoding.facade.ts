@@ -22,11 +22,17 @@ import { MapboxGeocodingConnector } from '../providers/mapbox';
 import { HereGeocodingConnector } from '../providers/here';
 import { EsriGeocodingConnector } from '../providers/esri';
 import { TomTomGeocodingConnector } from '../providers/tomtom';
+import { assertConfigObject } from './assert-config';
 
 export class Geocoding<P extends GeocodingProvider> implements IGeocodingConnector {
   readonly providerId: P;
   private connector: IGeocodingConnector;
 
+  /**
+   * @throws {TypeError} synchronously, for an unknown provider (or one without
+   *   a geocoding connector) or a missing config: misuse of the API, deliberately
+   *   not a `ConnectorError`.
+   */
   constructor(provider: P, config: ProviderConfigMap[P], fetchImpl?: typeof fetch) {
     this.providerId = provider;
     this.connector = createGeocodingConnector(provider, config, fetchImpl);
@@ -84,6 +90,7 @@ function createGeocodingConnector<P extends GeocodingProvider>(
   config: ProviderConfigMap[P],
   fetchImpl?: typeof fetch
 ): IGeocodingConnector {
+  assertConfigObject(config, 'Geocoding');
   switch (provider) {
     case 'google':
       return new GoogleGeocodingConnector(config as ProviderConfigMap['google'], fetchImpl);
@@ -96,6 +103,6 @@ function createGeocodingConnector<P extends GeocodingProvider>(
     case 'tomtom':
       return new TomTomGeocodingConnector(config as ProviderConfigMap['tomtom'], fetchImpl);
     default:
-      throw new Error(`Unknown geocoding provider: ${provider}`);
+      throw new TypeError(`Unknown geocoding provider: ${String(provider)}`);
   }
 }

@@ -20,21 +20,38 @@ import type { Passthrough } from './passthrough.type';
 export type PolylineQuality = 'simplified' | 'detailed';
 
 /**
- * How much traffic data a route should be computed against.
+ * Whether durations should reflect time-of-day traffic.
  *
- * `'none'` is the default, and that default is a **billing** decision as much as
- * a correctness one: on Google, traffic-aware routing is a Pro-tier SKU feature
- * while the base tier is Essentials, so a wrapper that quietly turns traffic on
- * moves the consumer to a more expensive SKU. Traffic is therefore always opt-in.
+ * - `'none'` (the default) — no time-of-day traffic: durations come from the
+ *   provider's time-independent speed model. That model is the provider's own
+ *   (free-flow on HERE and OSRM, a time-independent historical average on
+ *   Google, Esri, Mapbox and the TomTom matrix), so `'none'` does not promise
+ *   free-flow and the numbers still differ between providers. A `departureTime`
+ *   **never** adds traffic under `'none'`: where the provider would read the
+ *   time as a traffic input, the connector drops it or disables traffic.
+ * - `'traffic'` — the traffic expected at `departureTime`: live conditions when
+ *   the time is close to now, typical/predicted conditions for later times.
+ *   With no `departureTime`, the traffic for now.
+ * - `'live'` — **deprecated** alias of `'traffic'`, with identical behaviour.
+ *   It stays accepted indefinitely (it is public vocabulary); prefer
+ *   `'traffic'` in new code, because "live" undersells what a future
+ *   `departureTime` gets (predicted, not live, traffic).
  *
- * - `'none'` — free-flow / historical-free routing.
- * - `'live'` — use current traffic conditions where the provider supports it.
+ * `'none'` is the default as much for **billing** as for correctness: on Google,
+ * traffic-aware routing is a Pro-tier SKU feature while the base tier is
+ * Essentials, and HERE bills a routing request as Time-Aware Routing rather than
+ * basic routing unless traffic is explicitly disabled (HERE applies live traffic
+ * whenever no departure time is sent). A wrapper that quietly turned traffic on
+ * would move the consumer to a more expensive SKU, so traffic is always opt-in.
  *
- * Pair with `departureTime` for a future departure. Note that on providers where
- * a departure time alone implies traffic, `trafficMode` still governs: the
- * connector will not upgrade the request on your behalf.
+ * Approximations, where a provider cannot do exactly what is asked:
+ * - TomTom routing has no time-independent mode (`departAt=any` is rejected
+ *   there), so `'none'` sends `traffic=false`, and TomTom still applies its
+ *   typical (historic) traffic for the departure time, or for now.
+ * - OSRM, Mapbox Optimization (`optimize` on Mapbox) and walking/cycling on
+ *   every provider have no traffic model: `'traffic'` is ignored there.
  */
-export type TrafficMode = 'none' | 'live';
+export type TrafficMode = 'none' | 'traffic' | 'live';
 
 /**
  * Opt-in tokens for optional normalized output fields.
@@ -70,10 +87,21 @@ export interface IRoutingOptions {
   optimizeFixedOrigin?: boolean;
   optimizeFixedDestination?: boolean;
   isRoundTrip?: boolean;
+  /**
+   * A value that is not a `Date` rejects with a `TypeError`; an invalid `Date`
+   * (`new Date('garbage')`) rejects with `ConnectorError` `invalid_request`.
+   * Both are checked on every provider, including where the time is then
+   * dropped (see {@link TrafficMode}).
+   */
   departureTime?: Date;
   avoidTolls?: boolean;
   avoidFerries?: boolean;
   avoidHighways?: boolean;
+  /**
+   * Defaults to `'driving'`. Any other value rejects with a `TypeError`: the
+   * connector translates this vocabulary, so an unknown mode is a bug in the
+   * calling code, not request data (and is never silently routed as driving).
+   */
   travelMode?: 'driving' | 'walking' | 'cycling';
 
   /**
@@ -88,26 +116,36 @@ export interface IRoutingOptions {
    *
    * Silently ignoring is the right shape here (rather than throwing
    * `unsupported_option`) because fidelity is cosmetic: getting more vertices
-   * than asked for cannot make a caller's result wrong. Contrast `avoidTolls`,
-   * whose silent omission WOULD change routing semantics and therefore does
-   * throw. Precedent: `IAutocompleteOptions.radius` is likewise documented as
+   * than asked for cannot make a caller's result wrong. Contrast `avoidTolls` on
+   * a driving route, whose silent omission WOULD change routing semantics, so a
+   * provider that can't honour it (OSRM without the matching exclude class)
+   * rejects with `unsupported_option`.
+   * Precedent: `IAutocompleteOptions.radius` is likewise documented as
    * ignored by Mapbox and Esri.
+   *
+   * A value outside {@link PolylineQuality} rejects with a `TypeError`.
    */
   polylineQuality?: PolylineQuality;
 
   /**
-   * Whether to route against live traffic. Defaults to `'none'`.
+   * Whether durations reflect the traffic expected at `departureTime`
+   * (`'traffic'`) or no time-of-day traffic at all (`'none'`, the default).
+   * `'live'` is a deprecated alias of `'traffic'`. See {@link TrafficMode}.
    *
    * Opt-in because traffic is a billable upgrade on some providers — most
-   * notably Google, where it selects a Pro-tier SKU. Providers with no traffic
-   * control ignore it.
+   * notably Google, where it selects a Pro-tier SKU, and HERE, where a request
+   * that leaves traffic on is billed as Time-Aware Routing. Providers with no
+   * traffic model (OSRM, Mapbox Optimization) ignore `'traffic'`.
+   *
+   * A value outside {@link TrafficMode} rejects with a `TypeError`.
    */
   trafficMode?: TrafficMode;
 
   /**
    * Optional normalized output fields to fetch. Defaults to `[]` — nothing extra
    * is requested, so the response stays as small and as cheap as the provider
-   * allows.
+   * allows. A token outside {@link RoutingInclude} (or a non-array) rejects
+   * with a `TypeError`.
    *
    * @see RoutingInclude
    */
@@ -158,9 +196,8 @@ export interface IRoutingLeg {
  * visiting order is `A,C,B,D`, `waypointOrder` is `[0,2,1,3]`. Every routing
  * connector normalizes its vendor's native representation (inverse
  * permutations, intermediate-only lists, two-element pairs, etc.) to THIS
- * shape, guaranteeing identical output across providers and the location-php
- * sibling. Omitted when no optimization was requested or the vendor returned
- * no ordering.
+ * shape, guaranteeing identical output across providers. Omitted when no
+ * optimization was requested or the vendor returned no ordering.
  *
  * `raw` exposes the vendor's raw response body for consumer-side power-use;
  * typed as `unknown` to force consumer-side narrowing.

@@ -140,7 +140,7 @@ describe('EsriRoutingConnector', () => {
       expect(params.get('outSR')).toBe('4326');
     });
 
-    it('forwards departureTime as epoch milliseconds in `startTime`', async () => {
+    it('forwards departureTime with traffic as epoch milliseconds in `startTime`, flagged as UTC', async () => {
       mockFetch.mockResolvedValueOnce(buildSuccessResponse());
 
       const when = new Date('2024-01-15T08:00:00Z');
@@ -150,11 +150,88 @@ describe('EsriRoutingConnector', () => {
           { lat: 1, lng: 1 },
         ],
         departureTime: when,
+        trafficMode: 'traffic',
       });
 
       const [, init] = mockFetch.mock.calls[0]!;
       const params = parseForm(init!.body as string);
-      expect(params.get('startTime')).toBe(String(when.getTime()));
+      expect(params.get('startTime')).toBe('1705305600000');
+      // Route `startTimeIsUTC` defaults to false = the first stop's local zone.
+      expect(params.get('startTimeIsUTC')).toBe('true');
+    });
+
+    it('sends neither startTime nor startTimeIsUTC without a departureTime', async () => {
+      mockFetch.mockResolvedValueOnce(buildSuccessResponse());
+
+      await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+        ],
+      });
+
+      const [, init] = mockFetch.mock.calls[0]!;
+      const params = parseForm(init!.body as string);
+      expect(params.get('startTime')).toBeNull();
+      expect(params.get('startTimeIsUTC')).toBeNull();
+    });
+
+    it('rejects an invalid departureTime Date with invalid_request (no fetch)', async () => {
+      await expect(
+        connector.route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 1, lng: 1 },
+          ],
+          departureTime: new Date('not a date'),
+        }),
+      ).rejects.toMatchObject({ providerCode: 'invalid_request', statusCode: null });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('sends ignoreInvalidLocations=false so an unlocatable stop fails instead of being skipped', async () => {
+      mockFetch.mockResolvedValueOnce(buildSuccessResponse());
+
+      await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+        ],
+      });
+
+      const [, init] = mockFetch.mock.calls[0]!;
+      const params = parseForm(init!.body as string);
+      expect(params.get('ignoreInvalidLocations')).toBe('false');
+    });
+
+    it('surfaces the in-body unlocated-stop failure as no_route', async () => {
+      // With ignoreInvalidLocations=false ESRI documents: "Any invalid point will
+      // cause the request to return a failure" — an HTTP 200 error envelope whose
+      // details name the unlocated stop.
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 400,
+              message: 'Unable to complete operation.',
+              details: ['Location "Location 2" in "Stops" is unlocated.'],
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+
+      const err = await connector
+        .route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 1, lng: 1 },
+          ],
+        })
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ConnectorError);
+      expect((err as ConnectorError).providerCode).toBe('no_route');
+      expect((err as ConnectorError).statusCode).toBe(200);
     });
   });
 
@@ -426,6 +503,83 @@ describe('EsriRoutingConnector', () => {
       );
     });
 
+    // A caller may append or prepend accumulate attributes through passthrough.
+    // The extra `Cumul_*` columns come first here, so any "first matching key"
+    // rule would read them; legs must still come from the requested time
+    // attribute and Kilometers.
+    it.each([
+      ['driving', undefined, 'Cumul_TravelTime', 'Cumul_WalkTime'],
+      ['walking', 'walking' as const, 'Cumul_WalkTime', 'Cumul_TravelTime'],
+    ])(
+      '%s: extra accumulated columns never change which fields feed the legs',
+      async (_label, travelMode, timeKey, otherTimeKey) => {
+        const stop = (seq: number, minutes: number, km: number) => ({
+          attributes: {
+            Sequence: seq,
+            Status: 0,
+            Cumul_Miles: km * 0.621371,
+            Cumul_TruckTravelTime: minutes * 3,
+            [otherTimeKey]: minutes * 5,
+            [timeKey]: minutes,
+            Cumul_Kilometers: km,
+          },
+        });
+        mockFetch.mockResolvedValueOnce(
+          buildSuccessResponse(
+            buildSuccessBody({
+              stops: { features: [stop(1, 0, 0), stop(2, 10, 4), stop(3, 30, 12)] },
+            }),
+          ),
+        );
+
+        const result = await connector.route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 1, lng: 1 },
+            { lat: 2, lng: 2 },
+          ],
+          ...(travelMode !== undefined ? { travelMode } : {}),
+          _passthrough: {
+            body: {
+              accumulateAttributeNames: `TruckTravelTime,Miles,${timeKey.slice(6)},Kilometers`,
+            },
+          },
+        });
+
+        expect(result.legs).toEqual([
+          { distanceMeters: 4000, durationSeconds: 600 },
+          { distanceMeters: 8000, durationSeconds: 1200 },
+        ]);
+        expect(result.totalDistanceMeters).toBe(12000);
+        expect(result.totalDurationSeconds).toBe(1800);
+      },
+    );
+
+    it('reads the requested time total when stops are unusable, not another Total_*', async () => {
+      mockFetch.mockResolvedValueOnce(
+        buildSuccessResponse(
+          buildSuccessBody({
+            attributes: {
+              Total_TruckTravelTime: 99,
+              Total_TravelTime: 10,
+              Total_Kilometers: 8,
+            },
+            stops: OMIT_STOPS,
+          }),
+        ),
+      );
+
+      const result = await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+        ],
+      });
+
+      expect(result.totalDurationSeconds).toBe(600);
+      expect(result.totalDistanceMeters).toBe(8000);
+    });
+
     it('falls back to the route totals when a stop failed to locate', async () => {
       // A non-zero Status carries no usable cumulative cost, so every later
       // difference would be wrong. Prefer the route's own totals + an even split.
@@ -610,6 +764,88 @@ describe('EsriRoutingConnector', () => {
       expect(params.get('preserveLastStop')).toBe('true');
     });
 
+    // Live Route/solve: findBestSequence defaults BOTH preserve flags to true
+    // (order [0,1,2,3]); only an explicit `false` frees an end ([2,3,0,1]).
+    it.each([
+      ['plain optimize', { optimize: true }, 'true', 'true'],
+      ['optimize + optimizeFixedOrigin', { optimize: true, optimizeFixedOrigin: true }, 'true', 'false'],
+      ['optimizeFixedOrigin alone', { optimizeFixedOrigin: true }, 'true', 'false'],
+      ['optimizeFixedDestination alone', { optimizeFixedDestination: true }, 'false', 'true'],
+      ['both ends fixed, no optimize', { optimizeFixedOrigin: true, optimizeFixedDestination: true }, 'true', 'true'],
+    ] as const)('%s → findBestSequence with the matching preserve flags', async (_label, flags, first, last) => {
+      mockFetch.mockResolvedValueOnce(buildSuccessResponse());
+
+      await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+          { lat: 2, lng: 2 },
+          { lat: 3, lng: 3 },
+        ],
+        ...flags,
+      });
+
+      const params = parseForm(mockFetch.mock.calls[0]![1]!.body as string);
+      expect(params.get('findBestSequence')).toBe('true');
+      expect(params.get('preserveFirstStop')).toBe(first);
+      expect(params.get('preserveLastStop')).toBe(last);
+    });
+
+    it('sends no findBestSequence or preserve flags without an optimize flag', async () => {
+      mockFetch.mockResolvedValueOnce(buildSuccessResponse());
+      await connector.route({ waypoints: [{ lat: 0, lng: 0 }, { lat: 1, lng: 1 }] });
+      const params = parseForm(mockFetch.mock.calls[0]![1]!.body as string);
+      expect(params.has('findBestSequence')).toBe(false);
+      expect(params.has('preserveFirstStop')).toBe(false);
+      expect(params.has('preserveLastStop')).toBe(false);
+    });
+
+    // Live: walking + a request-level `restrictionAttributeNames=Avoid Ferries`
+    // is ignored (Esri's warning names only the mode's "Avoid Private Roads");
+    // appended inside the travel mode it is honoured.
+    it('puts avoid restrictions INSIDE the walking travel mode, not beside it', async () => {
+      mockFetch.mockResolvedValueOnce(buildSuccessResponse());
+
+      await connector.route({
+        waypoints: [
+          { lat: 40.7033, lng: -74.017 },
+          { lat: 40.6437, lng: -74.0736 },
+        ],
+        travelMode: 'walking',
+        avoidFerries: true,
+        avoidTolls: true,
+      });
+
+      const params = parseForm(mockFetch.mock.calls[0]![1]!.body as string);
+      expect(params.has('restrictionAttributeNames')).toBe(false);
+      const mode = JSON.parse(params.get('travelMode') as string);
+      expect(mode.name).toBe('Walking Time');
+      expect(mode.restrictionAttributeNames).toEqual([
+        'Avoid Private Roads',
+        'Avoid Roads Unsuitable for Pedestrians',
+        'Preferred for Pedestrians',
+        'Walking',
+        'Avoid Toll Roads',
+        'Avoid Ferries',
+      ]);
+    });
+
+    it('does not mutate the shared walking travel-mode constant', async () => {
+      mockFetch.mockResolvedValue(buildSuccessResponse());
+      await connector.route({
+        waypoints: [{ lat: 0, lng: 0 }, { lat: 1, lng: 1 }],
+        travelMode: 'walking',
+        avoidFerries: true,
+      });
+      mockFetch.mockResolvedValueOnce(buildSuccessResponse());
+      await connector.route({
+        waypoints: [{ lat: 0, lng: 0 }, { lat: 1, lng: 1 }],
+        travelMode: 'walking',
+      });
+      const mode = JSON.parse(parseForm(mockFetch.mock.calls[1]![1]!.body as string).get('travelMode') as string);
+      expect(mode.restrictionAttributeNames).not.toContain('Avoid Ferries');
+    });
+
     it('emits restrictionAttributeNames for avoid flags', async () => {
       mockFetch.mockResolvedValueOnce(buildSuccessResponse());
 
@@ -626,7 +862,8 @@ describe('EsriRoutingConnector', () => {
       const params = parseForm(init!.body as string);
       const restrictions = params.get('restrictionAttributeNames');
       expect(restrictions).toContain('Avoid Toll Roads');
-      // ArcGIS Network Analyst restriction name per baseline audit (loc-CR #73).
+      // Esri's Network Analyst restriction name for limited-access (highway)
+      // roads.
       expect(restrictions).toContain('Avoid Limited Access Roads');
     });
   });

@@ -27,15 +27,95 @@ export function assertRouteHasLegs(
   waypointCount: number,
   provider: string,
   raw: unknown,
+  statusCode: number | null = null,
 ): void {
   if (actualLegs > 0 || waypointCount < 2) return;
 
   const message = `${provider} returned a route with no legs for ${waypointCount} waypoints`;
   throw new ConnectorError({
     message,
-    statusCode: null,
+    statusCode,
     providerCode: 'no_route',
     providerMessage: message,
     cause: raw,
   });
+}
+
+/**
+ * The error for a 2xx body the connector cannot interpret: a missing or
+ * mistyped field, a `null` where an object belongs, a list that is not a list.
+ *
+ * Returning a zero-valued or empty result instead would hand the caller data
+ * the provider never sent, and letting the access throw would leak a raw
+ * `TypeError` outside the `ConnectorError` contract. `unknown` because no
+ * `ProviderCode` means "malformed provider body"; `cause` carries the body so
+ * the caller can see what actually arrived.
+ */
+export function malformedResponseError(
+  provider: string,
+  detail: string,
+  statusCode: number | null,
+  raw: unknown,
+): ConnectorError {
+  const message = `${provider} returned a malformed response: ${detail}`;
+  return new ConnectorError({
+    message,
+    statusCode,
+    providerCode: 'unknown',
+    providerMessage: message,
+    cause: raw,
+  });
+}
+
+/**
+ * The list at `value`, `[]` when the field is absent, or `null` when it is
+ * present but not an array — the caller turns `null` into
+ * {@link malformedResponseError}. Keeps "the provider found nothing" (absent or
+ * `[]`) apart from "the provider sent something we cannot read".
+ */
+export function optionalArray(value: unknown): unknown[] | null {
+  if (value === undefined || value === null) return [];
+  return Array.isArray(value) ? value : null;
+}
+
+/** Whether `value` is a non-null, non-array object whose fields can be read. */
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** Whether `value` is a finite number (the only shape a distance/duration may take). */
+export function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+/**
+ * Whether `value` is a usable polygon ring: at least one position, and every
+ * position a pair of finite numbers. A missing coordinate must never be read
+ * as 0, so a ring with one is unusable as a whole.
+ */
+export function isUsableRing(value: unknown): value is number[][] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (position) =>
+        Array.isArray(position) &&
+        position.length >= 2 &&
+        isFiniteNumber(position[0]) &&
+        isFiniteNumber(position[1]),
+    )
+  );
+}
+
+/**
+ * GeoJSON Polygon `coordinates` reduced to what is usable: the exterior ring
+ * plus every usable hole, or `null` when the exterior itself is unusable (a
+ * polygon without one describes no area). An unusable hole is dropped rather
+ * than failing the contour — losing a hole overstates the area slightly, while
+ * refusing the response would lose the whole isochrone.
+ */
+export function usablePolygon(value: unknown): number[][][] | null {
+  if (!Array.isArray(value) || !isUsableRing(value[0])) return null;
+  const [exterior, ...holes] = value as unknown[];
+  return [exterior as number[][], ...holes.filter(isUsableRing)];
 }

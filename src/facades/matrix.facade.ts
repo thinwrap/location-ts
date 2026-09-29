@@ -12,11 +12,17 @@ import { HereMatrixConnector } from '../providers/here';
 import { EsriMatrixConnector } from '../providers/esri';
 import { OsrmMatrixConnector } from '../providers/osrm';
 import { TomTomMatrixConnector } from '../providers/tomtom';
+import { assertConfigObject } from './assert-config';
 
 export class Matrix<P extends MatrixProvider> implements IMatrixConnector {
   readonly providerId: P;
   private connector: IMatrixConnector;
 
+  /**
+   * @throws {TypeError} synchronously, for an unknown provider (or one without
+   *   a matrix connector) or a missing config: misuse of the API, deliberately
+   *   not a `ConnectorError`.
+   */
   constructor(provider: P, config: ProviderConfigMap[P], fetchImpl?: typeof fetch) {
     this.providerId = provider;
     this.connector = createMatrixConnector(provider, config, fetchImpl);
@@ -35,6 +41,7 @@ function createMatrixConnector<P extends MatrixProvider>(
   config: ProviderConfigMap[P],
   fetchImpl?: typeof fetch
 ): IMatrixConnector {
+  assertConfigObject(config, 'Matrix');
   switch (provider) {
     case 'google':
       return new GoogleMatrixConnector(config as ProviderConfigMap['google'], fetchImpl);
@@ -49,6 +56,6 @@ function createMatrixConnector<P extends MatrixProvider>(
     case 'tomtom':
       return new TomTomMatrixConnector(config as ProviderConfigMap['tomtom'], fetchImpl);
     default:
-      throw new Error(`Unknown matrix provider: ${provider}`);
+      throw new TypeError(`Unknown matrix provider: ${String(provider)}`);
   }
 }

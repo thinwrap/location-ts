@@ -15,13 +15,15 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
-import { mergePassthrough } from '../../utils';
+import { isRecord, malformedResponseError, mergePassthrough, optionalArray } from '../../utils';
+import { validatePlaceDetailsOptions } from '../../utils/validate-options';
 import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
 import type { MapboxConfig } from './mapbox.config';
 import type {
   MapboxGeocodingV6Feature,
   MapboxGeocodingV6Response,
   MapboxSearchboxSuggestResponse,
+  MapboxSearchboxSuggestion,
 } from './mapbox.types';
 
 const GEOCODE_FORWARD_URL = 'https://api.mapbox.com/search/geocode/v6/forward';
@@ -41,12 +43,11 @@ const SEARCHBOX_SUGGEST_URL =
  * Autocomplete hits the separate Searchbox API:
  *   - `GET https://api.mapbox.com/search/searchbox/v1/suggest?q=…&session_token=…`
  *
- * **Session token generation.** Searchbox bills per `/suggest`→`/retrieve`
- * session, correlated by `session_token`. v1.0 generates one UUID per
- * `.autocomplete()` call via `webcrypto.randomUUID()` from `node:crypto`. A
- * consumer can override by passing `_passthrough.query.session_token`; the
- * `mergePassthrough` last-write-wins on `.query` lets the consumer override
- * the generated UUID.
+ * **Session token.** Searchbox requires `session_token` on both `/suggest` and
+ * `/retrieve` and bills per session, correlated by that token. Both calls send
+ * the caller's typed `sessionToken` when present, else a fresh UUIDv4 from
+ * `webcrypto.randomUUID()` (`node:crypto`). `_passthrough.query.session_token`
+ * still wins over either, via `mergePassthrough`'s last-write-wins on `.query`.
  *
  * **`radius` is documented no-op for Searchbox** (Searchbox lacks a
  * first-class radius parameter); for proximity biasing pass
@@ -118,13 +119,11 @@ export class MapboxGeocodingConnector
     const data = (await response.json().catch(() => null)) as
       | MapboxGeocodingV6Response
       | null;
-    if (data === null) {
+    if (!isRecord(data)) {
       throw this.malformedBodyError('geocoding', response.status);
     }
     return {
-      candidates: (data.features ?? [])
-        .map(normalizeFeature)
-        .filter((c): c is IGeocodeCandidate => c !== null),
+      candidates: normalizeFeatureList(data, 'geocoding', response.status),
       raw: data,
     };
   }
@@ -166,29 +165,28 @@ export class MapboxGeocodingConnector
     const data = (await response.json().catch(() => null)) as
       | MapboxGeocodingV6Response
       | null;
-    if (data === null) {
+    if (!isRecord(data)) {
       throw this.malformedBodyError('reverse geocoding', response.status);
     }
     // reverse-geocode mirrors forward shape — return all ranked
     // candidates, not just the first feature.
     return {
-      candidates: (data.features ?? [])
-        .map(normalizeFeature)
-        .filter((c): c is IGeocodeCandidate => c !== null),
+      candidates: normalizeFeatureList(data, 'reverse geocoding', response.status),
       raw: data,
     };
   }
 
   async autocomplete(
-    options: IAutocompleteOptions,
+    options: IAutocompleteOptions & { sessionToken?: string },
   ): Promise<IAutocompleteResult> {
-    // Searchbox requires a `session_token`. Generate a UUID per call;
-    // the consumer may override via `_passthrough.query.session_token` thanks
-    // to `mergePassthrough`'s last-write-wins on query.
+    // Searchbox requires a `session_token`, and only a token reused across the
+    // interaction bills it as one session — so the caller's wins, and a UUID is
+    // generated only when there is none. `_passthrough.query.session_token`
+    // still overrides both (last-write-wins on query).
     const baseQuery: Record<string, string> = {
       q: options.input,
       access_token: this.config.accessToken,
-      session_token: generateSessionToken(),
+      session_token: sessionTokenOrGenerated(options.sessionToken),
     };
 
     if (options.language) baseQuery.language = options.language;
@@ -223,53 +221,54 @@ export class MapboxGeocodingConnector
     const data = (await response.json().catch(() => null)) as
       | MapboxSearchboxSuggestResponse
       | null;
-    if (data === null) {
+    if (!isRecord(data)) {
       throw this.malformedBodyError('autocomplete', response.status);
     }
-    return {
-      predictions: (data.suggestions ?? []).map((s) => {
-        const prediction: IAutocompletePrediction = {
-          description: s.full_address ?? s.name ?? '',
-          ...(s.mapbox_id !== undefined ? { placeId: s.mapbox_id } : {}),
+    const suggestions = optionalArray(data.suggestions);
+    if (suggestions === null) {
+      throw malformedResponseError('Mapbox autocomplete', '`suggestions` is not a list', response.status, data);
+    }
+    const predictions: IAutocompletePrediction[] = [];
+    for (const row of suggestions) {
+      if (!isRecord(row)) continue;
+      const s = row as MapboxSearchboxSuggestion;
+      const prediction: IAutocompletePrediction = {
+        description: s.full_address ?? s.name ?? '',
+        ...(s.mapbox_id !== undefined ? { placeId: s.mapbox_id } : {}),
+      };
+      // Search Box returns `name` (the POI/street) and `place_formatted` (the
+      // rest of the address) as separate fields.
+      if (typeof s.name === 'string' && s.name !== '') {
+        prediction.structuredFormat = {
+          mainText: s.name,
+          ...(typeof s.place_formatted === 'string' && s.place_formatted !== ''
+            ? { secondaryText: s.place_formatted }
+            : {}),
         };
-        // Search Box returns `name` (the POI/street) and `place_formatted` (the
-        // rest of the address) as separate fields.
-        if (typeof s.name === 'string' && s.name !== '') {
-          prediction.structuredFormat = {
-            mainText: s.name,
-            ...(typeof s.place_formatted === 'string' && s.place_formatted !== ''
-              ? { secondaryText: s.place_formatted }
-              : {}),
-          };
-        }
-        return prediction;
-      }),
-      raw: data,
-    };
+      }
+      predictions.push(prediction);
+    }
+    return { predictions, raw: data };
   }
 
-  /**
-   * Build a typed ConnectorError for a 2xx response whose body failed to parse
-   * (empty / non-JSON), so a raw SyntaxError never escapes the connector.
-   */
   /**
    * Resolve a Mapbox `mapbox_id` to a full candidate.
    *
    * `GET https://api.mapbox.com/search/searchbox/v1/retrieve/{mapbox_id}`.
    *
-   * Pass the SAME `sessionToken` used for the preceding `autocomplete()` call:
+   * Pass the SAME `sessionToken` used for the preceding `autocomplete()` calls:
    * Search Box bills per *session*, so a matching token makes suggest+retrieve one
-   * billable session and a missing or fresh one makes it two.
+   * billable session. `session_token` is required on `/retrieve`, so without one
+   * a fresh UUID is sent and the retrieve bills as its own session.
    */
   async placeDetails(
     options: IPlaceDetailsOptions & { sessionToken?: string },
   ): Promise<IPlaceDetailsResult> {
+    validatePlaceDetailsOptions(options);
     const query: Record<string, string> = {
       access_token: this.config.accessToken,
+      session_token: sessionTokenOrGenerated(options.sessionToken),
     };
-    if (options.sessionToken !== undefined) {
-      query.session_token = options.sessionToken;
-    }
     if (options.language !== undefined) {
       query.language = options.language;
     }
@@ -285,6 +284,11 @@ export class MapboxGeocodingConnector
         string,
         unknown
       > | null;
+      // Search Box answers an id it cannot resolve with 404 ("No data found for
+      // requested ID", live): no place, not a failure.
+      if (response.status === 404) {
+        return { candidate: null, raw: errBody };
+      }
       throw new ConnectorError({
         message: `Mapbox Place Details failed: ${response.status}`,
         statusCode: response.status,
@@ -297,26 +301,27 @@ export class MapboxGeocodingConnector
     const data = (await response.json().catch(() => null)) as
       | MapboxGeocodingV6Response
       | null;
-    if (data === null) {
+    if (!isRecord(data)) {
       throw this.malformedBodyError('place details', response.status);
     }
 
     // Retrieve returns a GeoJSON FeatureCollection, the same shape as v6 geocode —
-    // so it reuses the geocode normalizer rather than duplicating it.
-    const feature = data.features?.[0];
-    const candidate = feature !== undefined ? normalizeFeature(feature) : null;
+    // so it reuses the geocode normalizer rather than duplicating it. No feature,
+    // or one without coordinates, is no usable place: `null`, never (0,0).
+    const features = optionalArray(data.features);
+    if (features === null) {
+      throw malformedResponseError('Mapbox place details', '`features` is not a list', response.status, data);
+    }
+    const feature = features[0];
+    const candidate = isRecord(feature)
+      ? normalizeFeature(feature as MapboxGeocodingV6Feature)
+      : null;
     if (candidate === null) {
-      throw new ConnectorError({
-        message: 'Mapbox Place Details returned no feature',
-        statusCode: response.status,
-        providerCode: 'no_route',
-        providerMessage: 'Mapbox Place Details returned no feature',
-        cause: data,
-      });
+      return { candidate: null, raw: data };
     }
 
     const wantsName = options.include?.includes('name') === true;
-    const name = feature?.properties?.name;
+    const name = (feature as MapboxGeocodingV6Feature).properties?.name;
     return {
       candidate,
       ...(wantsName && typeof name === 'string' && name !== '' ? { name } : {}),
@@ -324,6 +329,10 @@ export class MapboxGeocodingConnector
     };
   }
 
+  /**
+   * Build a typed ConnectorError for a 2xx response whose body failed to parse
+   * (empty / non-JSON), so a raw SyntaxError never escapes the connector.
+   */
   private malformedBodyError(
     operation: string,
     statusCode: number,
@@ -408,6 +417,24 @@ export class MapboxGeocodingConnector
 // Module-private helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * The candidates of a v6 FeatureCollection. An absent or empty `features` is
+ * "nothing found"; a `features` that is not a list is a body we cannot read.
+ */
+function normalizeFeatureList(
+  data: Record<string, unknown>,
+  operation: string,
+  statusCode: number,
+): IGeocodeCandidate[] {
+  const features = optionalArray(data.features);
+  if (features === null) {
+    throw malformedResponseError(`Mapbox ${operation}`, '`features` is not a list', statusCode, data);
+  }
+  return features
+    .map((f) => (isRecord(f) ? normalizeFeature(f as MapboxGeocodingV6Feature) : null))
+    .filter((c): c is IGeocodeCandidate => c !== null);
+}
+
 function normalizeFeature(f: MapboxGeocodingV6Feature): IGeocodeCandidate | null {
   const coords = f.geometry?.coordinates;
   // GeoJSON [lng, lat] order. Do NOT fabricate a (0,0) "Null Island" location
@@ -429,16 +456,21 @@ function normalizeFeature(f: MapboxGeocodingV6Feature): IGeocodeCandidate | null
     candidate.placeId = f.properties.mapbox_id;
   }
 
-  const bbox = f.properties?.bbox;
-  if (
-    bbox !== undefined &&
-    bbox.length === 4 &&
-    bbox.every((n) => typeof n === 'number')
-  ) {
-    candidate.viewport = {
-      southwest: { lat: bbox[1], lng: bbox[0] },
-      northeast: { lat: bbox[3], lng: bbox[2] },
-    };
+  // A partial bbox is dropped whole rather than 0-filled.
+  const bbox: unknown = f.properties?.bbox;
+  if (Array.isArray(bbox) && bbox.length === 4) {
+    const [west, south, east, north] = bbox as unknown[];
+    if (
+      typeof west === 'number' &&
+      typeof south === 'number' &&
+      typeof east === 'number' &&
+      typeof north === 'number'
+    ) {
+      candidate.viewport = {
+        southwest: { lat: south, lng: west },
+        northeast: { lat: north, lng: east },
+      };
+    }
   }
 
   return candidate;
@@ -461,4 +493,11 @@ function readMessage(body: Record<string, unknown> | null): string | null {
  */
 function generateSessionToken(): string {
   return webcrypto.randomUUID();
+}
+
+/** The caller's session token, or a fresh one when it is absent or empty. */
+function sessionTokenOrGenerated(sessionToken: string | undefined): string {
+  return sessionToken !== undefined && sessionToken !== ''
+    ? sessionToken
+    : generateSessionToken();
 }

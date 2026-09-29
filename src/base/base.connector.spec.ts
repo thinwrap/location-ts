@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { BaseConnector, isErrorBodyUnavailable } from './base.connector';
+import { BaseConnector, isErrorBodyUnavailable, type QueryParams } from './base.connector';
 import { ConnectorError } from '../types/error.types';
 
 class TestConnector extends BaseConnector {
@@ -9,7 +9,10 @@ class TestConnector extends BaseConnector {
     super(fetchImpl);
   }
 
-  callGet(url: string, opts?: { headers?: Record<string, string>; query?: Record<string, string> }) {
+  callGet(
+    url: string,
+    opts?: { headers?: Record<string, string>; query?: QueryParams; redirect?: 'manual' },
+  ) {
     return this.sendGet(url, opts);
   }
   callPostJson(url: string, body: unknown, opts?: { headers?: Record<string, string>; query?: Record<string, string> }) {
@@ -32,6 +35,54 @@ afterEach(() => {
 });
 
 describe('BaseConnector', () => {
+  describe('default fetch receiver', () => {
+    // Cloudflare Workers' fetch throws "Illegal invocation" unless it is called
+    // with the global scope as its receiver; an unbound reference invoked as
+    // `this.fetchImpl(...)` gets the connector instead.
+    it('invokes the global fetch with globalThis as its receiver', async () => {
+      const receivers: unknown[] = [];
+      vi.stubGlobal(
+        'fetch',
+        function (this: unknown) {
+          receivers.push(this);
+          return Promise.resolve(new Response('ok'));
+        },
+      );
+      await new TestConnector().callGet('https://api.example.com/x');
+      expect(receivers).toEqual([globalThis]);
+    });
+
+    it('leaves a caller-supplied fetchImpl untouched', async () => {
+      const own = vi.fn().mockResolvedValue(new Response('ok'));
+      const c = new TestConnector(own as unknown as typeof fetch);
+      await c.callGet('https://api.example.com/x');
+      expect(own).toHaveBeenCalledOnce();
+      expect(mockFetch).not.toHaveBeenCalled();
+      // Invoked as a method of the connector, exactly as before.
+      expect(own.mock.contexts[0]).toBe(c);
+    });
+  });
+
+  describe('Content-Type merge', () => {
+    it('lets a differently-cased caller header replace the default Content-Type', async () => {
+      mockFetch.mockResolvedValueOnce(new Response('ok'));
+      await new TestConnector().callPostJson('https://api.example.com/x', {}, {
+        headers: { 'content-type': 'application/geo+json' },
+      });
+      const headers = mockFetch.mock.calls[0]![1].headers as Record<string, string>;
+      expect(headers).toEqual({ 'content-type': 'application/geo+json' });
+    });
+
+    it('does the same for the form default', async () => {
+      mockFetch.mockResolvedValueOnce(new Response('ok'));
+      await new TestConnector().callPostForm('https://api.example.com/x', { a: '1' }, {
+        headers: { 'CONTENT-TYPE': 'text/plain' },
+      });
+      const headers = mockFetch.mock.calls[0]![1].headers as Record<string, string>;
+      expect(headers).toEqual({ 'CONTENT-TYPE': 'text/plain' });
+    });
+  });
+
   describe('sendGet', () => {
     it('issues GET without query when none provided', async () => {
       mockFetch.mockResolvedValueOnce(new Response('ok'));
@@ -51,6 +102,46 @@ describe('BaseConnector', () => {
       expect(url).toMatch(/^https:\/\/api\.example\.com\/x\?/);
       expect(url).toContain('a=1');
       expect(url).toContain('b=2');
+    });
+
+    it('emits an array value as repeated keys, never a comma list', async () => {
+      mockFetch.mockResolvedValueOnce(new Response('ok'));
+      const c = new TestConnector();
+      await c.callGet('https://api.example.com/x', {
+        query: { key: 'k', avoid: ['tollRoads', 'motorways'] },
+      });
+      const [url] = mockFetch.mock.calls[0]!;
+      expect(new URL(url as string).searchParams.getAll('avoid')).toEqual(['tollRoads', 'motorways']);
+      expect(url).toBe('https://api.example.com/x?key=k&avoid=tollRoads&avoid=motorways');
+    });
+
+    it('omits a key whose array value is empty', async () => {
+      mockFetch.mockResolvedValueOnce(new Response('ok'));
+      const c = new TestConnector();
+      await c.callGet('https://api.example.com/x', { query: { avoid: [] } });
+      expect(mockFetch.mock.calls[0]![0]).toBe('https://api.example.com/x');
+    });
+
+    it("defaults to redirect: 'error' and honours an explicit redirect: 'manual'", async () => {
+      mockFetch.mockResolvedValue(new Response('ok'));
+      const c = new TestConnector();
+      await c.callGet('https://api.example.com/x');
+      await c.callGet('https://api.example.com/x', { redirect: 'manual' });
+      expect(mockFetch.mock.calls[0]![1]?.redirect).toBe('error');
+      expect(mockFetch.mock.calls[1]![1]?.redirect).toBe('manual');
+      expect(mockFetch.mock.calls[1]![1]?.signal).toBeInstanceOf(AbortSignal);
+    });
+
+    it('rebuilds a thrown 303 under redirect: manual so its Location stays readable', async () => {
+      mockFetch.mockRejectedValueOnce(
+        new TypeError('fetch failed', {
+          cause: { statusCode: 303, headers: { location: 'https://next.example.com/r' }, body: null },
+        }),
+      );
+      const c = new TestConnector();
+      const res = await c.callGet('https://api.example.com/x', { redirect: 'manual' });
+      expect(res.status).toBe(303);
+      expect(res.headers.get('location')).toBe('https://next.example.com/r');
     });
 
     it('passes through headers', async () => {

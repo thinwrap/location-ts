@@ -16,4 +16,14 @@ export {
   isCompleteWaypointOrder,
   invertWaypointPositions,
 } from './waypoint-order';
-export { assertRouteHasLegs } from './response-completeness';
+export {
+  assertRouteHasLegs,
+  malformedResponseError,
+  optionalArray,
+  isRecord,
+  isFiniteNumber,
+  isUsableRing,
+  usablePolygon,
+} from './response-completeness';
+export { readPollingTimeoutMs } from './polling-timeout';
+export { toContourGeometry, closeRing, ringSignedArea } from './contour-geometry';

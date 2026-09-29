@@ -5,7 +5,84 @@ All notable changes to `@thinwrap/location` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] — 2026-09-29
+
+### Added
+
+- Mapbox `autocomplete()` takes a typed `sessionToken`, like Google.
+- Exported every list-valued default (Google field masks, HERE `return`/`matrixAttributes`, Mapbox/OSRM matrix `annotations`, Esri `accumulateAttributeNames`) to spread into a replacing `_passthrough`; matrix `annotations` is now replaceable too.
+- `trafficMode: 'traffic'`: the traffic expected at `departureTime` (live near now, predicted later; now when no time is given).
+
+### Changed
+
+- Isochrone contour `geometry` may now be a `GeoJsonMultiPolygon` (multi-part areas; holes kept, RFC 7946 winding); callers reading `coordinates` must check `type`.
+- `placeDetails()` returns `candidate: null` for a place id the provider cannot resolve (or a place without a location) instead of raising `no_route`; callers must null-check `candidate`.
+- With a `departureTime` and `trafficMode: 'none'`, Esri, Mapbox Directions and TomTom matrix now return time-independent durations (the time no longer adds typical traffic).
+- OSRM no longer rejects a `departureTime`; it has no time parameter, so the time is ignored.
+- Esri `trafficMode: 'traffic'` without a `departureTime` now uses live traffic (`now`) instead of none.
+- An unknown `travelMode`, `trafficMode`, `polylineQuality`, `include` token or isochrone `type` now rejects with a `TypeError` instead of silently defaulting.
+- Facade constructors throw `TypeError` for an unknown provider (was `Error`) and for a missing config (was a call-time failure).
+- A `departureTime` that is not a `Date` (isochrone: not a string) rejects with a `TypeError`.
+
+### Deprecated
+
+- `trafficMode: 'live'`: use `'traffic'`; `'live'` stays as an alias with identical behaviour.
+
+### Fixed
+
+- Google routes and matrix no longer fail with HTTP 400 when a `departureTime` is given with the default `trafficMode`.
+- An invalid `Date` `departureTime` raises `invalid_request` on every provider instead of a raw `RangeError`.
+- HERE isochrone rejects `'cycling'` with `unsupported_travel_mode` instead of computing a car isoline.
+- A NaN or infinite autocomplete `radius` raises `invalid_request` on Google, HERE and TomTom.
+- Google, HERE and TomTom matrix reject empty origins or destinations with `invalid_request` before any request.
+- TomTom matrix honours `trafficMode` (`'traffic'` → `traffic: live`, departing `now` without a time; `'none'` → `historical` + `departAt: any`).
+- OSRM matrix sends `exclude=toll` for `avoidTolls` when `supportedExcludeClasses` declares `toll`, like routing.
+- Google and TomTom matrix raise `unknown` for an empty or unreadable 2xx body instead of returning an empty matrix; a Google element with neither `condition` nor `status` is a failed cell.
+- HERE optimize sends every avoid flag to `findsequence2` (`tollroad`, `motorway`, `boatFerry`/`railFerry`), not just tolls.
+- Mapbox isochrone sends integer contours in increasing order, refuses sub-minute or colliding breaks, and reports each contour with the caller's value.
+- Esri isochrone reports each polygon with the caller's break value (7 s no longer comes back as 7.00002 s).
+- Google geocoding maps `OVER_DAILY_LIMIT` to `auth_failed` and `UNKNOWN_ERROR` to `provider_unavailable`.
+- Mapbox matrix maps `NoRoute`/`NoSegment` (200 or 422) to `no_route` and reads the 422 body code like routing.
+- OSRM matrix classifies 4xx/2xx envelope codes like routing (`NoSegment`/`NoTable` → `no_route`) and keeps the HTTP status on in-body errors.
+- Mapbox routing surfaces `Retry-After` like every other connector.
+- A 2xx body a connector cannot interpret raises `unknown` instead of a raw `TypeError`, zeros, `[[]]` polygons or an empty result; routes without legs raise `no_route`.
+- Partial Esri extents and malformed Mapbox bboxes drop `viewport` instead of 0-filling it.
+- Esri reverse geocode returns empty candidates for "Unable to find address" instead of `invalid_request`.
+- Esri matrix `odLines` rejects out-of-range OIDs.
+- `_passthrough.body.timeoutMs` accepts only a finite number of milliseconds > 0; anything else raises `invalid_request`.
+- Passthrough headers replace connector headers case-insensitively (no more `"mask-a, mask-b"` field masks).
+- Isochrone `departureTime` is validated before any request on every provider.
+- The default `fetch` is bound to `globalThis`, fixing "Illegal invocation" on Cloudflare Workers.
+- HERE isochrone `range[values]` never uses exponent notation.
+
+- Esri routing sends `startTimeIsUTC=true`, so departure times are no longer read in the first stop's local zone.
+- Esri matrix sends departure as `timeOfDay` + `timeOfDayIsUTC=true`; `solveODCostMatrix` has no `startTime`.
+- Esri isochrone sends `timeOfDayIsUTC=true`, and an unparseable `departureTime` on any Esri op raises `invalid_request`.
+- Esri distance isochrones use a `Kilometers` impedance (Walking Distance mode for walking) instead of the non-existent `breakUnits`.
+- Esri isochrones request detailed polygons only within Esri's 15 min / 15 mi limit.
+- Esri routing sends `ignoreInvalidLocations=false`, so an unlocatable stop raises `no_route` instead of being skipped silently.
+- TomTom matrix goes async above 100 cells, the default synchronous limit (was 2500).
+- TomTom isochrone rejects walking and cycling with `unsupported_travel_mode`; Reachable Range forbids both.
+- Mapbox optimize rejects a single fixed endpoint on an open route with `unsupported_option`; OSRM (≥ 5.27) sends `first/any` and `any/last` as asked.
+- Mapbox optimized trips reject avoid flags, and `departureTime` with driving traffic, up front; Directions sends `depart_at` only with driving traffic.
+- Mapbox `autocomplete()` and `placeDetails()` forward the caller's session token and always send `session_token`.
+- HERE routing builds legs per waypoint, so ferry and car-shuttle sections no longer add extra legs.
+- OSRM maps an older build's `NotImplemented` to `unsupported_option`, and baseUrl errors never echo `user:pass@` credentials.
+- TomTom routing sends each avoid flag as a repeated `avoid=` param; a comma list is a 400.
+- Esri routing and matrix put avoid restrictions inside the walking travel mode, where Esri actually reads them.
+- Esri and TomTom optimize on any of the three optimize flags; Esri frees the unfixed end with an explicit `preserve*Stop=false`.
+- Esri matrix raises `unknown` on a missing cost column, short cell or absent `odLines` total instead of reporting 0s.
+- Mapbox walking/cycling send only `exclude=ferry`, the one avoid value those profiles accept.
+- Mapbox `trafficMode: 'traffic'` selects the `driving-traffic` profile on Directions and Matrix.
+- Mapbox matrix rejects `avoidTolls` (`unsupported_option`) and `departureTime` with driving traffic (`unsupported_field`) instead of dropping them.
+- Mapbox round trips forward `optimizeFixedDestination` as `destination=last`.
+- Mapbox routing maps a 422 `InvalidInput` to `invalid_request` instead of `unknown`, and `NotImplemented` to `unsupported_option`.
+- HERE geocoding `formattedAddress` is `address.label`, not the POI `title`.
+- Google autocomplete and place details map `API_KEY_INVALID` (and the other ErrorInfo auth reasons) to `auth_failed`.
+- Google geocode rejects more than one `countryFilter` entry with `unsupported_option`; Google applies only the first.
+- HERE matrix poll and retrieve go through the shared transport, gaining its timeout and thrown-HTTP-error recovery.
+- Published types no longer import `geojson`; isochrone geometry is the exported `GeoJsonPolygon`.
+- HERE routing and matrix no longer apply live traffic unless `trafficMode: 'traffic'`, so routes bill at the basic rate instead of Time-Aware.
 
 ## [1.2.3] — 2026-08-08
 

@@ -1,3 +1,4 @@
 export { OsrmRoutingConnector } from './osrm.routing.connector';
 export { OsrmMatrixConnector } from './osrm.matrix.connector';
 export type { OsrmConfig, OsrmExcludeClass } from './osrm.config';
+export { OSRM_TABLE_ANNOTATIONS } from './osrm.defaults';

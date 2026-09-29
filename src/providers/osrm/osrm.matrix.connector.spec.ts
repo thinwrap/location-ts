@@ -158,22 +158,44 @@ describe('OsrmMatrixConnector', () => {
       connector = new OsrmMatrixConnector(defaultConfig);
     });
 
-    it('throws unsupported_field for departureTime', async () => {
-      try {
+    // No time parameter on /table and no request-time traffic: a departure time
+    // is ignored under every trafficMode instead of rejected.
+    for (const trafficMode of [undefined, 'none', 'traffic', 'live'] as const) {
+      it(`ignores departureTime (trafficMode ${String(trafficMode)}) without a time parameter`, async () => {
+        mockFetch.mockResolvedValueOnce(buildTableResponse());
         await connector.matrix({
           origins: TWO_ORIGINS,
           destinations: THREE_DESTS,
           departureTime: new Date('2024-06-15T08:00:00Z'),
+          trafficMode,
         });
-        expect.fail('expected throw');
-      } catch (err) {
-        expect(err).toBeInstanceOf(ConnectorError);
-        const ce = err as ConnectorError;
-        expect(ce.providerCode).toBe('unsupported_field');
-        expect(ce.statusCode).toBeNull();
-        expect(ce.providerMessage).toContain('departureTime');
-      }
+        const query = queryOf();
+        expect([...query.keys()].some((k) => /depart|time|traffic/i.test(k))).toBe(false);
+      });
+    }
+
+    // Same rule as the routing connector: a declared `toll` class is honoured
+    // on /table instead of always raising.
+    it('sends exclude=toll when the build declares the toll class', async () => {
+      mockFetch.mockResolvedValueOnce(buildTableResponse());
+      const withToll = new OsrmMatrixConnector({ ...defaultConfig, supportedExcludeClasses: ['toll'] });
+      await withToll.matrix({ origins: TWO_ORIGINS, destinations: THREE_DESTS, avoidTolls: true });
+      expect(queryOf().get('exclude')).toBe('toll');
+    });
+
+    it('still raises unsupported_option when only other classes are declared', async () => {
+      const ferryOnly = new OsrmMatrixConnector({ ...defaultConfig, supportedExcludeClasses: ['ferry'] });
+      await expect(
+        ferryOnly.matrix({ origins: TWO_ORIGINS, destinations: THREE_DESTS, avoidTolls: true }),
+      ).rejects.toMatchObject({ providerCode: 'unsupported_option', statusCode: null });
       expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('sends no exclude when avoidTolls is not set, even with the class declared', async () => {
+      mockFetch.mockResolvedValueOnce(buildTableResponse());
+      const withToll = new OsrmMatrixConnector({ ...defaultConfig, supportedExcludeClasses: ['toll'] });
+      await withToll.matrix({ origins: TWO_ORIGINS, destinations: THREE_DESTS });
+      expect(queryOf().has('exclude')).toBe(false);
     });
 
     it('throws unsupported_option for avoidTolls', async () => {
@@ -193,19 +215,16 @@ describe('OsrmMatrixConnector', () => {
       expect(mockFetch).not.toHaveBeenCalled();
     });
 
-    it('checks departureTime first when both pre-flight violations present', async () => {
-      try {
-        await connector.matrix({
+    it('still rejects avoidTolls when a departureTime is also given', async () => {
+      await expect(
+        connector.matrix({
           origins: TWO_ORIGINS,
           destinations: THREE_DESTS,
           departureTime: new Date('2024-06-15T08:00:00Z'),
           avoidTolls: true,
-        });
-        expect.fail('expected throw');
-      } catch (err) {
-        const ce = err as ConnectorError;
-        expect(ce.providerCode).toBe('unsupported_field');
-      }
+        }),
+      ).rejects.toMatchObject({ providerCode: 'unsupported_option', statusCode: null });
+      expect(mockFetch).not.toHaveBeenCalled();
     });
 
     it('does NOT throw for avoidTolls=false (falsy)', async () => {
@@ -321,30 +340,30 @@ describe('OsrmMatrixConnector', () => {
     });
   });
 
-  describe('Annotations invariant', () => {
+  describe('Annotations default', () => {
     let connector: OsrmMatrixConnector;
     beforeEach(() => {
       connector = new OsrmMatrixConnector(defaultConfig);
     });
 
-    it('forces annotations=duration,distance even when consumer attempts to override', async () => {
+    it('lets _passthrough.query.annotations replace the default list', async () => {
       mockFetch.mockResolvedValueOnce(buildTableResponse());
       await connector.matrix({
         origins: [{ lat: 0, lng: 0 }],
         destinations: [{ lat: 1, lng: 1 }],
-        _passthrough: { query: { annotations: 'duration' } },
+        _passthrough: { query: { annotations: 'distance,duration' } },
       });
       const q = queryOf();
-      expect(q.get('annotations')).toBe('duration,distance');
+      expect(q.getAll('annotations')).toEqual(['distance,duration']);
     });
 
-    it('still applies other _passthrough.query params alongside the annotations invariant', async () => {
+    it('keeps the default annotations when passthrough sets only other params', async () => {
       mockFetch.mockResolvedValueOnce(buildTableResponse());
       await connector.matrix({
         origins: [{ lat: 0, lng: 0 }],
         destinations: [{ lat: 1, lng: 1 }],
         _passthrough: {
-          query: { fallback_speed: '60', annotations: 'duration' },
+          query: { fallback_speed: '60' },
         },
       });
       const q = queryOf();
@@ -485,7 +504,8 @@ describe('OsrmMatrixConnector', () => {
       );
     }
 
-    it('maps NoTable → invalid_request', async () => {
+    // OSRM's Table service documents NoTable as "No route found".
+    it('maps NoTable → no_route and carries the HTTP status', async () => {
       mockFetch.mockResolvedValueOnce(buildInBodyError('NoTable', 'no table'));
       try {
         await connector.matrix({
@@ -495,9 +515,17 @@ describe('OsrmMatrixConnector', () => {
         expect.fail('expected throw');
       } catch (err) {
         const ce = err as ConnectorError;
-        expect(ce.providerCode).toBe('invalid_request');
+        expect(ce.providerCode).toBe('no_route');
         expect(ce.providerMessage).toBe('no table');
+        expect(ce.statusCode).toBe(200);
       }
+    });
+
+    it('maps a 2xx NoSegment → no_route', async () => {
+      mockFetch.mockResolvedValueOnce(buildInBodyError('NoSegment'));
+      await expect(
+        connector.matrix({ origins: [{ lat: 0, lng: 0 }], destinations: [{ lat: 1, lng: 1 }] }),
+      ).rejects.toMatchObject({ providerCode: 'no_route', statusCode: 200 });
     });
 
     it('maps InvalidQuery → invalid_request', async () => {
@@ -547,6 +575,22 @@ describe('OsrmMatrixConnector', () => {
     let connector: OsrmMatrixConnector;
     beforeEach(() => {
       connector = new OsrmMatrixConnector(defaultConfig);
+    });
+
+    // OSRM serves every non-Ok envelope with a 4xx, so the body code decides:
+    // the status alone would report NoSegment as a bad request.
+    it.each<[string, string]>([
+      ['NoSegment', 'no_route'],
+      ['NoTable', 'no_route'],
+      ['InvalidValue', 'invalid_request'],
+      ['NotImplemented', 'unsupported_option'],
+    ])('a 400 carrying %s maps to %s', async (code, expected) => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({ code, message: 'm' }), { status: 400 }),
+      );
+      await expect(
+        connector.matrix({ origins: TWO_ORIGINS, destinations: THREE_DESTS }),
+      ).rejects.toMatchObject({ providerCode: expected, statusCode: 400 });
     });
 
     it.each<[number, string]>([
@@ -634,16 +678,16 @@ describe('OsrmMatrixConnector', () => {
     });
   });
 
-  // LOC-CP-1 (loc-CR #79/#99) — sparse/asymmetric/short table dimension guard
-  describe('matrix dimension guard (LOC-CP-1)', () => {
+  // A sparse/asymmetric/short table must never be read as a full grid.
+  describe('matrix dimension guard', () => {
     let connector: OsrmMatrixConnector;
     beforeEach(() => {
       connector = new OsrmMatrixConnector(defaultConfig);
     });
 
     it('throws ConnectorError when a row is shorter than the destination count', async () => {
-      // 2 origins × 3 destinations, but row 1 has only 2 cols. Pre-fix this
-      // silently zero-filled cell [1][2]; now it must throw.
+      // 2 origins × 3 destinations, but row 1 has only 2 cols. Reading cell
+      // [1][2] anyway would fabricate it, so the table is refused.
       mockFetch.mockResolvedValueOnce(
         buildTableResponse({
           durations: [
@@ -667,7 +711,7 @@ describe('OsrmMatrixConnector', () => {
       expect(caught).toBeInstanceOf(ConnectorError);
       expect(caught?.providerCode).toBe('unknown');
       expect(caught?.providerMessage).toContain('2×3');
-      expect(caught?.statusCode).toBeNull();
+      expect(caught?.statusCode).toBe(200);
     });
 
     it('throws ConnectorError when the table has fewer rows than origins', async () => {

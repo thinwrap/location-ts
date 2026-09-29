@@ -360,9 +360,8 @@ describe('HereMatrixConnector', () => {
   });
 
   // Matrix v8 publishes the same eight transport modes as Routing v8 — verified
-  // live for `bus` and `privateBus`, both HTTP 200. This connector's own union
-  // used to stop at `scooter`, so `taxi`/`bus`/`privateBus` were unreachable
-  // without a cast even though the service accepts them.
+  // live for `bus` and `privateBus`, both HTTP 200 — so all of them must be
+  // reachable without a cast.
   it.each(['taxi', 'bus', 'privateBus'] as const)(
     'should forward the %s transport mode to the matrix body',
     async (mode) => {
@@ -415,6 +414,40 @@ describe('HereMatrixConnector', () => {
     expect((caught?.cause as { statusUrl?: string })?.statusUrl).toBe(
       'https://matrix.router.hereapi.com/v8/status/m1',
     );
+  });
+
+  // A deadline that is not a finite positive number of milliseconds is refused
+  // rather than coerced (parseInt of a string) or replaced by the 60 s default.
+  it.each([
+    ['a numeric string', '5000'],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['zero', 0],
+    ['a negative number', -1],
+    ['null', null],
+  ])('rejects timeoutMs given as %s before any request', async (_label, timeoutMs) => {
+    await expect(
+      connector.matrix({
+        origins: [{ lat: 0, lng: 0 }],
+        destinations: [{ lat: 1, lng: 1 }],
+        _passthrough: { body: { timeoutMs } },
+      }),
+    ).rejects.toMatchObject({ providerCode: 'invalid_request', statusCode: null });
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('accepts a fractional millisecond deadline as given', async () => {
+    mockFetch
+      .mockResolvedValueOnce(submitResp())
+      .mockResolvedValueOnce(completedResp())
+      .mockResolvedValueOnce(resultResp());
+    await expect(
+      connector.matrix({
+        origins: [{ lat: 0, lng: 0 }],
+        destinations: [{ lat: 1, lng: 1 }],
+        _passthrough: { body: { timeoutMs: 1500.5 } },
+      }),
+    ).resolves.toBeDefined();
   });
 
   // `timeoutMs` is wrapper-side; never reaches the vendor request body
@@ -546,6 +579,88 @@ describe('HereMatrixConnector', () => {
     expect(caught?.message).toContain('HERE Matrix poll');
   });
 
+  // The poll and retrieve hops share the base transport: its timeout, its
+  // sanitized transport errors, and its rebuild of an HTTP error that a host's
+  // global dispatcher (undici `interceptors.responseError()`) THREW.
+  describe('poll/retrieve transport', () => {
+    it('bounds the poll with a timeout signal and keeps redirect manual', async () => {
+      mockFetch
+        .mockResolvedValueOnce(submitResp())
+        .mockResolvedValueOnce(completedResp())
+        .mockResolvedValueOnce(resultResp());
+
+      await connector.matrix({ origins: [{ lat: 0, lng: 0 }], destinations: [{ lat: 1, lng: 1 }] });
+
+      const [, pollInit] = mockFetch.mock.calls[1]!;
+      expect(pollInit?.redirect).toBe('manual');
+      expect(pollInit?.signal).toBeInstanceOf(AbortSignal);
+      const [, retrieveInit] = mockFetch.mock.calls[2]!;
+      expect(retrieveInit?.redirect).toBe('manual');
+      expect(retrieveInit?.signal).toBeInstanceOf(AbortSignal);
+    });
+
+    it('maps a poll that times out to timeout', async () => {
+      mockFetch
+        .mockResolvedValueOnce(submitResp())
+        .mockRejectedValueOnce(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+
+      await expect(
+        connector.matrix({ origins: [{ lat: 0, lng: 0 }], destinations: [{ lat: 1, lng: 1 }] }),
+      ).rejects.toMatchObject({ providerCode: 'timeout', statusCode: null });
+    });
+
+    it('maps a 429 THROWN by the fetchImpl during the poll to rate_limited', async () => {
+      const thrown = new TypeError('fetch failed', {
+        cause: Object.assign(new Error('Response Error'), {
+          name: 'ResponseError',
+          code: 'UND_ERR_RESPONSE',
+          statusCode: 429,
+          headers: { 'retry-after': '7', 'content-type': 'application/json' },
+          body: { title: 'Too Many Requests', status: 429 },
+        }),
+      });
+      mockFetch.mockResolvedValueOnce(submitResp()).mockRejectedValueOnce(thrown);
+
+      const err = (await connector
+        .matrix({ origins: [{ lat: 0, lng: 0 }], destinations: [{ lat: 1, lng: 1 }] })
+        .catch((e: unknown) => e)) as ConnectorError;
+
+      expect(err).toBeInstanceOf(ConnectorError);
+      expect(err.providerCode).toBe('rate_limited');
+      expect(err.statusCode).toBe(429);
+      expect((err.cause as { retryAfter?: string }).retryAfter).toBe('7');
+    });
+
+    it('maps a 401 THROWN by the fetchImpl on the retrieve hop to auth_failed', async () => {
+      const thrown = new TypeError('fetch failed', {
+        cause: { statusCode: 401, headers: {}, body: { title: 'Unauthorized', status: 401 } },
+      });
+      mockFetch
+        .mockResolvedValueOnce(submitResp())
+        .mockResolvedValueOnce(completedResp())
+        .mockRejectedValueOnce(thrown);
+
+      await expect(
+        connector.matrix({ origins: [{ lat: 0, lng: 0 }], destinations: [{ lat: 1, lng: 1 }] }),
+      ).rejects.toMatchObject({ providerCode: 'auth_failed', statusCode: 401 });
+    });
+
+    it('never propagates a leaky fetchImpl message that embeds the apiKey', async () => {
+      mockFetch
+        .mockResolvedValueOnce(submitResp())
+        .mockRejectedValueOnce(
+          new TypeError('connect ECONNRESET https://matrix.router.hereapi.com/v8/status/m1?apiKey=test-here-key'),
+        );
+
+      const err = (await connector
+        .matrix({ origins: [{ lat: 0, lng: 0 }], destinations: [{ lat: 1, lng: 1 }] })
+        .catch((e: unknown) => e)) as ConnectorError;
+
+      expect(err.providerCode).toBe('provider_unavailable');
+      expect(JSON.stringify({ m: err.message, c: err.cause })).not.toContain('test-here-key');
+    });
+  });
+
   // Submit-phase missing matrixId/statusUrl → 'unknown'
   it('should throw unknown when submit response is missing matrixId', async () => {
     mockFetch.mockResolvedValueOnce(
@@ -593,6 +708,97 @@ describe('HereMatrixConnector', () => {
     expect((init?.headers as Record<string, string>)?.['X-Custom']).toBe('val');
   });
 
+  // Matrix v8 applies live traffic when `departureTime` is omitted, which would
+  // contradict the normalized `trafficMode: 'none'` default.
+  describe('trafficMode on the submit body', () => {
+    async function submitBody(
+      options: Omit<HereMatrixOptions, 'origins' | 'destinations'>,
+    ): Promise<Record<string, unknown>> {
+      mockFetch
+        .mockResolvedValueOnce(submitResp())
+        .mockResolvedValueOnce(completedResp())
+        .mockResolvedValueOnce(resultResp());
+      await connector.matrix({
+        origins: [{ lat: 0, lng: 0 }],
+        destinations: [{ lat: 1, lng: 1 }],
+        ...options,
+      });
+      const [, init] = mockFetch.mock.calls[0]!;
+      return JSON.parse(init!.body as string) as Record<string, unknown>;
+    }
+
+    it('sends departureTime "any" and no traffic by default', async () => {
+      const body = await submitBody({});
+      expect(body.departureTime).toBe('any');
+      expect(body).not.toHaveProperty('traffic');
+    });
+
+    it("treats an explicit 'none' the same as the default", async () => {
+      const body = await submitBody({ trafficMode: 'none' });
+      expect(body.departureTime).toBe('any');
+      expect(body).not.toHaveProperty('traffic');
+    });
+
+    it('keeps the caller departureTime and disables traffic when not live', async () => {
+      const body = await submitBody({
+        departureTime: new Date('2026-09-27T08:30:00Z'),
+      });
+      expect(body.departureTime).toBe('2026-09-27T08:30:00.000Z');
+      expect(body.traffic).toEqual({ mode: 'disabled' });
+    });
+
+    it("sends neither departureTime nor traffic on 'live' without a time", async () => {
+      const body = await submitBody({ trafficMode: 'live' });
+      expect(body).not.toHaveProperty('departureTime');
+      expect(body).not.toHaveProperty('traffic');
+    });
+
+    it("sends only the ISO departureTime on 'live' with a time", async () => {
+      const body = await submitBody({
+        trafficMode: 'live',
+        departureTime: new Date('2026-09-27T08:30:00Z'),
+      });
+      expect(body.departureTime).toBe('2026-09-27T08:30:00.000Z');
+      expect(body).not.toHaveProperty('traffic');
+    });
+
+    it('lets _passthrough.body override the traffic defaults', async () => {
+      const body = await submitBody({
+        departureTime: new Date('2026-09-27T08:30:00Z'),
+        _passthrough: { body: { traffic: { mode: 'default' } } },
+      });
+      expect(body.traffic).toEqual({ mode: 'default' });
+      expect(body.departureTime).toBe('2026-09-27T08:30:00.000Z');
+    });
+
+    // HERE answers `departureTime: "any"` + `arrivalTime` with HTTP 400.
+    it('disables traffic instead of sending any when passthrough sets arrivalTime', async () => {
+      const body = await submitBody({
+        _passthrough: { body: { arrivalTime: '2026-09-27T09:00:00Z' } },
+      });
+      expect(body).not.toHaveProperty('departureTime');
+      expect(body.arrivalTime).toBe('2026-09-27T09:00:00Z');
+      expect(body.traffic).toEqual({ mode: 'disabled' });
+    });
+
+    // Without this, the caller's time would replace `any` and HERE would apply
+    // live traffic to every cell.
+    it('disables traffic when passthrough sets departureTime', async () => {
+      const body = await submitBody({
+        _passthrough: { body: { departureTime: '2026-09-27T08:30:00Z' } },
+      });
+      expect(body.departureTime).toBe('2026-09-27T08:30:00Z');
+      expect(body.traffic).toEqual({ mode: 'disabled' });
+    });
+
+    // `disabled` would also drop long-term closures, which `any` keeps.
+    it('keeps the default when passthrough sets departureTime any', async () => {
+      const body = await submitBody({ _passthrough: { body: { departureTime: 'any' } } });
+      expect(body.departureTime).toBe('any');
+      expect(body).not.toHaveProperty('traffic');
+    });
+  });
+
   // Backwards-compat smoke: ConnectorError is thrown on submit failure
   it('should throw ConnectorError on submit 400', async () => {
     mockFetch.mockResolvedValueOnce(
@@ -607,11 +813,11 @@ describe('HereMatrixConnector', () => {
     ).rejects.toBeInstanceOf(ConnectorError);
   });
 
-  // LOC-CP-1 (loc-CR #79/#85/#99) — short/sparse flat-array dimension guard
-  describe('matrix dimension guard (LOC-CP-1)', () => {
+  // A short/sparse flat array must never be read as a full grid.
+  describe('matrix dimension guard', () => {
     it('throws ConnectorError when flat arrays are too short for the grid', async () => {
-      // 2×2 requested (needs 4 entries) but vendor returned only 3 — pre-fix
-      // the missing index silently read `?? 0`; now it must throw.
+      // 2×2 requested (needs 4 entries) but vendor returned only 3 — the
+      // missing index must not be read as a cell.
       mockFetch
         .mockResolvedValueOnce(submitResp())
         .mockResolvedValueOnce(completedResp())
@@ -683,10 +889,10 @@ describe('HereMatrixConnector', () => {
     });
   });
 
-  // WI-3: validate provider-supplied statusUrl (poll) / resultUrl (retrieve)
-  // before ever attaching the API key. A tampered submit response could
-  // otherwise exfiltrate apiKey to an arbitrary host.
-  describe('async URL validation (assertHereApiUrl, WI-3)', () => {
+  // Validate provider-supplied statusUrl (poll) / resultUrl (retrieve) before
+  // ever attaching the API key. A tampered submit response could otherwise
+  // exfiltrate apiKey to an arbitrary host.
+  describe('async URL validation (assertHereApiUrl)', () => {
     async function catchMatrix(): Promise<ConnectorError | null> {
       try {
         await connector.matrix({

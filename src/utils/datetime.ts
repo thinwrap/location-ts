@@ -1,3 +1,5 @@
+import { ConnectorError } from '../types';
+
 /**
  * ISO 8601 at *seconds* precision, zone designator retained
  * (`2026-08-07T03:06:00Z`).
@@ -19,4 +21,44 @@
  */
 export function toIsoSeconds(when: Date): string {
   return `${when.toISOString().slice(0, 19)}Z`;
+}
+
+/**
+ * Check a caller-supplied `departureTime` before any wire work.
+ *
+ * - Not a `Date` at all (a string, an epoch number) is a bug in the calling
+ *   code: the type says `Date`, so it is a `TypeError`.
+ * - An invalid `Date` (`new Date('garbage')`) is bad runtime data, typically a
+ *   time parsed from user input. Left alone, `toISOString()` throws a native
+ *   `RangeError: Invalid time value` from inside the connector, and an epoch
+ *   conversion sends `NaN`; it is a `ConnectorError` with `invalid_request`
+ *   instead, the error a vendor answers garbage with.
+ *
+ * Every routing and matrix connector calls this at the top of the operation,
+ * including where the time is then dropped (`trafficMode: 'none'` on some
+ * providers, walking, OSRM), so whether a bad value fails does not depend on
+ * the provider or on other options.
+ *
+ * @param context Names the connector for the error message.
+ * @throws {TypeError} when `when` is not a `Date`.
+ * @throws {ConnectorError} `providerCode: 'invalid_request'` for an invalid `Date`.
+ */
+export function assertValidDate(when: unknown, context: string): Date {
+  // Not `instanceof`: a Date from another realm (a vm context, an iframe) is
+  // still a Date.
+  if (Object.prototype.toString.call(when) !== '[object Date]') {
+    const received = typeof when === 'string' ? JSON.stringify(when) : typeof when;
+    throw new TypeError(`${context}: departureTime must be a Date (received ${received})`);
+  }
+  const date = when as Date;
+  if (Number.isNaN(date.getTime())) {
+    const message = `${context}: departureTime is not a valid date`;
+    throw new ConnectorError({
+      message,
+      statusCode: null,
+      providerCode: 'invalid_request',
+      providerMessage: message,
+    });
+  }
+  return date;
 }

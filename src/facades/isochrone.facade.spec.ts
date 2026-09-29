@@ -61,11 +61,30 @@ describe('Isochrone (unified facade)', () => {
     expect(new Isochrone('tomtom', { apiKey: 'tk' }).providerId).toBe('tomtom');
   });
 
-  it('should throw on unknown provider', () => {
-    expect(
+  it('should throw a TypeError on unknown provider', () => {
+    const create = () =>
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      () => new Isochrone('unknown' as any, {} as any)
-    ).toThrow('Unknown isochrone provider: unknown');
+      new Isochrone('unknown' as any, {} as any);
+    expect(create).toThrow(TypeError);
+    expect(create).toThrow('Unknown isochrone provider: unknown');
+  });
+
+  it('names a Symbol provider in the TypeError instead of crashing on it', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(() => new Isochrone(Symbol('x') as any, {} as any)).toThrow(
+      'Unknown isochrone provider: Symbol(x)',
+    );
+  });
+
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['a string', 'key'],
+  ])('throws a TypeError at construction for a %s config', (_label, config) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const create = () => new Isochrone('mapbox', config as any);
+    expect(create).toThrow(TypeError);
+    expect(create).toThrow('Isochrone requires a config object');
   });
 
   it('uses the injected fetchImpl when one is supplied to the facade', async () => {

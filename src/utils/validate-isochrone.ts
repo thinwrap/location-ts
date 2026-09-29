@@ -1,5 +1,6 @@
 import type { IIsochroneOptions } from '../types';
 import { ConnectorError } from '../types';
+import { assertOneOf, ISOCHRONE_TYPES, TRAVEL_MODES } from './assert-one-of';
 
 /**
  * Maximum number of contour breaks supported across all 4 Isochrone
@@ -8,12 +9,11 @@ import { ConnectorError } from '../types';
 export const MAX_ISOCHRONE_VALUES = 4;
 
 /**
- * Shared validator for the cross-provider 4-value cap.
+ * Shared entry validator for every per-connector `.isochrone()`, including the
+ * cross-provider 4-value cap.
  *
  * Invoked at the top of every per-connector `.isochrone()` implementation
- * before any wire work. Throws a `ConnectorError`
- * with `providerCode: 'invalid_request'` when `options.values.length` exceeds
- * the {@link MAX_ISOCHRONE_VALUES} ceiling.
+ * before any wire work.
  *
  * This is a deliberate small exception to the "no shared middleware"
  * rule: cross-cutting
@@ -21,9 +21,49 @@ export const MAX_ISOCHRONE_VALUES = 4;
  * per-vendor variance stays in the connector.
  *
  * @param options Caller-supplied isochrone options.
- * @throws {ConnectorError} when `options.values.length > MAX_ISOCHRONE_VALUES`.
+ * @throws {TypeError} when `type` is missing or not `'time'`/`'distance'`,
+ *   `travelMode` is not `'driving'`/`'walking'`/`'cycling'`, or `departureTime`
+ *   is not a string — misuse of the API, deliberately not a `ConnectorError`.
+ * @throws {ConnectorError} `providerCode: 'invalid_request'` when
+ *   `departureTime` does not parse, or `values` is empty, holds a non-positive
+ *   or non-finite break, or is longer than {@link MAX_ISOCHRONE_VALUES}.
  */
-export function validateIsochroneCap(options: Pick<IIsochroneOptions, 'values'>): void {
+export function validateIsochroneCap(
+  options: Pick<IIsochroneOptions, 'values'> &
+    Partial<Pick<IIsochroneOptions, 'type' | 'departureTime' | 'travelMode'>>,
+): void {
+  // Checked at runtime because a JS caller (or an `as` cast) can pass anything:
+  // every connector branches `type === 'time'` / else, so an empty or unknown
+  // value would silently be sent as a distance isochrone. The vocabulary is the
+  // library's API, not request data, so a value outside it is a `TypeError`.
+  // `travelMode` accepts the union of every provider's isochrone modes:
+  // `'cycling'` is a real mode that some providers lack, which the connector
+  // reports as `unsupported_travel_mode`.
+  if (options.type === undefined) {
+    throw new TypeError("isochrone type is required (expected one of 'time', 'distance')");
+  }
+  assertOneOf(options.type, ISOCHRONE_TYPES, 'isochrone type');
+  assertOneOf(options.travelMode, TRAVEL_MODES, 'travelMode');
+  if (options.departureTime !== undefined && typeof options.departureTime !== 'string') {
+    throw new TypeError(
+      `isochrone departureTime must be an ISO 8601 string (received ${typeof options.departureTime})`,
+    );
+  }
+  // Every provider takes the ISO 8601 string as-is, and none rejects garbage
+  // loudly enough to trust: an unparseable time is refused here instead.
+  if (
+    options.departureTime !== undefined &&
+    options.departureTime !== '' &&
+    !Number.isFinite(Date.parse(options.departureTime))
+  ) {
+    const message = 'isochrone departureTime is not a valid ISO 8601 date/time';
+    throw new ConnectorError({
+      message,
+      statusCode: null,
+      providerCode: 'invalid_request',
+      providerMessage: message,
+    });
+  }
   if (options.values.length < 1) {
     throw new ConnectorError({
       message: 'isochrone requires at least one break value',

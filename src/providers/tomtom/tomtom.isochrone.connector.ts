@@ -1,4 +1,3 @@
-import type { Polygon } from 'geojson';
 import { BaseConnector } from '../../base/base.connector';
 import type {
   IIsochroneConnector,
@@ -8,7 +7,13 @@ import type {
   ProviderCode,
 } from '../../types';
 import { ConnectorError } from '../../types';
-import { mergePassthrough, validateIsochroneCap } from '../../utils';
+import {
+  isFiniteNumber,
+  isRecord,
+  mergePassthrough,
+  toContourGeometry,
+  validateIsochroneCap,
+} from '../../utils';
 import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
 import type { TomTomConfig } from './tomtom.config';
 import type { TomTomReachableRangeResponse } from './tomtom.types';
@@ -16,11 +21,12 @@ import type { TomTomReachableRangeResponse } from './tomtom.types';
 const REACHABLE_RANGE_URL = 'https://api.tomtom.com/routing/1/calculateReachableRange';
 
 /**
- * TomTom Reachable Range connector — architectural outlier #5 in
- * *
+ * TomTom Reachable Range connector — the one isochrone connector that issues
+ * several HTTP calls per request.
+ *
  * TomTom's `calculateReachableRange` API takes only ONE budget value per call;
- * multi-band isochrones therefore require N parallel HTTP calls. Per
- * the N-call assembly lives inside this connector. This is the only connector
+ * multi-band isochrones therefore require N parallel HTTP calls, and the N-call
+ * assembly lives inside this connector. This is the only connector
  * that populates `result._meta` — and only when N>1 (multi-band). A single-band
  * request is a single HTTP call and omits `_meta` entirely.
  *
@@ -29,11 +35,10 @@ const REACHABLE_RANGE_URL = 'https://api.tomtom.com/routing/1/calculateReachable
  * (for `type: 'distance'`), `travelMode`, optional `departAt`, and the
  * `key=` API-key query parameter.
  *
- * **Travel mode mapping** with cycling per `IsochroneOptionsMap['tomtom']`
- * augmentation in `tomtom.types.ts`:
- * `'driving'` → `car`.
- * `'walking'` → `pedestrian`.
- * `'cycling'` → `bicycle`.
+ * **Travel mode.** `'driving'` (or unset) → `car`. `'walking'` and `'cycling'`
+ * raise `unsupported_travel_mode` before any request: TomTom documents that "in
+ * calculateReachableRange requests, the values bicycle and pedestrian must not
+ * be used" (allowed: car, truck, taxi, bus, van, motorcycle).
  *
  * **Promise.all semantics.** If ANY of the N calls fails the whole
  * `.isochrone` rejects with the first {@link ConnectorError} via
@@ -76,7 +81,7 @@ export class TomTomIsochroneConnector
 
     // Parse + normalize each response. Non-2xx paths are thrown inside
     // fetchOneBand; here we guard the body parse so a 2xx with an empty /
-    // non-JSON body surfaces as a ConnectorError, not a raw SyntaxError (#109).
+    // non-JSON body surfaces as a ConnectorError, not a raw SyntaxError.
     const datas = await Promise.all(
       responses.map(
         async (resp) =>
@@ -88,24 +93,23 @@ export class TomTomIsochroneConnector
 
     const contours: IIsochroneContour[] = datas
       .map((data, i) => {
-        // Guard against an unparseable body (#109) or a 2xx that lacks the
-        // `reachableRange.boundary` shape (#82) — surface as ConnectorError
-        // rather than a raw SyntaxError / TypeError.
-        const boundary = data?.reachableRange?.boundary;
-        if (!Array.isArray(boundary)) {
+        // An unparseable body, a 2xx without the `reachableRange.boundary`
+        // shape, an empty boundary or a point missing a coordinate describes no
+        // usable area — a ConnectorError, never a raw TypeError or a (0,0) point.
+        const ring = boundaryToRing(data?.reachableRange?.boundary);
+        if (ring === null) {
           throw new ConnectorError({
             message: 'TomTom Isochrone returned an unparseable or malformed body',
-            statusCode: null,
+            statusCode: responses[i]!.status,
             providerCode: 'unknown',
             providerMessage:
               'TomTom Isochrone returned an unparseable or malformed body',
             cause: data,
           });
         }
-        return {
-          value: options.values[i]!,
-          geometry: boundaryToPolygon(boundary),
-        };
+        // One boundary, so always a Polygon; its winding is normalized like
+        // every other provider's rather than trusted.
+        return { value: options.values[i]!, geometry: toContourGeometry([[ring]]) };
       })
       .sort((a, b) => a.value - b.value);
 
@@ -185,8 +189,9 @@ export class TomTomIsochroneConnector
   }
 
   /**
-   * Map TomTom (HTTP status) → canonical {@link ProviderCode}. Mirrors
-   * */
+   * Map TomTom (HTTP status) → canonical {@link ProviderCode}. TomTom documents
+   * 403 as an authorization failure only; its rate limit is 429.
+   */
   private mapVendorError(httpStatus: number): ProviderCode {
     if (httpStatus === 400) return 'invalid_request';
     if (httpStatus === 401 || httpStatus === 403) return 'auth_failed';
@@ -212,12 +217,22 @@ export class TomTomIsochroneConnector
     return base;
   }
 
+  /**
+   * Reachable Range forbids `pedestrian` and `bicycle`, so walking and cycling
+   * fail fast here rather than as a vendor 400 per band.
+   */
   private mapTravelMode(mode?: 'driving' | 'walking' | 'cycling'): string {
     switch (mode) {
       case 'walking':
-        return 'pedestrian';
-      case 'cycling':
-        return 'bicycle';
+      case 'cycling': {
+        const message = `TomTom Isochrone (calculateReachableRange) does not support travelMode "${mode}"`;
+        throw new ConnectorError({
+          message,
+          statusCode: null,
+          providerCode: 'unsupported_travel_mode',
+          providerMessage: message,
+        });
+      }
       default:
         return 'car';
     }
@@ -225,19 +240,21 @@ export class TomTomIsochroneConnector
 }
 
 /**
- * TomTom's `reachableRange.boundary` is an open array of
- * `{ latitude, longitude }` points. Convert to a closed GeoJSON Polygon ring
- * with `[lng, lat]` order.
+ * TomTom's `reachableRange.boundary` is an array of `{ latitude, longitude }`
+ * points. Convert to a `[lng, lat]` ring (closed later by `toContourGeometry`,
+ * only if it is not already), or `null` when the boundary is not a non-empty
+ * list of points with finite coordinates.
  */
-function boundaryToPolygon(
-  boundary: Array<{ latitude: number; longitude: number }>,
-): Polygon {
-  const ring: number[][] = boundary.map((p) => [p.longitude, p.latitude]);
-  if (ring.length > 0 && boundary[0] !== undefined) {
-    const first = ring[0]!;
-    ring.push([first[0]!, first[1]!]);
+function boundaryToRing(boundary: unknown): number[][] | null {
+  if (!Array.isArray(boundary) || boundary.length === 0) return null;
+  const ring: number[][] = [];
+  for (const point of boundary) {
+    if (!isRecord(point) || !isFiniteNumber(point.latitude) || !isFiniteNumber(point.longitude)) {
+      return null;
+    }
+    ring.push([point.longitude, point.latitude]);
   }
-  return { type: 'Polygon', coordinates: [ring] };
+  return ring;
 }
 
 function readTomTomErrorMessage(body: Record<string, unknown> | null): string | null {

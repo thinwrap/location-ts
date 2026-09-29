@@ -24,8 +24,8 @@ import { TomTomRoutingConnector } from './tomtom/tomtom.routing.connector';
  * | TomTom   | 400  | `detailedError.code: "MAP_MATCHING_FAILURE"`      |
  * | Esri     | 200  | `error.code: 400` + `details[]` saying "unlocated"|
  *
- * A consumer branching on "no usable route" previously had to reimplement all
- * six of those. One code replaces them.
+ * One code replaces all six, so a consumer branching on "no usable route" does
+ * not have to reimplement them.
  */
 
 const mockFetch = vi.fn();

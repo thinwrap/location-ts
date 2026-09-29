@@ -10,6 +10,7 @@ import { MapboxIsochroneConnector } from '../providers/mapbox';
 import { HereIsochroneConnector } from '../providers/here';
 import { EsriIsochroneConnector } from '../providers/esri';
 import { TomTomIsochroneConnector } from '../providers/tomtom';
+import { assertConfigObject } from './assert-config';
 
 // NOTE: Does **not** `implements IIsochroneConnector` — Mapbox +
 // TomTom augment {@link IsochroneOptionsMap} to widen `travelMode` to include
@@ -23,6 +24,11 @@ export class Isochrone<P extends IsochroneProvider> {
   readonly providerId: P;
   private connector: IIsochroneConnector;
 
+  /**
+   * @throws {TypeError} synchronously, for an unknown provider (or one without
+   *   an isochrone connector) or a missing config: misuse of the API, deliberately
+   *   not a `ConnectorError`.
+   */
   constructor(provider: P, config: ProviderConfigMap[P], fetchImpl?: typeof fetch) {
     this.providerId = provider;
     this.connector = createIsochroneConnector(provider, config, fetchImpl);
@@ -42,6 +48,7 @@ function createIsochroneConnector<P extends IsochroneProvider>(
   config: ProviderConfigMap[P],
   fetchImpl?: typeof fetch
 ): IIsochroneConnector {
+  assertConfigObject(config, 'Isochrone');
   switch (provider) {
     case 'mapbox':
       return new MapboxIsochroneConnector(config as ProviderConfigMap['mapbox'], fetchImpl);
@@ -52,6 +59,6 @@ function createIsochroneConnector<P extends IsochroneProvider>(
     case 'tomtom':
       return new TomTomIsochroneConnector(config as ProviderConfigMap['tomtom'], fetchImpl);
     default:
-      throw new Error(`Unknown isochrone provider: ${provider}`);
+      throw new TypeError(`Unknown isochrone provider: ${String(provider)}`);
   }
 }

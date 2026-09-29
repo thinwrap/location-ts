@@ -14,14 +14,17 @@ import type {
   ProviderCode,
 } from '../../types';
 import { ConnectorError } from '../../types';
-import { mergePassthrough } from '../../utils';
-import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
+import { isRecord, mergePassthrough, optionalArray } from '../../utils';
+import { validatePlaceDetailsOptions } from '../../utils/validate-options';
+import { assertFiniteCoordinate, assertFiniteNumber, formatCoord } from '../../utils/coordinate';
 import type { TomTomConfig } from './tomtom.config';
 import type {
   TomTomGeocodeResponse,
   TomTomReverseGeocodeResponse,
   TomTomSearchResponse,
 } from './tomtom.types';
+
+type TomTomResult = TomTomGeocodeResponse['results'][number];
 
 const GEOCODE_URL = 'https://api.tomtom.com/search/2/geocode';
 const REVERSE_GEOCODE_URL = 'https://api.tomtom.com/search/2/reverseGeocode';
@@ -68,8 +71,8 @@ export class TomTomGeocodingConnector
 
   async geocode(options: IGeocodeOptions): Promise<IGeocodeResult> {
     // TomTom carries the query in the URL path, not a `q=` param — an empty
-    // address would build the malformed `/geocode/.json` URL (#130). Reject
-    // pre-flight rather than round-tripping an opaque provider 400/404.
+    // address would build the malformed `/geocode/.json` URL. Reject pre-flight
+    // rather than round-tripping an opaque provider 400/404.
     if (options.address === '') {
       throw new ConnectorError({
         message: 'TomTom Geocoding requires a non-empty address',
@@ -112,10 +115,12 @@ export class TomTomGeocodingConnector
     const data = (await response.json().catch(() => null)) as
       | TomTomGeocodeResponse
       | null;
-    if (data === null) throw malformedBodyError(response.status, data);
+    if (!isRecord(data)) throw malformedBodyError(response.status, data);
+    const results = optionalArray(data.results);
+    if (results === null) throw malformedBodyError(response.status, data);
     return {
-      candidates: (data.results ?? [])
-        .map((r) => normalizeCandidate(r))
+      candidates: results
+        .map((r) => (isRecord(r) ? normalizeCandidate(r as TomTomResult) : null))
         .filter((c): c is IGeocodeCandidate => c !== null),
       raw: data,
     };
@@ -157,14 +162,14 @@ export class TomTomGeocodingConnector
     const data = (await response.json().catch(() => null)) as
       | TomTomReverseGeocodeResponse
       | null;
-    if (data === null) throw malformedBodyError(response.status, data);
+    if (!isRecord(data)) throw malformedBodyError(response.status, data);
+    const addresses = optionalArray(data.addresses);
+    if (addresses === null) throw malformedBodyError(response.status, data);
 
     // reverse-geocode mirrors forward shape — `candidates[]`.
     // TomTom encodes reverse-geocode position as a `"lat,lng"` string.
     return {
-      candidates: (data.addresses ?? []).flatMap((a) =>
-        normalizeReverseCandidate(a),
-      ),
+      candidates: addresses.flatMap((a) => normalizeReverseCandidate(a)),
       raw: data,
     };
   }
@@ -173,7 +178,7 @@ export class TomTomGeocodingConnector
     options: IAutocompleteOptions,
   ): Promise<IAutocompleteResult> {
     // Input is carried in the URL path — an empty input builds the malformed
-    // `/search/.json` URL (#130). Reject pre-flight.
+    // `/search/.json` URL. Reject pre-flight.
     if (options.input === '') {
       throw new ConnectorError({
         message: 'TomTom Autocomplete requires a non-empty input',
@@ -200,6 +205,7 @@ export class TomTomGeocodingConnector
       baseQuery.lon = formatCoord(options.location.lng);
     }
     if (options.radius !== undefined) {
+      assertFiniteNumber(options.radius, 'TomTom autocomplete radius');
       baseQuery.radius = String(options.radius);
     }
     // `countryFilter` (ISO 3166-1 alpha-2) → TomTom `countrySet=<comma-csv>`,
@@ -227,33 +233,39 @@ export class TomTomGeocodingConnector
     const data = (await response.json().catch(() => null)) as
       | TomTomSearchResponse
       | null;
-    if (data === null) throw malformedBodyError(response.status, data);
-    return {
-      predictions: (data.results ?? []).map((r) => {
-        const prediction: IAutocompletePrediction = {
-          description: r.poi?.name
-            ? `${r.poi.name}, ${r.address.freeformAddress}`
-            : r.address.freeformAddress,
-          // placeId is optional; set it only when the vendor returns an
-          // id rather than emitting `placeId: undefined` as an own-property (#146).
-          ...(r.id !== undefined ? { placeId: r.id } : {}),
+    if (!isRecord(data)) throw malformedBodyError(response.status, data);
+    const results = optionalArray(data.results);
+    if (results === null) throw malformedBodyError(response.status, data);
+    const predictions: IAutocompletePrediction[] = [];
+    for (const row of results) {
+      if (!isRecord(row)) continue;
+      const r = row as TomTomSearchResponse['results'][number];
+      const poiName = typeof r.poi?.name === 'string' && r.poi.name !== '' ? r.poi.name : null;
+      const address =
+        typeof r.address?.freeformAddress === 'string' ? r.address.freeformAddress : null;
+      // A row carrying neither a name nor an address has nothing to display.
+      if (poiName === null && address === null) continue;
+      const prediction: IAutocompletePrediction = {
+        description:
+          poiName !== null && address !== null
+            ? `${poiName}, ${address}`
+            : (poiName ?? address ?? ''),
+        // placeId is optional; set it only when the vendor returns an id, so an
+        // absent one is an absent key rather than an own `placeId: undefined`.
+        ...(typeof r.id === 'string' ? { placeId: r.id } : {}),
+      };
+      // Live-verified: `poi.name` is undefined for street/address results, which
+      // have no distinct main part. Omit the whole object there rather than
+      // splitting `freeformAddress` on a comma, which would be a guess.
+      if (poiName !== null) {
+        prediction.structuredFormat = {
+          mainText: poiName,
+          ...(address !== null && address !== '' ? { secondaryText: address } : {}),
         };
-        // Live-verified: `poi.name` is undefined for street/address results, which
-        // have no distinct main part. Omit the whole object there rather than
-        // splitting `freeformAddress` on a comma, which would be a guess.
-        if (typeof r.poi?.name === 'string' && r.poi.name !== '') {
-          const secondaryText = r.address?.freeformAddress;
-          prediction.structuredFormat = {
-            mainText: r.poi.name,
-            ...(typeof secondaryText === 'string' && secondaryText !== ''
-              ? { secondaryText }
-              : {}),
-          };
-        }
-        return prediction;
-      }),
-      raw: data,
-    };
+      }
+      predictions.push(prediction);
+    }
+    return { predictions, raw: data };
   }
 
   /**
@@ -263,6 +275,7 @@ export class TomTomGeocodingConnector
    * no per-session billing concept.
    */
   async placeDetails(options: IPlaceDetailsOptions): Promise<IPlaceDetailsResult> {
+    validatePlaceDetailsOptions(options);
     const query: Record<string, string> = {
       key: this.config.apiKey,
       entityId: options.placeId,
@@ -286,20 +299,18 @@ export class TomTomGeocodingConnector
       | null;
     if (data === null) throw malformedBodyError(response.status, data);
 
-    const result = data.results?.[0];
-    const candidate = result !== undefined ? normalizeCandidate(result) : null;
+    // No result, or one without a position, is no usable place: `null`, never
+    // a fabricated (0,0) candidate.
+    const results = optionalArray(data.results);
+    if (results === null) throw malformedBodyError(response.status, data);
+    const result = results[0];
+    const candidate = isRecord(result) ? normalizeCandidate(result as TomTomResult) : null;
     if (candidate === null) {
-      throw new ConnectorError({
-        message: 'TomTom Place Details returned no result',
-        statusCode: response.status,
-        providerCode: 'no_route',
-        providerMessage: 'TomTom Place Details returned no result',
-        cause: data,
-      });
+      return { candidate: null, raw: data };
     }
 
     const wantsName = options.include?.includes('name') === true;
-    const poiName = result?.poi?.name;
+    const poiName = (result as TomTomResult).poi?.name;
     return {
       candidate,
       ...(wantsName && typeof poiName === 'string' && poiName !== ''
@@ -331,8 +342,9 @@ export class TomTomGeocodingConnector
   }
 
   /**
-   * Map TomTom (HTTP status) → canonical {@link ProviderCode}. Mirrors
-   * */
+   * Map TomTom (HTTP status) → canonical {@link ProviderCode}. TomTom documents
+   * 403 as an authorization failure only; its rate limit is 429.
+   */
   private mapVendorError(httpStatus: number): ProviderCode {
     if (httpStatus === 400) return 'invalid_request';
     if (httpStatus === 401 || httpStatus === 403) return 'auth_failed';
@@ -364,19 +376,19 @@ export class TomTomGeocodingConnector
 // ---------------------------------------------------------------------------
 
 /**
- * Surface a 2xx response whose body is empty / non-JSON as a
- * {@link ConnectorError} rather than letting a raw `SyntaxError` escape (#129).
- * Mirrors the isochrone connector's malformed-body guard with `'unknown'`.
+ * Surface a 2xx response whose body is empty, non-JSON or not the documented
+ * shape as a {@link ConnectorError} rather than letting a raw `SyntaxError` /
+ * `TypeError` escape, or an unreadable list pass as "no results".
  */
 function malformedBodyError(
   statusCode: number,
   data: unknown,
 ): ConnectorError {
   return new ConnectorError({
-    message: 'TomTom returned a non-JSON/unparseable body',
+    message: 'TomTom returned a non-JSON/unparseable or malformed body',
     statusCode,
     providerCode: 'unknown',
-    providerMessage: 'TomTom returned a non-JSON/unparseable body',
+    providerMessage: 'TomTom returned a non-JSON/unparseable or malformed body',
     cause: data,
   });
 }
@@ -432,15 +444,14 @@ function normalizeCandidate(r: {
  * Normalize a single reverse-geocode `addresses[]` entry into a
  * {@link IGeocodeCandidate}. Returns `[]` (dropping the candidate) when the
  * entry lacks a usable `position` or `address` rather than fabricating a
- * Null Island (0,0) coordinate (#120, #145) or emitting silent NaN from a
- * malformed `"lat,lng"` string (#131). `placeId` is set only when present.
+ * Null Island (0,0) coordinate or emitting silent NaN from a malformed
+ * `"lat,lng"` string. `placeId` is set only when present.
  */
-function normalizeReverseCandidate(a: {
-  address?: { freeformAddress: string };
-  position?: string;
-  id?: string;
-}): IGeocodeCandidate[] {
-  if (a.address === undefined || typeof a.position !== 'string') return [];
+function normalizeReverseCandidate(entry: unknown): IGeocodeCandidate[] {
+  if (!isRecord(entry)) return [];
+  const a = entry as { address?: { freeformAddress?: unknown }; position?: unknown; id?: unknown };
+  if (!isRecord(a.address) || typeof a.position !== 'string') return [];
+  if (typeof a.address.freeformAddress !== 'string') return [];
 
   const parts = a.position.split(',');
   if (parts.length !== 2) return [];
@@ -452,7 +463,7 @@ function normalizeReverseCandidate(a: {
     formattedAddress: a.address.freeformAddress,
     location: { lat, lng },
   };
-  if (a.id !== undefined) candidate.placeId = a.id;
+  if (typeof a.id === 'string') candidate.placeId = a.id;
   return [candidate];
 }
 

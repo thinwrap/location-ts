@@ -127,29 +127,40 @@ describe('TomTomIsochroneConnector', () => {
     expect(coords).toHaveLength(5);
   });
 
-  it('maps travel modes correctly (driving/walking/cycling)', async () => {
+  it('maps driving (and unset) to travelMode=car', async () => {
     mockFetch.mockResolvedValueOnce(buildReachableRangeResponse());
-
     await connector.isochrone({
       center: { lat: 0, lng: 0 },
       type: 'time',
       values: [300],
-      travelMode: 'cycling',
-    } as unknown as Parameters<typeof connector.isochrone>[0]);
-
-    const [url] = mockFetch.mock.calls[0]!;
-    expect(url as string).toContain('travelMode=bicycle');
+      travelMode: 'driving',
+    });
+    expect(mockFetch.mock.calls[0]![0] as string).toContain('travelMode=car');
 
     mockFetch.mockReset();
     mockFetch.mockResolvedValueOnce(buildReachableRangeResponse());
-    await connector.isochrone({
-      center: { lat: 0, lng: 0 },
-      type: 'time',
-      values: [300],
-      travelMode: 'walking',
-    });
-    expect(mockFetch.mock.calls[0]![0] as string).toContain('travelMode=pedestrian');
+    await connector.isochrone({ center: { lat: 0, lng: 0 }, type: 'time', values: [300] });
+    expect(mockFetch.mock.calls[0]![0] as string).toContain('travelMode=car');
   });
+
+  // TomTom: "In calculateReachableRange requests, the values bicycle and
+  // pedestrian must not be used."
+  for (const mode of ['walking', 'cycling'] as const) {
+    it(`rejects ${mode} with unsupported_travel_mode before any request`, async () => {
+      const err = await connector
+        .isochrone({
+          center: { lat: 0, lng: 0 },
+          type: 'time',
+          values: [300, 600],
+          travelMode: mode,
+        } as Parameters<typeof connector.isochrone>[0])
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ConnectorError);
+      expect((err as ConnectorError).providerCode).toBe('unsupported_travel_mode');
+      expect((err as ConnectorError).statusCode).toBeNull();
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  }
 
   it('forwards departureTime via departAt query parameter', async () => {
     mockFetch.mockResolvedValueOnce(buildReachableRangeResponse());
@@ -262,5 +273,51 @@ describe('TomTomIsochroneConnector', () => {
         values: [600],
       }),
     ).rejects.toMatchObject({ providerCode: 'provider_unavailable' });
+  });
+});
+
+describe('TomTomIsochroneConnector — winding and closure', () => {
+  const signedArea = (ring: number[][]) =>
+    ring.slice(0, -1).reduce((sum, [x1, y1], i) => {
+      const [x2, y2] = ring[i + 1]!;
+      return sum + x1! * y2! - x2! * y1!;
+    }, 0);
+
+  async function geometryFor(boundary: Array<{ latitude: number; longitude: number }>) {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ reachableRange: { boundary } }), { status: 200 }),
+    );
+    const result = await new TomTomIsochroneConnector(defaultConfig).isochrone({
+      center: { lat: 5, lng: 5 },
+      type: 'time',
+      values: [600],
+    });
+    return result.contours[0]!.geometry;
+  }
+
+  it('winds a clockwise boundary counter-clockwise, as a closed Polygon', async () => {
+    // (0,0) → (0,10) → (10,10) → (10,0) in [lng, lat] is clockwise.
+    const geometry = await geometryFor([
+      { latitude: 0, longitude: 0 },
+      { latitude: 10, longitude: 0 },
+      { latitude: 10, longitude: 10 },
+      { latitude: 0, longitude: 10 },
+    ]);
+    expect(geometry.type).toBe('Polygon');
+    const [ring, ...holes] = geometry.coordinates as number[][][];
+    expect(holes).toHaveLength(0);
+    expect(signedArea(ring!)).toBeGreaterThan(0);
+    expect(ring).toEqual([[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]);
+  });
+
+  it('does not append a duplicate end point to an already-closed boundary', async () => {
+    const geometry = await geometryFor([
+      { latitude: 0, longitude: 0 },
+      { latitude: 0, longitude: 10 },
+      { latitude: 10, longitude: 10 },
+      { latitude: 10, longitude: 0 },
+      { latitude: 0, longitude: 0 },
+    ]);
+    expect(geometry.coordinates).toEqual([[[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]]);
   });
 });

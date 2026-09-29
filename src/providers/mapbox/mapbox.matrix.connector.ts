@@ -7,9 +7,19 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
-import { joinCoords, mergePassthrough } from '../../utils';
+import {
+  isFiniteNumber,
+  isRecord,
+  joinCoords,
+  malformedResponseError,
+  mergePassthrough,
+} from '../../utils';
+import { validateMatrixOptions } from '../../utils/validate-options';
 import { assertFiniteCoordinate } from '../../utils/coordinate';
+import { isTrafficRequested } from '../../utils/traffic';
 import type { MapboxConfig } from './mapbox.config';
+import { MAPBOX_MATRIX_ANNOTATIONS } from './mapbox.defaults';
+import { classifyMapboxEnvelopeCode } from './mapbox.envelope';
 import type { MapboxMatrixResponse } from './mapbox.types';
 
 const MATRIX_URL = 'https://api.mapbox.com/directions-matrix/v1/mapbox';
@@ -18,16 +28,15 @@ const MATRIX_URL = 'https://api.mapbox.com/directions-matrix/v1/mapbox';
  * Mapbox Matrix v1 connector.
  *
  * GETs `https://api.mapbox.com/directions-matrix/v1/mapbox/{profile}/{coords}`
- * with `access_token`, `sources`, `destinations`, and an annotations invariant
- * forced to `duration,distance`.
+ * with `access_token`, `sources`, `destinations`, and
+ * `annotations=duration,distance`.
  *
- * **Annotations invariant.** Mapbox's default is duration-only, which would
- * leave `distanceMeters` null on every cell and violate the "both distance
- * and duration" guarantee. We set `annotations=duration,distance` AFTER the
- * `_passthrough` merge so a consumer attempt to override it via
- * `_passthrough.query.annotations` is silently overwritten. README documents
- * that to layer in extra annotations (e.g. `congestion`), the consumer must
- * include both built-ins explicitly: `'duration,distance,congestion'`.
+ * **Annotations default.** Mapbox's default is duration-only, which would
+ * leave every cell without a distance, so the connector asks for both
+ * ({@link MAPBOX_MATRIX_ANNOTATIONS}). It is set before the `_passthrough`
+ * merge like every other default, so `_passthrough.query.annotations` replaces
+ * it; a list missing either value fails the dimension check and raises
+ * `unknown`.
  *
  * Result-shape normalization: the vendor's 2D `durations[][]` + `distances[][]`
  * arrays are flattened into `cells[]`. Native meters + seconds (no
@@ -45,6 +54,7 @@ export class MapboxMatrixConnector
   }
 
   async matrix(options: IMatrixOptions): Promise<IMatrixResult> {
+    validateMatrixOptions(options, 'Mapbox Matrix');
     // Empty origins/destinations would build a malformed `;`-only path and
     // empty `sources=`/`destinations=` params; fail fast with a typed error.
     if (options.origins.length === 0 || options.destinations.length === 0) {
@@ -57,7 +67,9 @@ export class MapboxMatrixConnector
       });
     }
 
-    const profile = this.mapProfile(options.travelMode);
+    validateMatrixCompat(options);
+
+    const profile = this.mapProfile(options.travelMode, options.trafficMode);
     const allCoords = [...options.origins, ...options.destinations];
     // Reject NaN/non-finite coordinates before they serialize into the URL
     // (out-of-range but finite lat/lng pass through verbatim — thin-wrapper).
@@ -77,12 +89,11 @@ export class MapboxMatrixConnector
       access_token: this.config.accessToken,
       sources: originIndices.join(';'),
       destinations: destinationIndices.join(';'),
+      // Mapbox's default is duration-only; asking for both is what populates
+      // `distanceMeters`. A default like any other, so passthrough replaces it.
+      annotations: MAPBOX_MATRIX_ANNOTATIONS.join(','),
     };
 
-    // Merge passthrough first; the `annotations` invariant is then set AFTER
-    // the merge so any consumer attempt to override it via
-    // `_passthrough.query.annotations` is silently overwritten. This
-    // guarantees `distanceMeters` is populated on every cell.
     const merged = mergePassthrough(
       {} as Record<string, unknown>,
       {},
@@ -90,14 +101,9 @@ export class MapboxMatrixConnector
       baseQuery,
     );
 
-    const finalQuery: Record<string, string> = {
-      ...merged.query,
-      annotations: 'duration,distance',
-    };
-
     const response = await this.sendGet(url, {
       headers: merged.headers,
-      query: finalQuery,
+      query: merged.query,
     });
 
     if (!response.ok) {
@@ -134,13 +140,14 @@ export class MapboxMatrixConnector
     }
 
     // Mapbox returns HTTP 200 with envelope `code !== 'Ok'` for some edge
-    // cases (e.g. `NoRoute`, `ProfileNotFound`). Surface as ConnectorError.
-    if (data.code !== 'Ok') {
+    // cases (e.g. `NoRoute`). Surface as ConnectorError.
+    if (!isRecord(data) || data.code !== 'Ok') {
+      const code: unknown = isRecord(data) ? data.code : undefined;
       throw new ConnectorError({
-        message: `Mapbox returned code: ${data.code}`,
+        message: `Mapbox returned code: ${String(code)}`,
         statusCode: response.status,
-        providerCode: this.mapBodyCode(data.code),
-        providerMessage: `Mapbox returned code: ${data.code}`,
+        providerCode: this.mapBodyCode(code),
+        providerMessage: `Mapbox returned code: ${String(code)}`,
         cause: data,
       });
     }
@@ -150,21 +157,17 @@ export class MapboxMatrixConnector
     const distances = data.distances ?? [];
     const durations = data.durations ?? [];
 
-    // LOC-CP-1 (loc-CR #79/#99): verify the vendor's 2D matrices match the
-    // requested origins×destinations dimensions BEFORE flattening. Mapbox
-    // returns one row per source and one column per destination; a sparse,
-    // asymmetric, or short matrix would otherwise be silently zero-filled by
-    // the `?? 0` cell reads below — returning WRONG cells with no signal. We
-    // surface a typed ConnectorError instead (mirrors the malformed-body guard
-    // above + Google's parseNdjsonElements guard). No 'invalid_response'
-    // ProviderCode exists in error.types.ts; 'unknown' is the closest existing
-    // value for a malformed provider body.
+    // Verify the vendor's 2D matrices match the requested origins×destinations
+    // dimensions BEFORE flattening. Mapbox returns one row per source and one
+    // column per destination; a sparse, asymmetric, or short matrix would
+    // otherwise leave cells unread — returning WRONG cells with no signal.
     assertMatrixDimensions(
       durations,
       distances,
       options.origins.length,
       options.destinations.length,
       data,
+      response.status,
     );
 
     const cells: IMatrixCell[] = [];
@@ -176,6 +179,14 @@ export class MapboxMatrixConnector
         // than coercing to 0 (which reads as "same location"). Contract:
         // missing/failed entries are omitted from `cells[]`.
         if (distanceMeters == null || durationSeconds == null) continue;
+        if (!isFiniteNumber(distanceMeters) || !isFiniteNumber(durationSeconds)) {
+          throw malformedResponseError(
+            'Mapbox Matrix',
+            `cell ${i}→${j} is not a number`,
+            response.status,
+            data,
+          );
+        }
         cells.push({
           originIndex: i,
           destinationIndex: j,
@@ -189,16 +200,20 @@ export class MapboxMatrixConnector
   }
 
   /**
-   * Map (HTTP status, decoded body) → canonical {@link ProviderCode}. Per
-   * (per-connector locality).    */
-  private mapVendorError(httpStatus: number, _body: unknown): ProviderCode {
+   * Map (HTTP status, decoded body) → canonical {@link ProviderCode}. Lives on the
+   * connector rather than in `BaseConnector`: error translation is per-provider.
+   */
+  private mapVendorError(httpStatus: number, body: unknown): ProviderCode {
     if (httpStatus === 401) return 'auth_failed';
     if (httpStatus === 403) return 'auth_failed';
     if (httpStatus === 429) return 'rate_limited';
-    // Mapbox 422 (incl. NoRoute/NoSegment envelopes) → invalid_request. (loc-CR
-    // #86 only flagged the prior dead/duplicate ternary; this collapses it to a
-    // single return without changing the established mapping.)
-    if (httpStatus === 422) return 'invalid_request';
+    // A 422 carries either a no-route envelope or a validation failure, so the
+    // body code decides, exactly as on Mapbox routing; an unknown code is a
+    // request Mapbox refused.
+    if (httpStatus === 422) {
+      const code = isRecord(body) ? body.code : undefined;
+      return classifyMapboxEnvelopeCode(code) ?? 'invalid_request';
+    }
     if (httpStatus === 400) return 'invalid_request';
     if (httpStatus >= 500 && httpStatus < 600) return 'provider_unavailable';
 
@@ -206,22 +221,11 @@ export class MapboxMatrixConnector
   }
 
   /**
-   * Map a 200-OK envelope `code !== 'Ok'` to ProviderCode. Mapbox occasionally
-   * returns HTTP 200 with a non-Ok envelope code such as `NoRoute` or
-   * `ProfileNotFound`.
+   * Map a 200-OK envelope `code !== 'Ok'` to ProviderCode. Matrix documents
+   * `NoRoute` on HTTP 200 ("no route found for the given coordinates").
    */
-  private mapBodyCode(code: string): ProviderCode {
-    switch (code) {
-      case 'NoRoute':
-      case 'NoSegment':
-      case 'InvalidInput':
-      case 'ProfileNotFound':
-        return 'invalid_request';
-      case 'ProcessingError':
-        return 'unknown';
-      default:
-        return 'unknown';
-    }
+  private mapBodyCode(code: unknown): ProviderCode {
+    return classifyMapboxEnvelopeCode(code) ?? 'unknown';
   }
 
   /**
@@ -247,35 +251,86 @@ export class MapboxMatrixConnector
     return base;
   }
 
-  private mapProfile(mode?: 'driving' | 'walking' | 'cycling'): string {
+  /**
+   * Traffic is a PROFILE on Mapbox, not a flag: `driving-traffic` (live:
+   * 200 with different durations than `driving`). Walking and cycling have no
+   * traffic variant, so `trafficMode` does not affect them.
+   */
+  private mapProfile(
+    mode: 'driving' | 'walking' | 'cycling' | undefined,
+    trafficMode: IMatrixOptions['trafficMode'],
+  ): string {
     switch (mode) {
       case 'walking':
         return 'walking';
       case 'cycling':
         return 'cycling';
       default:
-        return 'driving';
+        return isTrafficRequested(trafficMode) ? 'driving-traffic' : 'driving';
     }
   }
 }
 
 /**
- * LOC-CP-1 (loc-CR #79/#99): guard that the vendor's `durations`/`distances`
- * 2D arrays cover the full requested origins×destinations grid before the
- * row-major flatten. Throws a typed {@link ConnectorError} (`providerCode:
- * 'unknown'`, the closest existing value for a malformed provider body) when
- * either matrix has too few rows or any row is shorter than the requested
- * destination stride — the cases where `?? 0` would silently fabricate cells.
- * The full vendor body is preserved on `cause` per the repo convention.
+ * Reject inputs the Matrix API cannot honour, before any request.
+ *
+ * `exclude` is not a documented Matrix parameter and `depart_at` is a sign-up
+ * beta; live, either one answers 422 `Request too large for custom parameters`
+ * on a standard account. Dropping them silently would return tolled or
+ * time-independent durations as if the request had been honoured. A beta
+ * account can still send `depart_at` via `_passthrough.query`.
+ *
+ * A `departureTime` is rejected only with traffic on driving, the one case where
+ * the time would change the answer (`driving-traffic` + `depart_at`). Under
+ * `'none'` the durations are time-independent by definition, and walking and
+ * cycling have no traffic model, so there the time is dropped instead.
+ */
+function validateMatrixCompat(options: IMatrixOptions): void {
+  if (options.avoidTolls === true) {
+    throw new ConnectorError({
+      message: 'Mapbox Matrix does not support avoidTolls',
+      statusCode: null,
+      providerCode: 'unsupported_option',
+      providerMessage:
+        'Mapbox Matrix v1 has no exclude parameter, so avoidTolls cannot be honoured',
+    });
+  }
+  const driving = options.travelMode === undefined || options.travelMode === 'driving';
+  if (
+    options.departureTime !== undefined &&
+    driving &&
+    isTrafficRequested(options.trafficMode)
+  ) {
+    throw new ConnectorError({
+      message: 'Mapbox Matrix does not support departureTime with driving traffic',
+      statusCode: null,
+      providerCode: 'unsupported_field',
+      providerMessage:
+        'Mapbox Matrix v1 offers depart_at only as a sign-up beta, so departureTime cannot be honoured; a beta account can send depart_at via _passthrough.query',
+    });
+  }
+}
+
+/**
+ * Guard that the vendor's `durations`/`distances` 2D arrays cover the full
+ * requested origins×destinations grid before the row-major flatten. Throws a
+ * typed {@link ConnectorError} (`providerCode: 'unknown'`, the closest existing
+ * value for a malformed provider body) when either matrix is not a list, has
+ * too few rows, or has a row shorter than the requested destination stride —
+ * the cases where a cell would otherwise be silently fabricated or dropped.
+ * The full vendor body is preserved on `cause`.
  */
 function assertMatrixDimensions(
-  durations: (number | null)[][],
-  distances: (number | null)[][],
+  durations: unknown,
+  distances: unknown,
   numOrigins: number,
   numDestinations: number,
   raw: unknown,
-): void {
+  statusCode: number,
+): asserts durations is (number | null)[][] {
   const dimensionsOk =
+    Array.isArray(durations) &&
+    Array.isArray(distances) &&
     durations.length >= numOrigins &&
     distances.length >= numOrigins &&
     durations
@@ -291,7 +346,7 @@ function assertMatrixDimensions(
       `${numOrigins}×${numDestinations} dimensions`;
     throw new ConnectorError({
       message,
-      statusCode: null,
+      statusCode,
       providerCode: 'unknown',
       providerMessage: message,
       cause: raw,

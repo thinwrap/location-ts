@@ -48,7 +48,9 @@ export interface IAutocompleteOptions {
    *
    * Caveat: Mapbox and ESRI ignore `radius` — they accept only a proximity
    * point (`location`) with no radius parameter, so this value is silently
-   * dropped for those two providers.
+   * dropped for those two providers. Where it is sent (Google and HERE with a
+   * `location`, TomTom always), a NaN or infinite radius rejects with
+   * `ConnectorError` `invalid_request` and a non-number with a `TypeError`.
    */
   radius?: number;
   language?: string;
@@ -205,6 +207,9 @@ export interface IPlaceDetailsOptions {
    * `name` (`displayName`) moves the call to Pro. Providers that return the name
    * for free ignore the token's cost implication but still honour it as a gate,
    * so the normalized shape stays identical everywhere.
+   *
+   * A token outside {@link PlaceDetailsInclude} (or a non-array) rejects with a
+   * `TypeError`.
    */
   include?: PlaceDetailsInclude[];
 
@@ -219,14 +224,27 @@ export interface IPlaceDetailsOptions {
  * result straight into whatever already consumes geocode candidates.
  */
 export interface IPlaceDetailsResult {
-  candidate: IGeocodeCandidate;
+  /**
+   * The resolved place, or `null` when the provider has no usable place for
+   * this id — it answered "not found" (a Google 404 `NOT_FOUND`, a HERE or
+   * Mapbox 404, an empty result list) or returned the place without a
+   * location.
+   *
+   * `null` rather than an error for the same reason forward geocoding returns
+   * `candidates: []`: an id that no longer resolves (places close, ids expire)
+   * is an answer to branch on, not a failure. An id the provider rejects as
+   * invalid still raises `invalid_request` — which is how Google Places answers
+   * a well-formed but unknown id, and Esri a magicKey from an earlier release.
+   * Never a fabricated (0,0) location.
+   */
+  candidate: IGeocodeCandidate | null;
 
   /**
    * The place's display name, when the provider returns one distinct from the
    * formatted address (e.g. "Blue Bottle Coffee" vs its street address).
    *
-   * Absent on providers that only return an address, and on Google unless
-   * `include: ['name']` was requested — its Place Details SKU tier is driven by
+   * Absent when `candidate` is `null`, on providers that only return an
+   * address, and on Google unless `include: ['name']` was requested — its Place Details SKU tier is driven by
    * the field mask, and `displayName` is a Pro-tier field. Note that this is the
    * opposite of Compute Routes, whose SKU is feature-driven: check per API.
    */
@@ -296,8 +314,8 @@ export interface ReverseGeocodeOptionsMap {
 }
 
 /**
- * Provider-specific autocomplete input augmentations. Google adds `sessionToken`
- * here, which is what makes its keystrokes bill as one session.
+ * Provider-specific autocomplete input augmentations. Google and Mapbox add
+ * `sessionToken` here, which is what makes their keystrokes bill as one session.
  *
  * The declaration must live in the provider's `<id>.config.ts`. A `declare module`
  * block only applies when the file declaring it is part of the consumer's
@@ -309,7 +327,7 @@ export interface ReverseGeocodeOptionsMap {
  */
 // eslint-disable-next-line @typescript-eslint/no-empty-object-type
 export interface AutocompleteOptionsMap {
-  // Google adds its key from `google.config.ts`.
+  // Google and Mapbox add their keys from their `*.config.ts` modules.
 }
 
 /**

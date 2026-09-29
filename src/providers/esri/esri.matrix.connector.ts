@@ -8,14 +8,19 @@ import type {
   ProviderCode,
 } from '../../types';
 import { ConnectorError } from '../../types';
-import { mergePassthrough } from '../../utils';
+import { isRecord, malformedResponseError, mergePassthrough } from '../../utils';
+import { validateMatrixOptions } from '../../utils/validate-options';
 import { assertFiniteCoordinate } from '../../utils/coordinate';
+import { isTrafficRequested } from '../../utils/traffic';
 import type { EsriConfig } from './esri.config';
 import { resolveEsriBearerToken } from './esri.config';
+import { ESRI_MATRIX_ACCUMULATE_ATTRIBUTES } from './esri.defaults';
 import {
   ESRI_TIME_ATTRIBUTE_NAMES,
-  mapEsriTravelMode,
+  esriTimeAttributeFor,
+  esriTravelModeForm,
 } from './esri.travel-modes';
+import { esriEpochMillis } from './esri.time';
 import type { EsriODMatrixResponse } from './esri.types';
 
 const MATRIX_URL =
@@ -51,13 +56,13 @@ const KILOMETERS_TO_METERS = 1000;
  * kilometers → meters. A fallback over the `odLines.features[]` FeatureSet
  * (`esriNAODOutputStraightLines`) preserves parity.
  *
- * Token lifecycle (~120 min for `arcgisToken`) is consumer-owned (the wrapper holds no state); documented in the per-connector README
+ * Token lifecycle (~120 min for `arcgisToken`) is consumer-owned (the wrapper
+ * holds no state); documented in the per-connector README.
  *
- *
- * per-connector locality: error mapping + Retry-After parsing live
- * inline; no shared middleware. Retry-After surfacing: parsed seconds in
- * `providerMessage` + raw header in `cause.retryAfter` by design (no structured `retryAfterSeconds`
- * field on `ConnectorError`).
+ * Error mapping + Retry-After parsing live inline; no shared middleware.
+ * Retry-After surfacing: parsed seconds in `providerMessage` + raw header in
+ * `cause.retryAfter` (no structured `retryAfterSeconds` field on
+ * `ConnectorError`).
  */
 export class EsriMatrixConnector
   extends BaseConnector
@@ -70,6 +75,7 @@ export class EsriMatrixConnector
   }
 
   async matrix(options: IMatrixOptions): Promise<IMatrixResult> {
+    validateMatrixOptions(options, 'ESRI Matrix');
     if (options.origins.length === 0 || options.destinations.length === 0) {
       throw new ConnectorError({
         message:
@@ -94,23 +100,33 @@ export class EsriMatrixConnector
       // each cell array is [TravelTime, Kilometers].
       outputType: 'esriNAODOutputSparseMatrix',
       impedanceAttributeName: 'TravelTime',
-      accumulateAttributeNames: 'Kilometers',
+      accumulateAttributeNames: ESRI_MATRIX_ACCUMULATE_ATTRIBUTES.join(','),
       outSR: '4326',
     };
 
-    const travelMode = mapEsriTravelMode(options.travelMode, 'Matrix');
-    if (travelMode !== undefined) {
-      form.travelMode = travelMode;
-    }
+    Object.assign(
+      form,
+      esriTravelModeForm(options.travelMode, 'Matrix', buildRestrictions(options)),
+    );
 
-    const restrictions = buildRestrictions(options);
-    if (restrictions !== '') {
-      form.restrictionAttributeNames = restrictions;
-    }
-
-    if (options.departureTime) {
-      // ESRI accepts epoch milliseconds for `startTime`.
-      form.startTime = String(options.departureTime.getTime());
+    // Esri applies traffic whenever a `timeOfDay` is sent ("To use traffic in
+    // the analysis, set impedanceAttributeName to TravelTime, and assign a
+    // timeOfDay value"): `now` is live, an explicit time within 4 hours of now
+    // is live and typical beyond that. Without one, `TravelTime` falls back to
+    // time-independent speeds — the model `'none'` promises — so under `'none'`
+    // the time is never sent, and with traffic but no time `now` is sent.
+    // Validated even when dropped: an invalid Date is a caller bug either way.
+    // A passthrough `timeOfDay` still wins (merged below).
+    const timeOfDay =
+      options.departureTime !== undefined
+        ? esriEpochMillis(options.departureTime, 'Matrix')
+        : undefined;
+    if (isTrafficRequested(options.trafficMode)) {
+      // `solveODCostMatrix` has no `startTime` parameter — its departure is
+      // `timeOfDay` (epoch ms), read in the origins' local time zone unless
+      // `timeOfDayIsUTC` is set. Esri forces it to true for `now`.
+      form.timeOfDay = timeOfDay ?? 'now';
+      form.timeOfDayIsUTC = 'true';
     }
 
     const merged = mergePassthrough(
@@ -163,6 +179,7 @@ export class EsriMatrixConnector
       options.origins.length,
       options.destinations.length,
       response.status,
+      esriTimeAttributeFor(options.travelMode),
     );
   }
 
@@ -177,11 +194,15 @@ export class EsriMatrixConnector
     numOrigins: number,
     numDestinations: number,
     status: number,
+    timeAttribute: string,
   ): IMatrixResult {
     const cells: IMatrixCell[] = [];
 
     if (data.odCostMatrix !== undefined) {
-      const odm = data.odCostMatrix;
+      if (!isRecord(data.odCostMatrix)) {
+        throw malformedResponseError('ESRI Matrix', '`odCostMatrix` is not an object', status, data);
+      }
+      const odm = data.odCostMatrix as NonNullable<EsriODMatrixResponse['odCostMatrix']>;
       const attrOrder = odm.costAttributeNames ?? ['TravelTime', 'Kilometers'];
       // The impedance column is named after the active travel mode: driving
       // reports `TravelTime`, walking reports `WalkTime` (the WALK travelMode
@@ -197,6 +218,19 @@ export class EsriMatrixConnector
         }
       }
       const distIdx = attrOrder.indexOf('Kilometers');
+      // A column this decoder does not recognise (a future travel mode's
+      // impedance, e.g. `TruckTravelTime`, or a passthrough-changed
+      // accumulation) would otherwise decode every cell as 0 — a plausible,
+      // silently wrong matrix. Refuse it instead, naming the columns received.
+      if (timeIdx < 0 || distIdx < 0) {
+        throw costColumnError(
+          `ESRI Matrix returned unrecognised cost columns [${attrOrder.join(', ')}]; ` +
+            `expected one of ${ESRI_TIME_ATTRIBUTE_NAMES.join('/')} and Kilometers`,
+          attrOrder,
+          data,
+          status,
+        );
+      }
 
       // Sparse shape: every key except `costAttributeNames` is a 1-based origin
       // OID whose value maps 1-based dest OID → cost-value array. Map OIDs to
@@ -226,11 +260,17 @@ export class EsriMatrixConnector
           ) {
             throw matrixOidError(data, status);
           }
-          const { timeMinutes, distanceKm } = decodeCostCell(
-            values,
-            timeIdx,
-            distIdx,
-          );
+          const decoded = decodeCostCell(values, timeIdx, distIdx);
+          if (decoded === null) {
+            throw costColumnError(
+              `ESRI Matrix cell ${originKey}→${destKey} has no numeric value for every cost column ` +
+                `[${attrOrder.join(', ')}]`,
+              attrOrder,
+              data,
+              status,
+            );
+          }
+          const { timeMinutes, distanceKm } = decoded;
           cells.push({
             originIndex: originOID - 1,
             destinationIndex: destOID - 1,
@@ -242,34 +282,54 @@ export class EsriMatrixConnector
 
       // A SPARSE matrix (Esri omits unreachable pairs) is returned as-is rather
       // than erroring the whole call — each cell carries its origin/destination
-      // index, so the consumer can tell which pairs are present. Matches the
-      // Mapbox/OSRM/HERE/Google cell-omission semantics (supersedes the earlier
-      // whole-grid guard, which diverged from every other provider). The OID-range
-      // guards above still reject a genuinely malformed/misaligned response.
+      // index, so the consumer can tell which pairs are present — the same
+      // cell-omission rule as Mapbox/OSRM/HERE/Google. The OID-range guards
+      // above still reject a genuinely malformed/misaligned response.
       return { cells, raw: data };
     }
 
-    if (data.odLines?.features !== undefined) {
+    if (isRecord(data.odLines) && data.odLines.features !== undefined) {
+      if (!Array.isArray(data.odLines.features)) {
+        throw malformedResponseError('ESRI Matrix', '`odLines.features` is not a list', status, data);
+      }
       // Straight-lines FeatureSet: 1-based OriginID/DestinationID; minutes + km.
-      for (const f of data.odLines.features) {
+      for (const f of data.odLines.features as NonNullable<EsriODMatrixResponse['odLines']>['features']) {
+        if (!isRecord(f) || !isRecord(f.attributes)) throw matrixOidError(data, status);
         const attrs = f.attributes;
-        // LOC-CP-1 (loc-CR #101): OIDs are 1-based, mapped to 0-based indices
-        // via `- 1`. An ID of 0, undefined, or non-finite would yield a
-        // negative/NaN index and a silently misaligned (or out-of-range) cell.
-        // Reject the whole response rather than emit a wrong cell.
+        // OIDs are 1-based, mapped to 0-based indices via `- 1`. An ID of 0,
+        // undefined, non-finite or beyond the requested dimensions would yield
+        // a negative/NaN/out-of-range index and a silently misaligned cell —
+        // the same bounds the sparse path enforces. Reject the whole response
+        // rather than emit a wrong cell.
         if (
-          !Number.isFinite(attrs.OriginID) ||
-          !Number.isFinite(attrs.DestinationID) ||
+          !Number.isInteger(attrs.OriginID) ||
+          !Number.isInteger(attrs.DestinationID) ||
           attrs.OriginID < 1 ||
-          attrs.DestinationID < 1
+          attrs.DestinationID < 1 ||
+          attrs.OriginID > numOrigins ||
+          attrs.DestinationID > numDestinations
         ) {
           throw matrixOidError(data, status);
+        }
+        // The total is suffixed with the active impedance — `Total_WalkTime` on
+        // a walking matrix — and a missing one must not decode as 0.
+        const timeKey = `Total_${timeAttribute}` as 'Total_TravelTime' | 'Total_WalkTime';
+        const minutes = attrs[timeKey];
+        const km = attrs.Total_Kilometers;
+        if (typeof minutes !== 'number' || typeof km !== 'number') {
+          throw costColumnError(
+            `ESRI Matrix odLines feature ${attrs.OriginID}→${attrs.DestinationID} lacks ` +
+              `${timeKey} or Total_Kilometers`,
+            Object.keys(attrs),
+            data,
+            status,
+          );
         }
         cells.push({
           originIndex: attrs.OriginID - 1,
           destinationIndex: attrs.DestinationID - 1,
-          distanceMeters: attrs.Total_Kilometers * KILOMETERS_TO_METERS,
-          durationSeconds: attrs.Total_TravelTime * MINUTES_TO_SECONDS,
+          distanceMeters: km * KILOMETERS_TO_METERS,
+          durationSeconds: minutes * MINUTES_TO_SECONDS,
         });
       }
 
@@ -382,7 +442,7 @@ export class EsriMatrixConnector
 // ---------------------------------------------------------------------------
 
 /**
- * Build an ESRI FeatureSet for the `origins`/`destinations` form parameters
+ * Build an ESRI FeatureSet for the `origins`/`destinations` form parameters.
  * Each waypoint becomes a Point feature with `geometry.x = lng`,
  * `geometry.y = lat`, and `spatialReference = { wkid: 4326 }` (WGS-84,
  * matching `encodeEsriPaths`'s output convention and the ESRI Routing stops
@@ -414,10 +474,8 @@ function buildPointFeatureSet(points: LatLng[]): {
   };
 }
 
-function buildRestrictions(options: IMatrixOptions): string {
-  const restrictions: string[] = [];
-  if (options.avoidTolls) restrictions.push('Avoid Toll Roads');
-  return restrictions.join(',');
+function buildRestrictions(options: IMatrixOptions): string[] {
+  return options.avoidTolls ? ['Avoid Toll Roads'] : [];
 }
 
 function stringifyFormValue(value: unknown): string {
@@ -431,25 +489,46 @@ function stringifyFormValue(value: unknown): string {
 
 /**
  * Decode a single sparse cell's cost-value array. Values are ordered per
- * `costAttributeNames`; `timeIdx`/`distIdx` locate `TravelTime` (minutes) and
- * `Kilometers` (km) within it. Missing/non-numeric slots fall back to 0 (the
- * cell distance/time is then reported as 0 rather than corrupting the grid).
+ * `costAttributeNames`; `timeIdx`/`distIdx` locate the time column (minutes)
+ * and `Kilometers` (km) within it. Returns `null` for a cell too short for its
+ * columns or holding a non-numeric value: reporting 0 there would be a
+ * plausible, silently wrong cell.
  */
 function decodeCostCell(
-  values: number[],
+  values: unknown,
   timeIdx: number,
   distIdx: number,
-): { timeMinutes: number; distanceKm: number } {
-  const timeMinutes =
-    timeIdx >= 0 && typeof values[timeIdx] === 'number' ? values[timeIdx]! : 0;
-  const distanceKm =
-    distIdx >= 0 && typeof values[distIdx] === 'number' ? values[distIdx]! : 0;
+): { timeMinutes: number; distanceKm: number } | null {
+  if (!Array.isArray(values)) return null;
+  const timeMinutes: unknown = values[timeIdx];
+  const distanceKm: unknown = values[distIdx];
+  if (typeof timeMinutes !== 'number' || typeof distanceKm !== 'number') return null;
   return { timeMinutes, distanceKm };
 }
 
 /**
- * LOC-CP-1 (loc-CR #101): build the typed {@link ConnectorError} raised when an
- * ESRI matrix payload carries an OID (sparse origin/dest key or `odLines`
+ * The typed error for a cost payload whose columns cannot be decoded. `cause`
+ * carries the column names received, so the caller can see what Esri sent
+ * without digging through `raw`.
+ */
+function costColumnError(
+  message: string,
+  costAttributeNames: readonly string[],
+  data: EsriODMatrixResponse,
+  status: number,
+): ConnectorError {
+  return new ConnectorError({
+    message,
+    statusCode: status,
+    providerCode: 'unknown',
+    providerMessage: message,
+    cause: { costAttributeNames, raw: data },
+  });
+}
+
+/**
+ * Build the typed {@link ConnectorError} raised when an ESRI matrix payload
+ * carries an OID (sparse origin/dest key or `odLines`
  * OriginID/DestinationID) that is non-finite, non-positive, or beyond the
  * requested dimensions — any of which would map to a negative, NaN, or
  * out-of-range 0-based cell index. `providerCode: 'unknown'` is the closest

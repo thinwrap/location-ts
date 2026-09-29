@@ -29,6 +29,15 @@ function buildNdjsonResponse(
   return new Response(body, { status: 200, ...init });
 }
 
+/** A minimal successful element, for tests that only inspect the request. */
+const OK_ELEMENT = {
+  originIndex: 0,
+  destinationIndex: 0,
+  distanceMeters: 100,
+  duration: '10s',
+  condition: 'ROUTE_EXISTS',
+};
+
 describe('GoogleMatrixConnector', () => {
   let connector: GoogleMatrixConnector;
 
@@ -40,10 +49,12 @@ describe('GoogleMatrixConnector', () => {
     expect(connector.providerId).toBe('google');
   });
 
-  // Route Matrix bills PER ELEMENT, so the implicit Pro-SKU promotion cost
-  // origins x destinations times more than the routing one. `departureTime` alone
-  // no longer enables traffic.
-  it('keeps routingPreference TRAFFIC_UNAWARE when only departureTime is provided', async () => {
+  // Route Matrix bills PER ELEMENT, so an implicit Pro-SKU promotion would cost
+  // origins x destinations times more than on routing: `departureTime` alone
+  // does not enable traffic.
+  // Google answers HTTP 400 "Timestamp cannot be set for TRAFFIC_UNAWARE routing
+  // mode." when both are present, so the time is dropped rather than sent.
+  it('keeps routingPreference TRAFFIC_UNAWARE and drops departureTime when only departureTime is provided', async () => {
     mockFetch.mockResolvedValueOnce(
       buildNdjsonResponse([
         { originIndex: 0, destinationIndex: 0, distanceMeters: 100, duration: '10s', condition: 'ROUTE_EXISTS' },
@@ -58,7 +69,7 @@ describe('GoogleMatrixConnector', () => {
 
     const [, init] = mockFetch.mock.calls[0]!;
     const body = JSON.parse(init!.body as string) as Record<string, unknown>;
-    expect(body.departureTime).toBe('2026-01-01T12:00:00.000Z');
+    expect(body.departureTime).toBeUndefined();
     expect(body.routingPreference).toBe('TRAFFIC_UNAWARE');
   });
 
@@ -86,7 +97,7 @@ describe('GoogleMatrixConnector', () => {
     ['walking', 'WALK'],
     ['cycling', 'BICYCLE'],
   ])('should map travelMode %s to %s', async (input, expected) => {
-    mockFetch.mockResolvedValueOnce(buildNdjsonResponse([]));
+    mockFetch.mockResolvedValueOnce(buildNdjsonResponse([OK_ELEMENT]));
 
     await connector.matrix({
       origins: [{ lat: 0, lng: 0 }],
@@ -100,7 +111,7 @@ describe('GoogleMatrixConnector', () => {
   });
 
   it('should include avoidTolls in routeModifiers', async () => {
-    mockFetch.mockResolvedValueOnce(buildNdjsonResponse([]));
+    mockFetch.mockResolvedValueOnce(buildNdjsonResponse([OK_ELEMENT]));
 
     await connector.matrix({
       origins: [{ lat: 0, lng: 0 }],
@@ -116,9 +127,9 @@ describe('GoogleMatrixConnector', () => {
   // NDJSON parser: assert multi-line response parses to multiple cells
   it('should parse NDJSON multi-line response into multiple cells', async () => {
     const ndjsonBody =
-      '{"originIndex":0,"destinationIndex":0,"distanceMeters":1000,"duration":"60s"}\n' +
-      '{"originIndex":0,"destinationIndex":1,"distanceMeters":2000,"duration":"120s"}\n' +
-      '{"originIndex":1,"destinationIndex":0,"distanceMeters":1500,"duration":"90s"}';
+      '{"originIndex":0,"destinationIndex":0,"distanceMeters":1000,"duration":"60s","condition":"ROUTE_EXISTS"}\n' +
+      '{"originIndex":0,"destinationIndex":1,"distanceMeters":2000,"duration":"120s","condition":"ROUTE_EXISTS"}\n' +
+      '{"originIndex":1,"destinationIndex":0,"distanceMeters":1500,"duration":"90s","condition":"ROUTE_EXISTS"}';
 
     mockFetch.mockResolvedValueOnce(new Response(ndjsonBody, { status: 200 }));
 
@@ -150,8 +161,8 @@ describe('GoogleMatrixConnector', () => {
 
   it('should tolerate blank lines and trailing whitespace in NDJSON', async () => {
     const ndjsonBody =
-      '\n  \n{"originIndex":0,"destinationIndex":0,"distanceMeters":100,"duration":"10s"}\n\n' +
-      '{"originIndex":0,"destinationIndex":1,"distanceMeters":200,"duration":"20s"}\n';
+      '\n  \n{"originIndex":0,"destinationIndex":0,"distanceMeters":100,"duration":"10s","condition":"ROUTE_EXISTS"}\n\n' +
+      '{"originIndex":0,"destinationIndex":1,"distanceMeters":200,"duration":"20s","condition":"ROUTE_EXISTS"}\n';
 
     mockFetch.mockResolvedValueOnce(new Response(ndjsonBody, { status: 200 }));
 
@@ -170,13 +181,13 @@ describe('GoogleMatrixConnector', () => {
   it('should omit failed cells from cells[] but retain them in raw', async () => {
     mockFetch.mockResolvedValueOnce(
       buildNdjsonResponse([
-        { originIndex: 0, destinationIndex: 0, distanceMeters: 1000, duration: '60s' },
+        { originIndex: 0, destinationIndex: 0, distanceMeters: 1000, duration: '60s', condition: 'ROUTE_EXISTS' },
         {
           originIndex: 0,
           destinationIndex: 1,
           status: { code: 5, message: 'NOT_FOUND' },
         },
-        { originIndex: 1, destinationIndex: 0, distanceMeters: 1500, duration: '90s' },
+        { originIndex: 1, destinationIndex: 0, distanceMeters: 1500, duration: '90s', condition: 'ROUTE_EXISTS' },
         {
           originIndex: 1,
           destinationIndex: 1,
@@ -268,11 +279,51 @@ describe('GoogleMatrixConnector', () => {
     expect(result.cells[0]!.destinationIndex).toBe(0);
   });
 
+  // Google answers every requested pair, so an empty 200 is not "no cells":
+  // an empty success would be a fabricated answer.
+  it.each([
+    ['an empty body', ''],
+    ['whitespace only', '\n  \n'],
+    ['an empty JSON array', '[]'],
+  ])('raises unknown (with raw) for %s', async (_label, text) => {
+    mockFetch.mockResolvedValueOnce(new Response(text, { status: 200 }));
+    await expect(
+      connector.matrix({ origins: [{ lat: 0, lng: 0 }], destinations: [{ lat: 1, lng: 1 }] }),
+    ).rejects.toMatchObject({ providerCode: 'unknown', statusCode: 200, cause: text });
+  });
+
+  // Neither `condition` nor `status` says whether the route exists, so the
+  // element must not become a 0 m / 0 s cell.
+  it('treats an element with neither condition nor status as a failed cell', async () => {
+    mockFetch.mockResolvedValueOnce(
+      buildNdjsonResponse([
+        OK_ELEMENT,
+        { originIndex: 0, destinationIndex: 1 },
+      ]),
+    );
+    const result = await connector.matrix({
+      origins: [{ lat: 0, lng: 0 }],
+      destinations: [
+        { lat: 1, lng: 1 },
+        { lat: 2, lng: 2 },
+      ],
+    });
+    expect(result.cells.map((c) => c.destinationIndex)).toEqual([0]);
+    expect(result.raw).toHaveLength(2);
+  });
+
+  it('raises unknown for a null element instead of a raw TypeError', async () => {
+    mockFetch.mockResolvedValueOnce(new Response('[null]', { status: 200 }));
+    await expect(
+      connector.matrix({ origins: [{ lat: 0, lng: 0 }], destinations: [{ lat: 1, lng: 1 }] }),
+    ).rejects.toMatchObject({ providerCode: 'unknown' });
+  });
+
   // duration parsing ("123s" → 123) and distanceMeters passthrough
   it('should parse Google duration format and pass distanceMeters through unchanged', async () => {
     mockFetch.mockResolvedValueOnce(
       buildNdjsonResponse([
-        { originIndex: 0, destinationIndex: 0, distanceMeters: 12345, duration: '678s' },
+        { originIndex: 0, destinationIndex: 0, distanceMeters: 12345, duration: '678s', condition: 'ROUTE_EXISTS' },
       ]),
     );
 
@@ -291,7 +342,7 @@ describe('GoogleMatrixConnector', () => {
 
   // _passthrough merge via mergePassthrough (4-arg form)
   it('should deep-merge _passthrough body and shallow-merge headers', async () => {
-    mockFetch.mockResolvedValueOnce(buildNdjsonResponse([]));
+    mockFetch.mockResolvedValueOnce(buildNdjsonResponse([OK_ELEMENT]));
 
     await connector.matrix({
       origins: [{ lat: 0, lng: 0 }],

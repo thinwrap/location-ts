@@ -14,8 +14,9 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
-import { mergePassthrough } from '../../utils';
-import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
+import { isRecord, malformedResponseError, mergePassthrough, optionalArray } from '../../utils';
+import { validatePlaceDetailsOptions } from '../../utils/validate-options';
+import { assertFiniteCoordinate, assertFiniteNumber, formatCoord } from '../../utils/coordinate';
 import type { HereConfig } from './here.config';
 import type {
   HereGeocodeResponse,
@@ -168,18 +169,17 @@ export class HereGeocodingConnector
     const data = (await response.json().catch(() => null)) as
       | HereGeocodeResponse
       | null;
-    if (data === null) {
+    if (!isRecord(data)) {
       throw new ConnectorError({
         message: 'HERE Geocoding returned an unparseable response body',
         statusCode: response.status,
         providerCode: 'unknown',
         providerMessage: 'HERE Geocoding returned an unparseable response body',
+        cause: data,
       });
     }
     return {
-      candidates: (data.items ?? [])
-        .map((item) => normalizeCandidate(item))
-        .filter((c): c is IGeocodeCandidate => c !== null),
+      candidates: normalizeItemList(data, 'HERE Geocoding', response.status),
       raw: data,
     };
   }
@@ -217,21 +217,20 @@ export class HereGeocodingConnector
     const data = (await response.json().catch(() => null)) as
       | HereGeocodeResponse
       | null;
-    if (data === null) {
+    if (!isRecord(data)) {
       throw new ConnectorError({
         message: 'HERE Reverse Geocoding returned an unparseable response body',
         statusCode: response.status,
         providerCode: 'unknown',
         providerMessage:
           'HERE Reverse Geocoding returned an unparseable response body',
+        cause: data,
       });
     }
     // reverse-geocode mirrors forward shape — return all candidates,
     // not just the first result.
     return {
-      candidates: (data.items ?? [])
-        .map((item) => normalizeCandidate(item))
-        .filter((c): c is IGeocodeCandidate => c !== null),
+      candidates: normalizeItemList(data, 'HERE Reverse Geocoding', response.status),
       raw: data,
     };
   }
@@ -253,7 +252,8 @@ export class HereGeocodingConnector
     if (options.location !== undefined) {
       assertFiniteCoordinate(options.location, 'HERE autocomplete location');
       if (options.radius !== undefined) {
-        baseQuery.in = `circle:${formatCoord(options.location.lat)},${formatCoord(options.location.lng)};r=${options.radius}`;
+        assertFiniteNumber(options.radius, 'HERE autocomplete radius');
+        baseQuery.in = `circle:${formatCoord(options.location.lat)},${formatCoord(options.location.lng)};r=${formatCoord(options.radius)}`;
       } else {
         baseQuery.at = `${formatCoord(options.location.lat)},${formatCoord(options.location.lng)}`;
       }
@@ -307,37 +307,44 @@ export class HereGeocodingConnector
     const data = (await response.json().catch(() => null)) as
       | HereAutocompleteResponse
       | null;
-    if (data === null) {
+    if (!isRecord(data)) {
       throw new ConnectorError({
         message: 'HERE Autosuggest returned an unparseable response body',
         statusCode: response.status,
         providerCode: 'unknown',
         providerMessage:
           'HERE Autosuggest returned an unparseable response body',
+        cause: data,
       });
     }
-    return {
-      predictions: (data.items ?? []).map((item) => {
-        const prediction: IAutocompletePrediction = {
-          description: item.title,
-          placeId: item.id,
+    const items = optionalArray(data.items);
+    if (items === null) {
+      throw malformedResponseError('HERE Autosuggest', '`items` is not a list', response.status, data);
+    }
+    const predictions: IAutocompletePrediction[] = [];
+    for (const row of items) {
+      // A suggestion without a title has nothing to display.
+      if (!isRecord(row) || typeof row.title !== 'string') continue;
+      const item = row as unknown as HereAutocompleteResponse['items'][number];
+      const prediction: IAutocompletePrediction = {
+        description: item.title,
+        ...(typeof item.id === 'string' ? { placeId: item.id } : {}),
+      };
+      // HERE's *query*-type suggestions carry a title but no address at all, so
+      // `secondaryText` is omitted rather than emitted as an empty string a UI
+      // would render as a blank second line.
+      if (item.title !== '') {
+        const label = item.address?.label;
+        prediction.structuredFormat = {
+          mainText: item.title,
+          ...(typeof label === 'string' && label !== ''
+            ? { secondaryText: label }
+            : {}),
         };
-        // HERE's *query*-type suggestions carry a title but no address at all, so
-        // `secondaryText` is omitted rather than emitted as an empty string a UI
-        // would render as a blank second line.
-        if (typeof item.title === 'string' && item.title !== '') {
-          const label = item.address?.label;
-          prediction.structuredFormat = {
-            mainText: item.title,
-            ...(typeof label === 'string' && label !== ''
-              ? { secondaryText: label }
-              : {}),
-          };
-        }
-        return prediction;
-      }),
-      raw: data,
-    };
+      }
+      predictions.push(prediction);
+    }
+    return { predictions, raw: data };
   }
 
   /**
@@ -377,16 +384,13 @@ export class HereGeocodingConnector
   }
 
   /**
-   * Parse the response body + raise a {@link ConnectorError} for non-2xx. The
-   * cause object merges in Retry-After when present by design (no structured retry field).
-   */
-  /**
    * Resolve a HERE place id to a full candidate.
    *
    * `GET https://lookup.search.hereapi.com/v1/lookup?id=` — the same normalizer as
    * geocode, since HERE returns one `items[]`-shaped entry.
    */
   async placeDetails(options: IPlaceDetailsOptions): Promise<IPlaceDetailsResult> {
+    validatePlaceDetailsOptions(options);
     const query: Record<string, string> = {
       apiKey: this.config.apiKey,
       id: options.placeId,
@@ -401,12 +405,18 @@ export class HereGeocodingConnector
       query: merged.query,
     });
 
+    // HERE answers an id it cannot resolve with 404: no place, not a failure.
+    // A malformed id is a 400 and stays an error.
+    if (response.status === 404) {
+      const notFound = (await response.json().catch(() => null)) as unknown;
+      return { candidate: null, raw: notFound };
+    }
     if (!response.ok) {
       throw await this.raiseHttpError(response, 'HERE Place Details');
     }
 
     const data = (await response.json().catch(() => null)) as HereGeocodeItem | null;
-    if (data === null) {
+    if (!isRecord(data)) {
       throw new ConnectorError({
         message: 'HERE Place Details returned a malformed response body',
         statusCode: response.status,
@@ -416,15 +426,10 @@ export class HereGeocodingConnector
       });
     }
 
+    // A place without a position is no usable place, never a (0,0) one.
     const candidate = normalizeCandidate(data);
     if (candidate === null) {
-      throw new ConnectorError({
-        message: 'HERE Place Details returned no position',
-        statusCode: response.status,
-        providerCode: 'no_route',
-        providerMessage: 'HERE Place Details returned no position',
-        cause: data,
-      });
+      return { candidate: null, raw: data };
     }
 
     const wantsName = options.include?.includes('name') === true;
@@ -439,6 +444,10 @@ export class HereGeocodingConnector
     };
   }
 
+  /**
+   * Parse the response body + raise a {@link ConnectorError} for non-2xx. The
+   * cause object merges in Retry-After when present by design (no structured retry field).
+   */
   private async raiseHttpError(
     response: Response,
     label: string,
@@ -468,19 +477,30 @@ export class HereGeocodingConnector
 /**
  * Normalize a single HERE `items[]` entry to {@link IGeocodeCandidate}.
  *
- * - `formattedAddress` ← `title` (or `address.label` fallback).
+ * - `formattedAddress` ← `address.label` (`title` only when the label is absent).
  * - `location` ← `position.{lat,lng}`.
  * - `placeId` ← `id` (HERE's locationId).
  * - `viewport` ← derived from `mapView` (south/west/north/east) when present.
- */
-/**
- * Normalize one HERE `items[]` entry.
  *
  * Returns `null` (the caller skips the row) when `position.lat`/`lng` are absent
  * or non-numeric — never fabricate a Null-Island (0,0) candidate, and never let a
  * missing node surface as a raw `TypeError` outside the `ConnectorError`
  * contract. Same rule as the other four geocoding connectors.
  */
+function normalizeItemList(
+  data: Record<string, unknown>,
+  label: string,
+  statusCode: number,
+): IGeocodeCandidate[] {
+  const items = optionalArray(data.items);
+  if (items === null) {
+    throw malformedResponseError(label, '`items` is not a list', statusCode, data);
+  }
+  return items
+    .map((item) => (isRecord(item) ? normalizeCandidate(item as unknown as HereGeocodeItem) : null))
+    .filter((c): c is IGeocodeCandidate => c !== null);
+}
+
 function normalizeCandidate(item: HereGeocodeItem): IGeocodeCandidate | null {
   const lat = item.position?.lat;
   const lng = item.position?.lng;
@@ -488,10 +508,18 @@ function normalizeCandidate(item: HereGeocodeItem): IGeocodeCandidate | null {
     return null;
   }
 
+  // `title` is the result's NAME for a POI (live: "Empire State Building"),
+  // while `address.label` is the full address ("Empire State Building, 20 W
+  // 34th St, New York, NY 10118, United States"). For a plain address the two
+  // coincide, so the label is the right source for every result type; the
+  // title belongs in `name` (place details).
+  const label = item.address?.label;
   const formattedAddress =
-    typeof item.title === 'string' && item.title !== ''
-      ? item.title
-      : (item.address?.label ?? '');
+    typeof label === 'string' && label !== ''
+      ? label
+      : typeof item.title === 'string'
+        ? item.title
+        : '';
 
   const candidate: IGeocodeCandidate = {
     formattedAddress,
@@ -502,9 +530,10 @@ function normalizeCandidate(item: HereGeocodeItem): IGeocodeCandidate | null {
     candidate.placeId = item.id;
   }
 
+  // A partial mapView is dropped whole rather than 0-filled.
   const mapView = item.mapView;
   if (
-    mapView !== undefined &&
+    isRecord(mapView) &&
     typeof mapView.south === 'number' &&
     typeof mapView.west === 'number' &&
     typeof mapView.north === 'number' &&

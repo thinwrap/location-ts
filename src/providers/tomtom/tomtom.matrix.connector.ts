@@ -7,29 +7,45 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import type { ProviderCode } from '../../types/error.types';
-import { mergePassthrough } from '../../utils';
+import {
+  isFiniteNumber,
+  isRecord,
+  malformedResponseError,
+  mergePassthrough,
+  readPollingTimeoutMs,
+} from '../../utils';
+import { assertNonEmptyMatrix, validateMatrixOptions } from '../../utils/validate-options';
 import { assertFiniteCoordinate } from '../../utils/coordinate';
+import { isTrafficRequested } from '../../utils/traffic';
 import type { TomTomConfig } from './tomtom.config';
 import type { TomTomMatrixResponse } from './tomtom.types';
 
 const SYNC_MATRIX_URL = 'https://api.tomtom.com/routing/matrix/2';
 const ASYNC_MATRIX_URL = 'https://api.tomtom.com/routing/matrix/2/async';
-const SYNC_CELL_THRESHOLD = 2_500;
+// TomTom's synchronous matrix allows 100 cells under any options. The 200-cell
+// tier is only lifted out of a 400 km box when departAt/arriveAt is `any`,
+// `traffic` is `historical`, routeType is `fastest` and nothing else is sent, and
+// 2500 needs an Enterprise plan — so a request whose options are not known to
+// fit those profiles (`trafficMode: 'traffic'`, a departure time, an avoid) cannot
+// rely on them, and the async endpoint (2500 cells standard) takes everything
+// above 100 regardless of `traffic`.
+const SYNC_CELL_THRESHOLD = 100;
 const POLL_INITIAL_DELAY_MS = 1_000;
 const POLL_MAX_DELAY_MS = 5_000;
 const POLL_BACKOFF_MULTIPLIER = 1.5;
 const POLL_DEFAULT_DEADLINE_MS = 60_000;
 
 /**
- * TomTom Matrix v2 connector — architectural outlier #2 for Matrix.
+ * TomTom Matrix v2 connector — the one matrix connector that is sync or async
+ * depending on the request.
  *
  * Unlike HERE Matrix v8 (always async) and Google/Mapbox/Esri
  * (always sync), TomTom Matrix v2 is **conditionally async** — dispatch is
  * driven by the cell-count threshold (`origins.length * destinations.length`):
  *
- *   - ≤ 2500 cells → single sync `POST /routing/matrix/2`. The response carries
+ *   - ≤ 100 cells → single sync `POST /routing/matrix/2`. The response carries
  *     `data[]` directly and is flattened to {@link IMatrixCell}[].
- *   - > 2500 cells → submit-poll-retrieve via `/routing/matrix/2/async`:
+ *   - > 100 cells → submit-poll-retrieve via `/routing/matrix/2/async`:
  *       1. `POST /async?key=…` returns `{ jobId }`.
  *       2. `GET /async/{jobId}?key=…` is polled with exponential backoff
  *          (1s start, x1.5, capped at 5s) until `state === 'Completed'`,
@@ -37,11 +53,12 @@ const POLL_DEFAULT_DEADLINE_MS = 60_000;
  *       3. `GET /async/{jobId}/result?key=…` retrieves the same `data[]` shape
  *          as the sync path.
  *
- * (async polling locality), the polling loop lives entirely inside
- * this connector with no shared middleware (parity with {@link HereMatrixConnector}).
+ * The polling loop lives entirely inside this connector with no shared
+ * middleware (parity with {@link HereMatrixConnector}).
  *
  * Polling deadline override: `options._passthrough.body.timeoutMs`
- * (consumer-supplied, in milliseconds). The `timeoutMs`
+ * (consumer-supplied: a finite number of milliseconds greater than 0, anything
+ * else is refused as `invalid_request` before any request). The `timeoutMs`
  * key is stripped from the wire body so it never reaches the vendor.
  *
  * Per-connector error mapping: 401/403 → `auth_failed`, 400/404 →
@@ -78,6 +95,8 @@ export class TomTomMatrixConnector
   }
 
   async matrix(options: IMatrixOptions): Promise<IMatrixResult> {
+    validateMatrixOptions(options, 'TomTom Matrix');
+    assertNonEmptyMatrix(options, 'TomTom Matrix');
     // Reject NaN/non-finite coordinates before they serialize into the JSON
     // body (JSON.stringify(NaN) === "null" would silently corrupt the request);
     // covers both the sync and async dispatch paths below. Out-of-range but
@@ -85,6 +104,10 @@ export class TomTomMatrixConnector
     for (const coord of [...options.origins, ...options.destinations]) {
       assertFiniteCoordinate(coord, 'TomTom Matrix');
     }
+    // Validated on the sync path too, where it is unused: a malformed deadline is
+    // a caller mistake either way, and which path runs depends on the grid size.
+    const deadlineMs =
+      readPollingTimeoutMs(options._passthrough, 'TomTom Matrix') ?? POLL_DEFAULT_DEADLINE_MS;
 
     const cellCount = options.origins.length * options.destinations.length;
 
@@ -92,11 +115,11 @@ export class TomTomMatrixConnector
       return this.matrixSync(options);
     }
 
-    return this.matrixAsync(options);
+    return this.matrixAsync(options, deadlineMs);
   }
 
   /**
-   * Sync path (≤2500 cells): single POST to `/routing/matrix/2`.
+   * Sync path (≤100 cells): single POST to `/routing/matrix/2`.
    */
   private async matrixSync(options: IMatrixOptions): Promise<IMatrixResult> {
     const { body, query } = this.buildRequest(options);
@@ -132,24 +155,19 @@ export class TomTomMatrixConnector
       });
     }
 
-    return this.normalizeCells(
-      data,
-      options.origins.length,
-      options.destinations.length,
-    );
+    return this.normalizeCells(data, response.status);
   }
 
   /**
-   * Async path (>2500 cells): submit → poll → retrieve.
+   * Async path (>100 cells): submit → poll → retrieve.
    */
-  private async matrixAsync(options: IMatrixOptions): Promise<IMatrixResult> {
+  private async matrixAsync(
+    options: IMatrixOptions,
+    deadlineMs: number,
+  ): Promise<IMatrixResult> {
     const jobId = await this.submitAsync(options);
-    await this.pollAsync(jobId, options);
-    return this.retrieveAsync(
-      jobId,
-      options.origins.length,
-      options.destinations.length,
-    );
+    await this.pollAsync(jobId, deadlineMs);
+    return this.retrieveAsync(jobId);
   }
 
   /**
@@ -205,11 +223,7 @@ export class TomTomMatrixConnector
    * Raises `'matrix_polling_timeout'` on deadline expiry with `cause.jobId`
    * so consumers can resume out-of-band.
    */
-  private async pollAsync(
-    jobId: string,
-    options: IMatrixOptions,
-  ): Promise<void> {
-    const deadlineMs = this.resolveDeadlineMs(options);
+  private async pollAsync(jobId: string, deadlineMs: number): Promise<void> {
     const deadlineAt = Date.now() + deadlineMs;
     const statusUrl = `${ASYNC_MATRIX_URL}/${encodeURIComponent(jobId)}`;
 
@@ -275,11 +289,7 @@ export class TomTomMatrixConnector
    * Step 3: retrieve the final async matrix payload (same `data[]` shape as
    * the sync response).
    */
-  private async retrieveAsync(
-    jobId: string,
-    numOrigins: number,
-    numDestinations: number,
-  ): Promise<IMatrixResult> {
+  private async retrieveAsync(jobId: string): Promise<IMatrixResult> {
     const resultUrl = `${ASYNC_MATRIX_URL}/${encodeURIComponent(jobId)}/result`;
 
     const response = await this.sendGet(resultUrl, {
@@ -303,7 +313,7 @@ export class TomTomMatrixConnector
       });
     }
 
-    return this.normalizeCells(data, numOrigins, numDestinations);
+    return this.normalizeCells(data, response.status);
   }
 
   /**
@@ -322,8 +332,21 @@ export class TomTomMatrixConnector
       bodyOptions.avoid = ['tollRoads'];
     }
 
-    if (options.departureTime) {
-      bodyOptions.departAt = options.departureTime.toISOString();
+    // Sent in both directions. TomTom has no "no traffic" value, so `'none'` is
+    // `historical` with `departAt: "any"` — "tailored to the use case where the
+    // time context is irrelevant", a time-independent average. The caller's
+    // time is dropped there: `historical` with a real `departAt` applies the
+    // typical traffic for that time, which `'none'` rules out. `any` is
+    // TomTom's default, sent explicitly so the request states what it asks for.
+    // `live` is rejected alongside `departAt: any`, so a traffic request without
+    // a departure time departs `now`.
+    if (isTrafficRequested(options.trafficMode)) {
+      bodyOptions.traffic = 'live';
+      bodyOptions.departAt =
+        options.departureTime !== undefined ? options.departureTime.toISOString() : 'now';
+    } else {
+      bodyOptions.traffic = 'historical';
+      bodyOptions.departAt = 'any';
     }
 
     const body: Record<string, unknown> = {
@@ -343,53 +366,57 @@ export class TomTomMatrixConnector
 
   /**
    * Flatten the `data[]` array (shared between sync and async result shapes)
-   * into `IMatrixCell[]`. Cells without `routeSummary` are skipped, matching
-   * the sibling PHP connector. Native meters + seconds.
+   * into `IMatrixCell[]`. Native meters + seconds.
    *
-   * A SPARSE result (an unroutable origin×destination pair dropped by TomTom)
-   * is OMITTED rather than erroring the whole call — each returned cell carries
-   * its `originIndex`/`destinationIndex`, so a consumer can tell exactly which
-   * pairs are present. This matches the Mapbox/OSRM/HERE/Google cell-omission
-   * semantics (supersedes the earlier loc-CR #100 whole-grid guard, which
-   * diverged from every other provider).
+   * A cell without `routeSummary` is a failed pair (TomTom sends a
+   * `detailedError` instead) and is OMITTED rather than erroring the whole call
+   * — each returned cell carries its `originIndex`/`destinationIndex`, so a
+   * consumer can tell exactly which pairs are present. This matches the
+   * Mapbox/OSRM/HERE/Google cell-omission semantics.
+   *
+   * A body without a `data` list, a non-object entry, or a summary whose
+   * length/time is not a number is a body we cannot read: it raises `unknown`
+   * rather than returning an empty or zero-filled matrix.
    */
   private normalizeCells(
     data: TomTomMatrixResponse,
-    _numOrigins: number,
-    _numDestinations: number,
+    statusCode: number,
   ): IMatrixResult {
-    const cells: IMatrixCell[] = [];
-    const entries = Array.isArray(data.data) ? data.data : [];
+    const entries: unknown = isRecord(data) ? data.data : undefined;
+    if (!Array.isArray(entries)) {
+      throw malformedResponseError('TomTom Matrix', '`data` is not a list', statusCode, data);
+    }
 
+    const cells: IMatrixCell[] = [];
     for (const entry of entries) {
-      if (entry.routeSummary) {
-        cells.push({
-          originIndex: entry.originIndex,
-          destinationIndex: entry.destinationIndex,
-          distanceMeters: entry.routeSummary.lengthInMeters,
-          durationSeconds: entry.routeSummary.travelTimeInSeconds,
-        });
+      if (!isRecord(entry)) {
+        throw malformedResponseError('TomTom Matrix', 'a cell is not an object', statusCode, data);
       }
+      const summary = entry.routeSummary;
+      if (summary === undefined || summary === null) continue;
+      if (
+        !isRecord(summary) ||
+        !isFiniteNumber(summary.lengthInMeters) ||
+        !isFiniteNumber(summary.travelTimeInSeconds) ||
+        !Number.isInteger(entry.originIndex) ||
+        !Number.isInteger(entry.destinationIndex)
+      ) {
+        throw malformedResponseError(
+          'TomTom Matrix',
+          'a cell has no numeric indexes, length or travel time',
+          statusCode,
+          data,
+        );
+      }
+      cells.push({
+        originIndex: entry.originIndex as number,
+        destinationIndex: entry.destinationIndex as number,
+        distanceMeters: summary.lengthInMeters,
+        durationSeconds: summary.travelTimeInSeconds,
+      });
     }
 
     return { cells, raw: data };
-  }
-
-  /**
-   * Resolve the polling deadline (ms). Honors
-   * `options._passthrough.body.timeoutMs` when present and positive,
-   * else falls back to 60 s default.
-   */
-  private resolveDeadlineMs(options: IMatrixOptions): number {
-    const raw = options._passthrough?.body?.timeoutMs;
-    if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
-      return raw;
-    }
-    if (typeof raw === 'string') {
-      const parsed = parseInt(raw, 10);
-      if (Number.isFinite(parsed) && parsed > 0) return parsed;
-    }
-    return POLL_DEFAULT_DEADLINE_MS;
   }
 
   /**

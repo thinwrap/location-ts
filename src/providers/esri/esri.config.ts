@@ -27,9 +27,10 @@ export interface EsriConfig {
 
 /**
  * Resolve the bearer credential to forward on the `token=` parameter,
- * enforcing the {@link EsriConfig} dual-auth XOR invariant. Throws a
- * {@link ConnectorError} with `providerCode: 'invalid_request'` when both or
- * neither are set.
+ * enforcing the {@link EsriConfig} dual-auth XOR invariant, at call time.
+ * Throws a {@link ConnectorError} with `providerCode: 'invalid_request'` when
+ * both are set (contradictory credentials), and `'auth_failed'` when neither
+ * is (there is no credential to send).
  */
 export function resolveEsriBearerToken(config: EsriConfig): string {
   const hasApiKey = typeof config.apiKey === 'string' && config.apiKey !== '';

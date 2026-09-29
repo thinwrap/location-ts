@@ -1,9 +1,19 @@
 import type { Passthrough } from '../types/passthrough.type';
 
-export type MergedPassthrough<TBody = Record<string, unknown>> = {
+/**
+ * A connector-built query: an array value is a repeated key on the wire (see
+ * `BaseConnector`'s `QueryParams`). A passthrough entry for the same key
+ * replaces the whole array, like every other shallow-merged query key.
+ */
+export type ConnectorQuery = Record<string, string | readonly string[]>;
+
+export type MergedPassthrough<
+  TBody = Record<string, unknown>,
+  TQuery extends ConnectorQuery = Record<string, string>,
+> = {
   body: TBody;
   headers: Record<string, string>;
-  query: Record<string, string>;
+  query: TQuery;
 };
 
 /**
@@ -14,17 +24,47 @@ export type MergedPassthrough<TBody = Record<string, unknown>> = {
  * hatch: there is deliberately NO reserved-key protection — a consumer can
  * override anything the connector sets (including auth headers) by design.
  */
-export function mergePassthrough<TBody extends Record<string, unknown>>(
+export function mergePassthrough<
+  TBody extends Record<string, unknown>,
+  TQuery extends ConnectorQuery = Record<string, string>,
+>(
   connectorBody: TBody,
   connectorHeaders: Record<string, string> = {},
   passthrough?: Passthrough,
-  connectorQuery: Record<string, string> = {},
-): MergedPassthrough<TBody> {
+  connectorQuery: TQuery = {} as TQuery,
+): MergedPassthrough<TBody, TQuery> {
   return {
     body: deepMergeBody(connectorBody, passthrough?.body ?? {}) as TBody,
-    headers: { ...connectorHeaders, ...(passthrough?.headers ?? {}) },
-    query: { ...connectorQuery, ...(passthrough?.query ?? {}) },
+    headers: mergeHeaders(connectorHeaders, passthrough?.headers),
+    // Passthrough values are strings, which every `TQuery` value type admits.
+    query: { ...connectorQuery, ...(passthrough?.query ?? {}) } as TQuery,
   };
+}
+
+/**
+ * Overlay `override` onto `base`, matching header names case-insensitively.
+ *
+ * HTTP header names are case-insensitive, but a plain object spread is not: a
+ * passthrough `x-goog-fieldmask` next to the connector's `X-Goog-FieldMask`
+ * would survive as two keys, and fetch then joins them into one value
+ * (`"mask-a, mask-b"`) that the vendor rejects or misreads. The override's key
+ * replaces every differently-cased duplicate, and its spelling is the one sent.
+ */
+export function mergeHeaders(
+  base: Record<string, string>,
+  override?: Record<string, string>,
+): Record<string, string> {
+  const result: Record<string, string> = { ...base };
+  for (const [name, value] of Object.entries(override ?? {})) {
+    const lower = name.toLowerCase();
+    for (const existing of Object.keys(result)) {
+      if (existing !== name && existing.toLowerCase() === lower) {
+        delete result[existing];
+      }
+    }
+    result[name] = value;
+  }
+  return result;
 }
 
 function deepMergeBody(

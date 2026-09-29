@@ -1,4 +1,4 @@
-import { BaseConnector } from '../../base/base.connector';
+import { BaseConnector, type QueryParams } from '../../base/base.connector';
 import type {
   IRoutingConnector,
   IRoutingLeg,
@@ -9,11 +9,18 @@ import type {
 } from '../../types';
 import { ConnectorError } from '../../types';
 import {
+  assertRouteHasLegs,
   encodePolyline,
   isCompleteWaypointOrder,
+  isFiniteNumber,
+  isRecord,
   joinCoords,
+  malformedResponseError,
   mergePassthrough,
+  optionalArray,
 } from '../../utils';
+import { validateRoutingOptions } from '../../utils/validate-options';
+import { isTrafficRequested } from '../../utils/traffic';
 import type { TomTomConfig } from './tomtom.config';
 import type { TomTomRouteResponse } from './tomtom.types';
 
@@ -28,9 +35,10 @@ const ROUTE_URL = 'https://api.tomtom.com/routing/1/calculateRoute';
  * (built via {@link joinCoords} with `'latlng'` + `':'`).
  *
  * Travel mode mapping: `driving → car`, `walking → pedestrian`,
- * `cycling → bicycle`. Avoid flags collapse into a comma-joined
- * `avoid=` query value: `avoidTolls → tollRoads`, `avoidFerries → ferries`,
- * `avoidHighways → motorways`.
+ * `cycling → bicycle`. Each avoid flag is its own REPEATED `avoid=` query
+ * param (`avoidTolls → tollRoads`, `avoidFerries → ferries`,
+ * `avoidHighways → motorways`): calculateRoute answers a comma list
+ * (`avoid=tollRoads,motorways`) with 400 `Invalid avoid value`.
  *
  * Polyline is rebuilt inline: `routes[0].legs[*].points` arrives as
  * `{ latitude, longitude }` pairs (full-word keys, NOT lat/lng), flattened
@@ -48,6 +56,7 @@ export class TomTomRoutingConnector
   }
 
   async route(options: IRoutingOptions): Promise<IRoutingResult> {
+    validateRoutingOptions(options, 'TomTom Routing');
     const waypoints = options.waypoints;
     if (waypoints.length < 2) {
       throw new ConnectorError({
@@ -62,7 +71,7 @@ export class TomTomRoutingConnector
     const locations = joinCoords(waypoints, 'latlng', ':');
     const url = `${ROUTE_URL}/${locations}/json`;
 
-    const baseQuery: Record<string, string> = {
+    const baseQuery: Record<string, string | string[]> = {
       key: this.config.apiKey,
       travelMode: mapTravelMode(options.travelMode),
       routeType: 'fastest',
@@ -82,18 +91,31 @@ export class TomTomRoutingConnector
       });
     }
 
-    if (options.optimize === true && waypoints.length > 2) {
+    // Any of the three optimize flags means "reorder", as on Google/HERE/Mapbox/
+    // OSRM. TomTom always keeps BOTH ends fixed — it has no way to free one — so
+    // optimizeFixedOrigin / optimizeFixedDestination alone still reorder only
+    // the intermediates.
+    const optimize = wantsOptimization(options);
+    if (optimize && waypoints.length > 2) {
       baseQuery.computeBestOrder = 'true';
     }
 
+    // Kept under `'none'` too: Calculate Route has no time-independent mode.
+    // Its `departAt` has no `any` value here (live: 400 "traffic=false not
+    // allowed in combination with departAt=any", and the same with `true`), so
+    // dropping the time would only move the departure to now.
     if (options.departureTime) {
       baseQuery.departAt = options.departureTime.toISOString();
     }
 
     // TomTom's `traffic` parameter defaults to ON at the vendor, so leaving it
     // unset would contradict the normalized default of `trafficMode: 'none'`.
-    // Send it explicitly in both directions.
-    baseQuery.traffic = options.trafficMode === 'live' ? 'true' : 'false';
+    // Send it explicitly in both directions. `false` is the closest TomTom gets
+    // to `'none'`, and it is an approximation: "although the current traffic
+    // data is ignored during routing, the effect of historic traffic on
+    // effective road speeds is still incorporated" — typical traffic for the
+    // departure time (or now) stays in the duration. The README says so.
+    baseQuery.traffic = isTrafficRequested(options.trafficMode) ? 'true' : 'false';
 
     // `noTrafficTravelTimeInSeconds` only appears when `computeTravelTimeFor=all`
     // is requested, and that asks TomTom for extra computed values — so unlike
@@ -105,14 +127,14 @@ export class TomTomRoutingConnector
     }
 
     const avoids = buildAvoids(options);
-    if (avoids !== '') {
+    if (avoids.length > 0) {
       baseQuery.avoid = avoids;
     }
 
     // Per-connector body merge: body is empty for this GET. Query carries the
     // vendor params + headers may be augmented by passthrough.
-    const merged = mergePassthrough(
-      {} as Record<string, unknown>,
+    const merged = mergePassthrough<Record<string, unknown>, QueryParams>(
+      {},
       {},
       options._passthrough,
       baseQuery,
@@ -130,7 +152,7 @@ export class TomTomRoutingConnector
     const data = (await response.json().catch(() => null)) as
       | TomTomRouteResponse
       | null;
-    if (data === null) {
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) {
       throw new ConnectorError({
         message: 'TomTom Routing returned a malformed response body',
         statusCode: response.status,
@@ -139,8 +161,12 @@ export class TomTomRoutingConnector
         cause: data,
       });
     }
-    const route = data.routes?.[0];
-    if (!route) {
+    const routes = optionalArray(data.routes);
+    if (routes === null) {
+      throw malformedResponseError('TomTom Routing', '`routes` is not a list', response.status, data);
+    }
+    const route = routes[0] as TomTomRoute | null | undefined;
+    if (route === undefined) {
       throw new ConnectorError({
         message: 'TomTom Routing returned no routes',
         statusCode: response.status,
@@ -150,10 +176,32 @@ export class TomTomRoutingConnector
       });
     }
 
-    const legs = (route.legs ?? []).map((leg) => {
+    // TomTom always sends each summary's length and travel time; a missing one
+    // would otherwise be reported as 0 m / 0 s.
+    if (!isRecord(route) || !hasLengthAndTime(route.summary)) {
+      throw malformedResponseError(
+        'TomTom Routing',
+        'the first route has no summary length/travel time',
+        response.status,
+        data,
+      );
+    }
+    const rawLegs = optionalArray(route.legs);
+    if (rawLegs === null || rawLegs.some((leg) => !isRecord(leg) || !hasLengthAndTime(leg.summary))) {
+      throw malformedResponseError(
+        'TomTom Routing',
+        'a leg has no summary length/travel time',
+        response.status,
+        data,
+      );
+    }
+    const typedLegs = rawLegs as TomTomRoute['legs'];
+    assertRouteHasLegs(typedLegs.length, waypoints.length, 'TomTom Routing', data, response.status);
+
+    const legs = typedLegs.map((leg) => {
       const normalized: IRoutingLeg = {
-        distanceMeters: leg.summary?.lengthInMeters ?? 0,
-        durationSeconds: leg.summary?.travelTimeInSeconds ?? 0,
+        distanceMeters: leg.summary.lengthInMeters,
+        durationSeconds: leg.summary.travelTimeInSeconds,
       };
       const noTraffic = leg.summary?.noTrafficTravelTimeInSeconds;
       if (wantsNoTrafficTime && typeof noTraffic === 'number') {
@@ -163,17 +211,30 @@ export class TomTomRoutingConnector
     });
 
     // Flatten all leg points (TomTom uses { latitude, longitude } full-word
-    // keys) into LatLng[] and re-encode to precision-5.
-    const allPoints: LatLng[] = (route.legs ?? []).flatMap((leg) =>
-      (leg.points ?? []).map((p) => ({ lat: p.latitude, lng: p.longitude })),
-    );
+    // keys) into LatLng[] and re-encode to precision-5. A point missing a
+    // coordinate is a body we cannot read, never a (0,0) vertex.
+    const allPoints: LatLng[] = [];
+    for (const leg of typedLegs) {
+      const points = optionalArray(leg.points);
+      if (points === null) {
+        throw malformedResponseError('TomTom Routing', '`points` is not a list', response.status, data);
+      }
+      for (const p of points) {
+        if (!isRecord(p) || !isFiniteNumber(p.latitude) || !isFiniteNumber(p.longitude)) {
+          throw malformedResponseError(
+            'TomTom Routing',
+            'a route point has no latitude/longitude',
+            response.status,
+            data,
+          );
+        }
+        allPoints.push({ lat: p.latitude, lng: p.longitude });
+      }
+    }
     const polyline = encodePolyline(allPoints);
 
     let waypointOrder: number[] | undefined;
-    if (
-      options.optimize === true &&
-      Array.isArray(data.optimizedWaypoints)
-    ) {
+    if (optimize && Array.isArray(data.optimizedWaypoints)) {
       // TomTom `optimizedWaypoints` covers only the INTERMEDIATE waypoints;
       // `providedIndex` is 0-based over those intermediates (origin and
       // destination excluded). The canonical `waypointOrder` is the full
@@ -199,12 +260,12 @@ export class TomTomRoutingConnector
       }
     }
 
-    const totalNoTraffic = route.summary?.noTrafficTravelTimeInSeconds;
+    const totalNoTraffic = route.summary.noTrafficTravelTimeInSeconds;
 
     return {
       legs,
-      totalDistanceMeters: route.summary?.lengthInMeters ?? 0,
-      totalDurationSeconds: route.summary?.travelTimeInSeconds ?? 0,
+      totalDistanceMeters: route.summary.lengthInMeters,
+      totalDurationSeconds: route.summary.travelTimeInSeconds,
       polyline,
       ...(waypointOrder !== undefined ? { waypointOrder } : {}),
       ...(wantsNoTrafficTime && typeof totalNoTraffic === 'number'
@@ -309,6 +370,16 @@ function readTomTomErrorCode(body: Record<string, unknown> | null): string | nul
   return typeof code === 'string' && code !== '' ? code : null;
 }
 
+type TomTomRoute = TomTomRouteResponse['routes'][number];
+
+function hasLengthAndTime(summary: unknown): boolean {
+  return (
+    isRecord(summary) &&
+    isFiniteNumber(summary.lengthInMeters) &&
+    isFiniteNumber(summary.travelTimeInSeconds)
+  );
+}
+
 function mapTravelMode(mode?: 'driving' | 'walking' | 'cycling'): string {
   switch (mode) {
     case 'walking':
@@ -320,12 +391,20 @@ function mapTravelMode(mode?: 'driving' | 'walking' | 'cycling'): string {
   }
 }
 
-function buildAvoids(options: IRoutingOptions): string {
+function buildAvoids(options: IRoutingOptions): string[] {
   const avoids: string[] = [];
   if (options.avoidTolls) avoids.push('tollRoads');
   if (options.avoidFerries) avoids.push('ferries');
   if (options.avoidHighways) avoids.push('motorways');
-  return avoids.join(',');
+  return avoids;
+}
+
+function wantsOptimization(options: IRoutingOptions): boolean {
+  return (
+    options.optimize === true ||
+    options.optimizeFixedOrigin === true ||
+    options.optimizeFixedDestination === true
+  );
 }
 
 function readTomTomErrorMessage(

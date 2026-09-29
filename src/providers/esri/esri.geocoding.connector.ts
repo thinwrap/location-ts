@@ -1,6 +1,7 @@
 import { BaseConnector } from '../../base/base.connector';
 import type {
   IAutocompleteOptions,
+  IAutocompletePrediction,
   IAutocompleteResult,
   IPlaceDetailsOptions,
   IPlaceDetailsResult,
@@ -13,7 +14,8 @@ import type {
   ProviderCode,
 } from '../../types';
 import { ConnectorError } from '../../types';
-import { mergePassthrough } from '../../utils';
+import { isRecord, malformedResponseError, mergePassthrough, optionalArray } from '../../utils';
+import { validatePlaceDetailsOptions } from '../../utils/validate-options';
 import { assertFiniteCoordinate, formatCoord } from '../../utils/coordinate';
 import type { EsriConfig } from './esri.config';
 import { resolveEsriBearerToken } from './esri.config';
@@ -37,8 +39,7 @@ const SUGGEST_URL =
  * **Three endpoints under `GeocodeServer/`:**
  * - `findAddressCandidates` for forward geocoding (multi-result natively).
  * - `reverseGeocode` for reverse geocoding (**single-result natively** — the
- *   connector wraps the single result in a one-element `candidates[]` array
- *).
+ *   connector wraps the single result in a one-element `candidates[]` array).
  * - `suggest` for autocomplete (`magicKey` → unified `placeId`).
  *
  * Dual-auth ({@link EsriConfig} `apiKey` XOR `arcgisToken`) is resolved via
@@ -74,9 +75,11 @@ export class EsriGeocodingConnector
   }
 
   async geocode(options: IGeocodeOptions): Promise<IGeocodeResult> {
-    // forward geocode → findAddressCandidates with singleLine + token,
-    // `outFields=*` to surface viewport `extent`, optional `countryCode` from
-    // `countryFilter` (comma-joined alpha-2; ESRI uses alpha-2 directly).
+    // forward geocode → findAddressCandidates with singleLine + token, optional
+    // `countryCode` from `countryFilter` (comma-joined alpha-2; ESRI uses
+    // alpha-2 directly). `outFields` fills only each candidate's `attributes`,
+    // which the normalizer does not read — `address`, `location` and `extent`
+    // are returned regardless — so `*` only enriches `raw`.
     const baseQuery: Record<string, string> = {
       f: 'json',
       token: resolveEsriBearerToken(this.config),
@@ -91,15 +94,19 @@ export class EsriGeocodingConnector
       baseQuery.langCode = options.language;
     }
 
-    const data = await this.dispatchGet<EsriGeocodeResponse>(
+    const { data, status } = await this.dispatchGet<EsriGeocodeResponse>(
       GEOCODE_URL,
       baseQuery,
       options._passthrough,
       'ESRI geocoding failed',
     );
 
+    const candidates = optionalArray(data.candidates);
+    if (candidates === null) {
+      throw malformedResponseError('ESRI geocoding', '`candidates` is not a list', status, data);
+    }
     return {
-      candidates: (data.candidates ?? [])
+      candidates: candidates
         .map((c) => this.normalizeForwardCandidate(c))
         .filter((c): c is IGeocodeCandidate => c !== null),
       raw: data,
@@ -125,22 +132,26 @@ export class EsriGeocodingConnector
       baseQuery.langCode = options.language;
     }
 
-    const data = await this.dispatchGet<EsriReverseGeocodeResponse>(
+    const { data } = await this.dispatchGet<EsriReverseGeocodeResponse>(
       REVGEOCODE_URL,
       baseQuery,
       options._passthrough,
       'ESRI reverse geocoding failed',
+      isEsriNoAddressError,
     );
 
-    // when ESRI surfaces no address/location, return an empty
-    // candidates[] (parity with the other 4 providers' empty result shape).
-    if (data.address === undefined || data.location === undefined) {
+    // When ESRI finds no address — including its "Unable to find address"
+    // error body, which is how it answers a location with nothing nearby —
+    // return an empty candidates[], the same "no result" shape as the other
+    // four providers.
+    if (!isRecord(data.address) || !isRecord(data.location)) {
       return { candidates: [], raw: data };
     }
 
+    const longLabel = data.address.LongLabel;
     const formattedAddress =
-      data.address.LongLabel ?? data.address.Match_addr;
-    if (formattedAddress === undefined || formattedAddress === '') {
+      typeof longLabel === 'string' && longLabel !== '' ? longLabel : data.address.Match_addr;
+    if (typeof formattedAddress !== 'string' || formattedAddress === '') {
       return { candidates: [], raw: data };
     }
 
@@ -186,30 +197,30 @@ export class EsriGeocodingConnector
       baseQuery.countryCode = options.countryFilter.join(',');
     }
 
-    const data = await this.dispatchGet<EsriSuggestResponse>(
+    const { data, status } = await this.dispatchGet<EsriSuggestResponse>(
       SUGGEST_URL,
       baseQuery,
       options._passthrough,
       'ESRI autocomplete failed',
     );
 
-    return {
-      predictions: (data.suggestions ?? []).map((s) => ({
+    const suggestions = optionalArray(data.suggestions);
+    if (suggestions === null) {
+      throw malformedResponseError('ESRI autocomplete', '`suggestions` is not a list', status, data);
+    }
+    const predictions: IAutocompletePrediction[] = [];
+    for (const s of suggestions) {
+      if (!isRecord(s) || typeof s.text !== 'string') continue;
+      predictions.push({
         description: s.text,
-        // magicKey → placeId (ESRI's "most stable per-result
-        // identifier" convention from the architecture).
-        placeId: s.magicKey,
-      })),
-      raw: data,
-    };
+        // magicKey → placeId: it is the handle `findAddressCandidates` resolves
+        // back to the full candidate in `placeDetails`.
+        ...(typeof s.magicKey === 'string' ? { placeId: s.magicKey } : {}),
+      });
+    }
+    return { predictions, raw: data };
   }
 
-  /**
-   * Shared GET dispatch + body inspection used by all three geocoding methods.
-   * Funnels both HTTP-level errors and 200-with-error-body through
-   * {@link EsriGeocodingConnector.raiseHttpError} /
-   * {@link EsriGeocodingConnector.raiseBodyError}.
-   */
   /**
    * Resolve an Esri `magicKey` (from `autocomplete()`) to a full candidate.
    *
@@ -223,6 +234,7 @@ export class EsriGeocodingConnector
    * input — our `placeId` IS the magicKey.
    */
   async placeDetails(options: IPlaceDetailsOptions): Promise<IPlaceDetailsResult> {
+    validatePlaceDetailsOptions(options);
     const baseQuery: Record<string, string> = {
       f: 'json',
       token: resolveEsriBearerToken(this.config),
@@ -233,23 +245,22 @@ export class EsriGeocodingConnector
       baseQuery.langCode = options.language;
     }
 
-    const data = await this.dispatchGet<EsriGeocodeResponse>(
+    const { data, status } = await this.dispatchGet<EsriGeocodeResponse>(
       GEOCODE_URL,
       baseQuery,
       options._passthrough,
       'ESRI place details failed',
     );
 
-    const first = data.candidates?.[0];
-    const candidate = first !== undefined ? this.normalizeForwardCandidate(first) : null;
+    // No candidate, or one without a location, is no usable place: `null`,
+    // never a fabricated (0,0) candidate.
+    const candidates = optionalArray(data.candidates);
+    if (candidates === null) {
+      throw malformedResponseError('ESRI place details', '`candidates` is not a list', status, data);
+    }
+    const candidate = this.normalizeForwardCandidate(candidates[0]);
     if (candidate === null) {
-      throw new ConnectorError({
-        message: 'ESRI Place Details returned no candidate',
-        statusCode: null,
-        providerCode: 'no_route',
-        providerMessage: 'ESRI Place Details returned no candidate',
-        cause: data,
-      });
+      return { candidate: null, raw: data };
     }
 
     // Esri returns only an address — there is no separate display name to
@@ -257,12 +268,23 @@ export class EsriGeocodingConnector
     return { candidate, raw: data };
   }
 
+  /**
+   * Shared GET dispatch + body inspection used by every geocoding method.
+   * Funnels both HTTP-level errors and 200-with-error-body through
+   * {@link EsriGeocodingConnector.raiseHttpError} /
+   * {@link EsriGeocodingConnector.raiseBodyError}.
+   *
+   * `isNoResult` names the in-body errors that are Esri's way of saying "nothing
+   * found" for this operation; those bodies are returned for the caller to turn
+   * into an empty result instead of being raised.
+   */
   private async dispatchGet<T extends { error?: { message: string; code: number } }>(
     url: string,
     baseQuery: Record<string, string>,
     passthrough: IGeocodeOptions['_passthrough'],
     failureLabel: string,
-  ): Promise<T> {
+    isNoResult?: (body: Record<string, unknown>) => boolean,
+  ): Promise<{ data: T; status: number }> {
     // mergePassthrough 3-arg form (positional: connectorBody, connectorHeaders,
     // passthrough). we route the wire params via `body` then
     // shift them into the URL query string for the GET request, alongside
@@ -304,10 +326,13 @@ export class EsriGeocodingConnector
 
     // ESRI 200-with-error-body inspection.
     if (data.error !== undefined && data.error !== null) {
+      if (isNoResult?.(data as unknown as Record<string, unknown>) === true) {
+        return { data, status: response.status };
+      }
       throw this.raiseBodyError(data, response.status, failureLabel);
     }
 
-    return data;
+    return { data, status: response.status };
   }
 
   /**
@@ -317,11 +342,11 @@ export class EsriGeocodingConnector
    * carry a stable per-result identifier (its `attributes.UniqueID` is
    * service-version-dependent and not portable).
    */
-  private normalizeForwardCandidate(
-    c: EsriGeocodeResponse['candidates'][number],
-  ): IGeocodeCandidate | null {
+  private normalizeForwardCandidate(entry: unknown): IGeocodeCandidate | null {
     // Skip a candidate without real coordinates rather than emitting a fabricated
     // (0,0) location or letting a missing `location` surface as a raw TypeError.
+    if (!isRecord(entry)) return null;
+    const c = entry as Partial<EsriGeocodeResponse['candidates'][number]>;
     const y = c.location?.y;
     const x = c.location?.x;
     if (typeof y !== 'number' || typeof x !== 'number') {
@@ -329,14 +354,23 @@ export class EsriGeocodingConnector
     }
 
     const candidate: IGeocodeCandidate = {
-      formattedAddress: c.address,
+      formattedAddress: typeof c.address === 'string' ? c.address : '',
       location: { lat: y, lng: x },
     };
 
-    if (c.extent !== undefined && c.extent !== null) {
+    // A partial extent is dropped whole rather than 0-filled: a (0,0) corner
+    // would silently stretch a consumer's map bounds to Null Island.
+    const extent = c.extent;
+    if (
+      isRecord(extent) &&
+      typeof extent.xmin === 'number' &&
+      typeof extent.ymin === 'number' &&
+      typeof extent.xmax === 'number' &&
+      typeof extent.ymax === 'number'
+    ) {
       candidate.viewport = {
-        southwest: { lat: c.extent.ymin, lng: c.extent.xmin },
-        northeast: { lat: c.extent.ymax, lng: c.extent.xmax },
+        southwest: { lat: extent.ymin, lng: extent.xmin },
+        northeast: { lat: extent.ymax, lng: extent.xmax },
       };
     }
 
@@ -388,9 +422,9 @@ export class EsriGeocodingConnector
   }
 
   /**
-   * Map ESRI (HTTP status, decoded body) → canonical {@link ProviderCode}
-   * Handles both HTTP-level codes and ESRI's 200-with-error-body
-   * case via `body.error.code`. 16.
+   * Map ESRI (HTTP status, decoded body) → canonical {@link ProviderCode}.
+   * Handles both HTTP-level codes and ESRI's 200-with-error-body case via
+   * `body.error.code`.
    */
   private mapVendorError(
     httpStatus: number,
@@ -454,6 +488,32 @@ export class EsriGeocodingConnector
 // ---------------------------------------------------------------------------
 // Module-private helpers
 // ---------------------------------------------------------------------------
+
+/** The `message` plus every `details[]` string of an ESRI error body. */
+function esriErrorTexts(body: Record<string, unknown>): string[] {
+  const errorField = body.error;
+  if (!isRecord(errorField)) return [];
+  const texts: string[] = [];
+  if (typeof errorField.message === 'string') texts.push(errorField.message);
+  if (Array.isArray(errorField.details)) {
+    for (const detail of errorField.details) {
+      if (typeof detail === 'string') texts.push(detail);
+    }
+  }
+  return texts;
+}
+
+/**
+ * ESRI's reverse-geocode answer for a location with no address nearby: an
+ * `error` body (code 400) whose details read "Unable to find address for the
+ * specified location." — a "no result", not a bad request.
+ */
+function isEsriNoAddressError(body: Record<string, unknown>): boolean {
+  return (
+    readBodyErrorCode(body) === 400 &&
+    esriErrorTexts(body).some((t) => /unable to find address/i.test(t))
+  );
+}
 
 function stringifyQueryValue(value: unknown): string {
   if (typeof value === 'string') return value;

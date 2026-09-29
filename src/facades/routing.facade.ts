@@ -12,11 +12,17 @@ import { HereRoutingConnector } from '../providers/here';
 import { EsriRoutingConnector } from '../providers/esri';
 import { OsrmRoutingConnector } from '../providers/osrm';
 import { TomTomRoutingConnector } from '../providers/tomtom';
+import { assertConfigObject } from './assert-config';
 
 export class Routing<P extends RoutingProvider> implements IRoutingConnector {
   readonly providerId: P;
   private connector: IRoutingConnector;
 
+  /**
+   * @throws {TypeError} synchronously, for an unknown provider (or one without
+   *   a routing connector) or a missing config: misuse of the API, deliberately
+   *   not a `ConnectorError`.
+   */
   constructor(provider: P, config: ProviderConfigMap[P], fetchImpl?: typeof fetch) {
     this.providerId = provider;
     this.connector = createRoutingConnector(provider, config, fetchImpl);
@@ -35,6 +41,7 @@ function createRoutingConnector<P extends RoutingProvider>(
   config: ProviderConfigMap[P],
   fetchImpl?: typeof fetch
 ): IRoutingConnector {
+  assertConfigObject(config, 'Routing');
   switch (provider) {
     case 'google':
       return new GoogleRoutingConnector(config as ProviderConfigMap['google'], fetchImpl);
@@ -49,6 +56,6 @@ function createRoutingConnector<P extends RoutingProvider>(
     case 'tomtom':
       return new TomTomRoutingConnector(config as ProviderConfigMap['tomtom'], fetchImpl);
     default:
-      throw new Error(`Unknown routing provider: ${provider}`);
+      throw new TypeError(`Unknown routing provider: ${String(provider)}`);
   }
 }

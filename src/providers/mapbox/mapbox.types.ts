@@ -92,7 +92,8 @@ export interface MapboxIsochroneResponse {
     };
     geometry: {
       type: string;
-      coordinates: number[][][];
+      /** `number[][][]` for a `Polygon`, `number[][][][]` for a `MultiPolygon`. */
+      coordinates: number[][][] | number[][][][];
     };
   }>;
 }

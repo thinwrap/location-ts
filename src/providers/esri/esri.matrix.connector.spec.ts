@@ -82,7 +82,7 @@ describe('EsriMatrixConnector', () => {
       expect(params.get('outSR')).toBe('4326');
     });
 
-    it('forwards departureTime as epoch milliseconds in `startTime`', async () => {
+    it('forwards departureTime with traffic as epoch milliseconds in `timeOfDay`, flagged as UTC', async () => {
       mockFetch.mockResolvedValueOnce(
         buildSuccessResponse(buildOdCostMatrixBody({ '1': { '1': [5, 1] } })),
       );
@@ -92,11 +92,44 @@ describe('EsriMatrixConnector', () => {
         origins: [{ lat: 0, lng: 0 }],
         destinations: [{ lat: 1, lng: 1 }],
         departureTime: when,
+        trafficMode: 'traffic',
       });
 
       const [, init] = mockFetch.mock.calls[0]!;
       const params = parseForm(init!.body as string);
-      expect(params.get('startTime')).toBe(String(when.getTime()));
+      // solveODCostMatrix documents `timeOfDay` + `timeOfDayIsUTC` (default
+      // false = origins' local zone); it has no `startTime` parameter.
+      expect(params.get('timeOfDay')).toBe('1779004800000');
+      expect(params.get('timeOfDayIsUTC')).toBe('true');
+      expect(params.get('startTime')).toBeNull();
+      expect(params.get('startTimeIsUTC')).toBeNull();
+    });
+
+    it('sends no time parameters without a departureTime', async () => {
+      mockFetch.mockResolvedValueOnce(
+        buildSuccessResponse(buildOdCostMatrixBody({ '1': { '1': [5, 1] } })),
+      );
+
+      await connector.matrix({
+        origins: [{ lat: 0, lng: 0 }],
+        destinations: [{ lat: 1, lng: 1 }],
+      });
+
+      const [, init] = mockFetch.mock.calls[0]!;
+      const params = parseForm(init!.body as string);
+      expect(params.get('timeOfDay')).toBeNull();
+      expect(params.get('timeOfDayIsUTC')).toBeNull();
+    });
+
+    it('rejects an invalid departureTime Date with invalid_request (no fetch)', async () => {
+      await expect(
+        connector.matrix({
+          origins: [{ lat: 0, lng: 0 }],
+          destinations: [{ lat: 1, lng: 1 }],
+          departureTime: new Date(Number.NaN),
+        }),
+      ).rejects.toMatchObject({ providerCode: 'invalid_request', statusCode: null });
+      expect(mockFetch).not.toHaveBeenCalled();
     });
 
     it('sends the full Walking Time travelMode JSON object for walking', async () => {
@@ -338,9 +371,9 @@ describe('EsriMatrixConnector', () => {
     it('decodes the WalkTime impedance column for a walking matrix (real live shape)', async () => {
       // With a WALK travel mode, ArcGIS overrides the requested impedance, so
       // costAttributeNames comes back as ['WalkTime', 'Kilometers'] — NOT
-      // 'TravelTime'. The pre-fix decoder looked up 'TravelTime' only and
-      // silently reported every duration as 0. Live values from
-      // route-api.arcgis.com (2026-07-21).
+      // 'TravelTime'. A decoder looking up 'TravelTime' only would silently
+      // report every duration as 0. Live values from route-api.arcgis.com
+      // (2026-07-21).
       const WALK_MIN = 13.094903051108146;
       const WALK_KM = 1.091226960340165;
       mockFetch.mockResolvedValueOnce(
@@ -433,6 +466,136 @@ describe('EsriMatrixConnector', () => {
           '1': { '1': [5, 1] },
         },
       });
+    });
+
+    it.each([
+      ['an unknown impedance column', ['TruckTravelTime', 'Kilometers']],
+      ['no distance column', ['TravelTime', 'Miles']],
+      ['no known column at all', ['Minutes']],
+    ])('raises unknown (never 0s) for %s', async (_label, costAttributeNames) => {
+      mockFetch.mockResolvedValueOnce(
+        buildSuccessResponse({
+          odCostMatrix: { costAttributeNames, '1': { '1': [5, 1] } },
+        }),
+      );
+
+      const err = (await connector
+        .matrix({ origins: [{ lat: 0, lng: 0 }], destinations: [{ lat: 1, lng: 1 }] })
+        .catch((e: unknown) => e)) as ConnectorError;
+
+      expect(err).toBeInstanceOf(ConnectorError);
+      expect(err.providerCode).toBe('unknown');
+      expect(err.statusCode).toBe(200);
+      expect((err.cause as { costAttributeNames: string[] }).costAttributeNames).toEqual(
+        costAttributeNames,
+      );
+    });
+
+    it.each([
+      ['a cell shorter than its columns', [5]],
+      ['a non-numeric value', [5, null]],
+      ['a non-array cell', 5],
+    ])('raises unknown (never 0s) for %s', async (_label, cell) => {
+      mockFetch.mockResolvedValueOnce(
+        buildSuccessResponse({
+          odCostMatrix: { costAttributeNames: ['TravelTime', 'Kilometers'], '1': { '1': cell } },
+        }),
+      );
+
+      const err = (await connector
+        .matrix({ origins: [{ lat: 0, lng: 0 }], destinations: [{ lat: 1, lng: 1 }] })
+        .catch((e: unknown) => e)) as ConnectorError;
+
+      expect(err).toBeInstanceOf(ConnectorError);
+      expect(err.providerCode).toBe('unknown');
+      expect((err.cause as { costAttributeNames: string[] }).costAttributeNames).toEqual([
+        'TravelTime',
+        'Kilometers',
+      ]);
+    });
+
+    it('reads Total_WalkTime from an odLines FeatureSet on a walking matrix', async () => {
+      mockFetch.mockResolvedValueOnce(
+        buildSuccessResponse({
+          odLines: {
+            features: [
+              {
+                attributes: { OriginID: 1, DestinationID: 1, Total_WalkTime: 81.98, Total_Kilometers: 6.8316 },
+              },
+            ],
+          },
+        }),
+      );
+
+      const result = await connector.matrix({
+        origins: [{ lat: 0, lng: 0 }],
+        destinations: [{ lat: 1, lng: 1 }],
+        travelMode: 'walking',
+      });
+
+      expect(result.cells[0]!.durationSeconds).toBeCloseTo(81.98 * 60);
+      expect(result.cells[0]!.distanceMeters).toBeCloseTo(6831.6);
+    });
+
+    it('raises unknown when an odLines feature lacks the active time total', async () => {
+      mockFetch.mockResolvedValueOnce(
+        buildSuccessResponse({
+          odLines: {
+            features: [
+              { attributes: { OriginID: 1, DestinationID: 1, Total_TravelTime: 12, Total_Kilometers: 3 } },
+            ],
+          },
+        }),
+      );
+
+      await expect(
+        connector.matrix({
+          origins: [{ lat: 0, lng: 0 }],
+          destinations: [{ lat: 1, lng: 1 }],
+          travelMode: 'walking',
+        }),
+      ).rejects.toMatchObject({ providerCode: 'unknown', statusCode: 200 });
+    });
+
+    it('decodes the live walking columns [WalkTime, Kilometers]', async () => {
+      mockFetch.mockResolvedValueOnce(
+        buildSuccessResponse({
+          odCostMatrix: {
+            costAttributeNames: ['WalkTime', 'Kilometers'],
+            '1': { '1': [81.98, 6.8316] },
+          },
+        }),
+      );
+
+      const result = await connector.matrix({
+        origins: [{ lat: 0, lng: 0 }],
+        destinations: [{ lat: 1, lng: 1 }],
+        travelMode: 'walking',
+      });
+
+      expect(result.cells[0]!.durationSeconds).toBeCloseTo(81.98 * 60);
+      expect(result.cells[0]!.distanceMeters).toBeCloseTo(6831.6);
+    });
+
+    it('puts avoidTolls INSIDE the walking travel mode instead of beside it', async () => {
+      mockFetch.mockResolvedValueOnce(
+        buildSuccessResponse({
+          odCostMatrix: { costAttributeNames: ['WalkTime', 'Kilometers'], '1': { '1': [5, 1] } },
+        }),
+      );
+
+      await connector.matrix({
+        origins: [{ lat: 0, lng: 0 }],
+        destinations: [{ lat: 1, lng: 1 }],
+        travelMode: 'walking',
+        avoidTolls: true,
+      });
+
+      const params = parseForm(mockFetch.mock.calls[0]![1]!.body as string);
+      expect(params.has('restrictionAttributeNames')).toBe(false);
+      const mode = JSON.parse(params.get('travelMode') as string);
+      expect(mode.restrictionAttributeNames).toContain('Avoid Toll Roads');
+      expect(mode.restrictionAttributeNames).toContain('Walking');
     });
 
     it('emits restrictionAttributeNames for avoidTolls', async () => {
@@ -715,8 +878,8 @@ describe('EsriMatrixConnector', () => {
   });
 
   // Matrix sparse-cell omission + OID guards. A sparse matrix (unroutable pairs
-  // omitted by Esri) is returned as-is with indexed cells — parity with the other
-  // providers, superseding the earlier whole-grid throw (loc-CR #79/#99/#100).
+  // omitted by Esri) is returned as-is with indexed cells — the same
+  // cell-omission rule as the other providers.
   describe('matrix sparse-cell omission + OID guards', () => {
     it('omits a destination a sparse origin lacks (returns the indexed cells)', async () => {
       // 2×2 requested, but origin 2 only has dest 1 → three routable cells.

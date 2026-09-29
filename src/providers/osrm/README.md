@@ -19,9 +19,10 @@ const matrix  = new Matrix('osrm',  { baseUrl: 'http://localhost:5000' });
 |---|---|---|---|
 | `baseUrl` | `string` | yes | OSRM server URL (e.g. `http://localhost:5000` or your hosted instance) |
 | `supportedExcludeClasses` | `OsrmExcludeClass[]` | no | Exclude classes YOUR build was compiled with — see below |
-| `fetch` | `typeof fetch` | no | BYO fetch (defaults to `globalThis.fetch`) |
 
-The connector requires an explicit non-empty `baseUrl` and throws `ConnectorError` with `providerCode: 'invalid_request'` before any HTTP call when it's missing. The public demo server is deliberately never a default.
+A custom `fetch` is not a config field: pass it as the facade's third argument (`new Routing('osrm', config, myFetch)`). It defaults to `globalThis.fetch`.
+
+The connector requires an explicit non-empty `baseUrl`; the operation rejects with `ConnectorError` `providerCode: 'invalid_request'` before any HTTP call when it's missing. (A missing config object is different: `new Routing('osrm', null)` throws a `TypeError` at construction, like every facade.) The public demo server is deliberately never a default.
 
 `baseUrl` must include an **`http://` or `https://` scheme**; a bare host
 (`router.example.com`) is rejected with the same typed error. Without the check it would
@@ -55,10 +56,28 @@ Pre-flight validation raises typed errors before any HTTP call:
 
 | Unsupported field | `providerCode` |
 |---|---|
-| `departureTime` (no live-traffic on stock OSRM) | `unsupported_field` |
 | `avoidTolls` (unless `toll` is declared) | `unsupported_option` |
 | `avoidFerries` (unless `ferry` is declared) | `unsupported_option` |
 | `avoidHighways` (unless `motorway` is declared) | `unsupported_option` |
+
+**Traffic and departure time.** OSRM routes on the static speeds of its compiled profile
+and has no time parameter. Traffic can only come from rebuilding the graph (`osrm-contract`
+with edge-weight updates), not from a request option. So `trafficMode: 'traffic'` (or its
+deprecated alias `'live'`) is **ignored**, and a `departureTime` is ignored with it. Under
+`'none'` a departure time has no effect by definition. Neither is rejected.
+
+### Open trips and fixed endpoints
+
+On an open route (`roundtrip=false`) the fixed-endpoint flags are sent to the Trip service as-is:
+
+| Flags | `source` / `destination` |
+|---|---|
+| `optimizeFixedOrigin` + `optimizeFixedDestination` | `first` / `last` |
+| `optimizeFixedOrigin` alone | `first` / `any` |
+| `optimizeFixedDestination` alone | `any` / `last` |
+| plain `optimize` (neither fixed) | `first` / `last` |
+
+OSRM supports every combination except `any/any` with `roundtrip=false` (osrm-backend `trip.cpp`, added in v5.27), so a plain `optimize` keeps the first and last waypoint in place and reorders the middle. An OSRM build older than 5.27 answers a single fixed end with `NotImplemented`, which surfaces as `unsupported_option`.
 
 ### Making the avoid-flags work: `supportedExcludeClasses`
 
@@ -83,6 +102,9 @@ await routing.route({ waypoints, avoidTolls: true });
 // Still rejected with `unsupported_option` — 'motorway' was not declared.
 await routing.route({ waypoints, avoidHighways: true });
 ```
+
+The same declaration covers the Matrix connector: `new Matrix('osrm', { …, supportedExcludeClasses: ['toll'] })`
+sends `exclude=toll` on `/table` for `avoidTolls`.
 
 It is declared rather than probed because there is no way to ask an OSRM server what it
 supports without issuing a request that fails, and the wrapper holds no state to cache
@@ -154,11 +176,46 @@ Pre-flight validation (Routing's table applies, except `avoidFerries` / `avoidHi
 
 | Unsupported field | `providerCode` |
 |---|---|
-| `departureTime` | `unsupported_field` |
-| `avoidTolls` | `unsupported_option` |
+| `avoidTolls` (without `'toll'` in `supportedExcludeClasses`) | `unsupported_option` |
 
-The connector flattens OSRM's 2D arrays to `IMatrixCell[]`.
+`trafficMode` and `departureTime` are ignored, as on Routing.
+
+`avoidTolls` follows the routing rule exactly: with `'toll'` declared in
+`supportedExcludeClasses`, `/table` is sent `exclude=toll` (the Table service takes OSRM's
+general `exclude` option); without it the flag is refused before any request.
+
+The connector flattens OSRM's 2D arrays to `IMatrixCell[]`; a `null` cell (an unroutable
+pair) is omitted.
+
+### Error mapping
+
+OSRM sends every non-`Ok` envelope code with a 4xx, so the body code decides — on a 4xx and
+on a 2xx alike, with the routing connector's table: `NoSegment` (and `NoTable`, which the
+Table service documents as "No route found") → `no_route`,
+`InvalidQuery`/`InvalidOptions`/`InvalidValue` → `invalid_request`, `NotImplemented` →
+`unsupported_option`. Reverse-proxy 401/403/429 and 5xx map by status. Every error carries the
+HTTP status it arrived with.
 
 ### Retry-After
 
 **Not surfaced** (same rationale as Routing).
+
+## Replacing a default list
+
+The Matrix connector (`/table`) sends `annotations=duration,distance`. OSRM's own default is
+`duration` alone, which would leave every cell without a distance, so the connector asks for
+both. It is an ordinary default, set before the `_passthrough` merge, so
+`_passthrough.query.annotations` **replaces** it outright — deliberately, because a merge could
+only ever add values and would leave no way to drop one.
+
+The list is published as the frozen constant `OSRM_TABLE_ANNOTATIONS` (`['duration',
+'distance']`), which the connector builds its query from, so it is always exactly what is sent.
+OSRM documents only `duration` and `distance` for the Table endpoint, so there is nothing
+further to append — the constant is there so the list the normalizer relies on is visible, and
+to start from if you build your own.
+
+> **Both values feed normalized outputs:** `duration` → each cell's `durationSeconds`,
+> `distance` → each cell's `distanceMeters`. A replacement list without either one gets a
+> response missing that matrix, and the call raises `ConnectorError` with
+> `providerCode: 'unknown'` (the matrix does not match the requested dimensions) rather than
+> returning zeroed cells.

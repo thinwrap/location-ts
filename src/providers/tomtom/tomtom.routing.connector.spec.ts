@@ -198,7 +198,9 @@ describe('TomTomRoutingConnector', () => {
       expect(queryOf().get('avoid')).toBe('motorways');
     });
 
-    it('comma-joins multiple avoid values in `avoid=`', async () => {
+    // Live calculateRoute: `avoid=tollRoads,motorways` → 400 `Invalid avoid
+    // value: [tollRoads,motorways]`; repeated `avoid=` keys → 200.
+    it('sends multiple avoid values as repeated `avoid=` params, never a comma list', async () => {
       mockFetch.mockResolvedValueOnce(buildRouteResponse());
 
       await connector.route({
@@ -211,7 +213,24 @@ describe('TomTomRoutingConnector', () => {
         avoidHighways: true,
       });
 
-      expect(queryOf().get('avoid')).toBe('tollRoads,ferries,motorways');
+      expect(queryOf().getAll('avoid')).toEqual(['tollRoads', 'ferries', 'motorways']);
+      expect(urlOf()).not.toContain('%2C');
+    });
+
+    it('lets a passthrough `avoid` replace the connector-built list', async () => {
+      mockFetch.mockResolvedValueOnce(buildRouteResponse());
+
+      await connector.route({
+        waypoints: [
+          { lat: 0, lng: 0 },
+          { lat: 1, lng: 1 },
+        ],
+        avoidTolls: true,
+        avoidHighways: true,
+        _passthrough: { query: { avoid: 'unpavedRoads' } },
+      });
+
+      expect(queryOf().getAll('avoid')).toEqual(['unpavedRoads']);
     });
 
     it('omits `avoid` when no avoid flags are set', async () => {
@@ -423,6 +442,26 @@ describe('TomTomRoutingConnector', () => {
       // The route itself is still returned.
       expect(result.totalDistanceMeters).toBe(8000);
     });
+
+    // Any of the three optimize flags reorders; TomTom keeps both ends fixed.
+    for (const flag of ['optimizeFixedOrigin', 'optimizeFixedDestination'] as const) {
+      it(`sends computeBestOrder=true for ${flag} alone and projects the order`, async () => {
+        mockFetch.mockResolvedValueOnce(buildRouteResponse({ optimized: true }));
+
+        const result = await connector.route({
+          waypoints: [
+            { lat: 40.7128, lng: -74.006 },
+            { lat: 40.73, lng: -73.995 },
+            { lat: 40.758, lng: -73.9855 },
+            { lat: 40.77, lng: -73.98 },
+          ],
+          [flag]: true,
+        });
+
+        expect(queryOf().get('computeBestOrder')).toBe('true');
+        expect(result.waypointOrder).toEqual([0, 2, 1, 3]);
+      });
+    }
 
     it('omits computeBestOrder when optimize is set but only two waypoints', async () => {
       mockFetch.mockResolvedValueOnce(buildRouteResponse());
@@ -657,23 +696,52 @@ describe('TomTomRoutingConnector', () => {
   });
 
   describe('malformed 200 body normalization', () => {
-    // A contract-violating 200 body (route missing legs/summary) must normalize
-    // to safe defaults, not escape as an unwrapped TypeError.
-    it('normalizes a 200 body with a route missing legs/summary to defaults', async () => {
-      mockFetch.mockResolvedValueOnce(
-        new Response(JSON.stringify({ routes: [{}] }), { status: 200 }),
-      );
-
-      const result = await connector.route({
-        waypoints: [
-          { lat: 0, lng: 0 },
-          { lat: 1, lng: 1 },
-        ],
-      });
-
-      expect(result.legs).toEqual([]);
-      expect(result.totalDistanceMeters).toBe(0);
-      expect(result.totalDurationSeconds).toBe(0);
+    // A route missing its summary/legs must not come back as 0 m / 0 s with no
+    // legs, and a null route or point must not escape as a TypeError or (0,0).
+    const leg = {
+      summary: { lengthInMeters: 10, travelTimeInSeconds: 5 },
+      points: [{ latitude: 0, longitude: 0 }],
+    };
+    it.each([
+      ['a route missing legs/summary', { routes: [{}] }],
+      ['a null route', { routes: [null] }],
+      ['a route missing its summary', { routes: [{ legs: [leg] }] }],
+      [
+        'a leg summary missing travel time',
+        {
+          routes: [
+            {
+              summary: { lengthInMeters: 10, travelTimeInSeconds: 5 },
+              legs: [{ summary: { lengthInMeters: 10 }, points: [] }],
+            },
+          ],
+        },
+      ],
+      [
+        'a route with no legs',
+        { routes: [{ summary: { lengthInMeters: 10, travelTimeInSeconds: 5 }, legs: [] }] },
+      ],
+      [
+        'a point missing longitude',
+        {
+          routes: [
+            {
+              summary: { lengthInMeters: 10, travelTimeInSeconds: 5 },
+              legs: [{ ...leg, points: [{ latitude: 1 }] }],
+            },
+          ],
+        },
+      ],
+    ])('raises a ConnectorError for %s', async (_label, body) => {
+      mockFetch.mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
+      await expect(
+        connector.route({
+          waypoints: [
+            { lat: 0, lng: 0 },
+            { lat: 1, lng: 1 },
+          ],
+        }),
+      ).rejects.toMatchObject({ name: 'ConnectorError', statusCode: 200 });
     });
   });
 });

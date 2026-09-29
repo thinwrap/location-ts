@@ -232,16 +232,17 @@ describe('GoogleRoutingConnector', () => {
       expect(bodyOf().routingPreference).toBe('TRAFFIC_UNAWARE');
     });
 
-    it('stays TRAFFIC_UNAWARE when departureTime alone is given', async () => {
+    it('stays TRAFFIC_UNAWARE and drops the time when departureTime alone is given', async () => {
       mockFetch.mockResolvedValueOnce(buildRoutesResponse());
       await connector.route({
         waypoints: TWO,
         departureTime: new Date('2026-01-01T12:00:00Z'),
       });
       const body = bodyOf();
-      // The departure time is still sent — it affects historical/scheduled
-      // routing — but it no longer upgrades the SKU on its own.
-      expect(body.departureTime).toBe('2026-01-01T12:00:00.000Z');
+      // The time does not upgrade the SKU, and it is not sent either: Google
+      // answers HTTP 400 "Timestamp cannot be set for TRAFFIC_UNAWARE routing
+      // mode." when both are present.
+      expect(body.departureTime).toBeUndefined();
       expect(body.routingPreference).toBe('TRAFFIC_UNAWARE');
     });
 
@@ -479,24 +480,53 @@ describe('GoogleRoutingConnector', () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
-  // A contract-violating 200 body (route present but missing nested
-  // polyline/duration/legs) must normalize to safe defaults, not escape as an
-  // unwrapped TypeError.
-  it('normalizes a 200 body with a route missing nested fields to defaults', async () => {
+  // HTTP header names are case-insensitive: a lower-cased passthrough mask must
+  // replace the connector's, not ride along and be joined into "a, b".
+  it('replaces X-Goog-FieldMask with a differently-cased passthrough header', async () => {
     mockFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({ routes: [{}] }), { status: 200 }),
+      new Response(JSON.stringify({ routes: [{ legs: [{ distanceMeters: 1, duration: '1s' }] }] }), {
+        status: 200,
+      }),
     );
+    await connector.route({
+      waypoints: [{ lat: 0, lng: 0 }, { lat: 1, lng: 1 }],
+      _passthrough: { headers: { 'x-goog-fieldmask': 'routes.legs.distanceMeters' } },
+    });
+    const headers = mockFetch.mock.calls[0]![1]!.headers as Record<string, string>;
+    const maskKeys = Object.keys(headers).filter((k) => k.toLowerCase() === 'x-goog-fieldmask');
+    expect(maskKeys).toEqual(['x-goog-fieldmask']);
+    expect(headers['x-goog-fieldmask']).toBe('routes.legs.distanceMeters');
+  });
 
+  // A route with no legs describes no journey, and a null route is no route
+  // object at all: both are ConnectorErrors, never a zero-valued success or a
+  // raw TypeError.
+  it.each([
+    ['a route without legs', { routes: [{}] }],
+    ['a null route', { routes: [null] }],
+    ['a non-list routes', { routes: { distanceMeters: 1 } }],
+    ['a null leg', { routes: [{ legs: [null] }] }],
+  ])('raises a ConnectorError for %s', async (_label, body) => {
+    mockFetch.mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
+    await expect(
+      connector.route({ waypoints: [{ lat: 0, lng: 0 }, { lat: 1, lng: 1 }] }),
+    ).rejects.toMatchObject({ name: 'ConnectorError', statusCode: 200 });
+  });
+
+  // Google's JSON drops zero values, so a leg with no distance/duration is a
+  // same-point leg — the one place an absent number legitimately means 0.
+  it('reads absent leg/route numbers as Google-dropped zeros', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ routes: [{ legs: [{}] }] }), { status: 200 }),
+    );
     const result = await connector.route({
       waypoints: [
         { lat: 0, lng: 0 },
-        { lat: 1, lng: 1 },
+        { lat: 0, lng: 0 },
       ],
     });
-
-    expect(result.legs).toEqual([]);
+    expect(result.legs).toEqual([{ distanceMeters: 0, durationSeconds: 0 }]);
     expect(result.totalDistanceMeters).toBe(0);
-    expect(result.totalDurationSeconds).toBe(0);
     expect(result.polyline).toBe('');
   });
 });

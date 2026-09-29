@@ -1,10 +1,10 @@
 import { ConnectorError } from '../types/error.types';
+import { mergeHeaders } from '../utils/merge-passthrough';
 
 /**
  * Default per-request bound, so a hung provider cannot leave the caller's promise
  * pending forever. Not a policy knob: a caller wanting a different bound supplies
- * their own `fetchImpl`, whose signal fires first. Matches the 30s default in the
- * Python sibling's `Transport`.
+ * their own `fetchImpl`, whose signal fires first.
  */
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -15,6 +15,19 @@ const DEFAULT_TIMEOUT_MS = 30_000;
  * them back.
  */
 const REBUILT_RESPONSE_DROPPED_HEADERS = new Set(['content-length', 'content-encoding']);
+
+/**
+ * Query parameters for the shared request helpers. An array value is emitted as
+ * a REPEATED key (`avoid=a&avoid=b`), never comma-joined: some vendors (TomTom
+ * Routing's `avoid`) reject a comma list and only accept repetition.
+ */
+export type QueryParams = Record<string, string | readonly string[]>;
+
+/** Options shared by the request helpers. */
+export interface RequestOptions {
+  headers?: Record<string, string>;
+  query?: QueryParams;
+}
 
 export abstract class BaseConnector {
   abstract readonly providerId: string;
@@ -35,28 +48,46 @@ export abstract class BaseConnector {
   protected readonly fetchImpl: typeof fetch;
 
   protected constructor(fetchImpl?: typeof fetch) {
-    this.fetchImpl = fetchImpl ?? globalThis.fetch;
+    // The default is bound to `globalThis` because it is later invoked as
+    // `this.fetchImpl(...)`: Cloudflare Workers' fetch throws "Illegal
+    // invocation" when its receiver is not the global scope. A caller-supplied
+    // implementation is stored untouched, so it is invoked exactly as before.
+    this.fetchImpl =
+      fetchImpl ??
+      (typeof globalThis.fetch === 'function'
+        ? globalThis.fetch.bind(globalThis)
+        : globalThis.fetch);
   }
 
   // ===== Shared request helpers used by every connector =====
 
+  /**
+   * `redirect: 'manual'` is an explicit opt-in for a connector that must SEE a
+   * redirect (status + `Location`) and decide per hop where credentials go —
+   * HERE Matrix's async 303s. Every other call keeps the `'error'` default, so a
+   * redirect can never silently re-send auth to its target.
+   */
   protected async sendGet(
     url: string,
-    options?: { headers?: Record<string, string>; query?: Record<string, string> },
+    options?: RequestOptions & { redirect?: 'manual' },
   ): Promise<Response> {
     const finalUrl = this.buildUrl(url, options?.query);
-    return this.invokeFetch(finalUrl, { method: 'GET', headers: options?.headers });
+    return this.invokeFetch(finalUrl, {
+      method: 'GET',
+      headers: options?.headers,
+      ...(options?.redirect !== undefined ? { redirect: options.redirect } : {}),
+    });
   }
 
   protected async sendPostJson(
     url: string,
     body: unknown,
-    options?: { headers?: Record<string, string>; query?: Record<string, string> },
+    options?: RequestOptions,
   ): Promise<Response> {
     const finalUrl = this.buildUrl(url, options?.query);
     return this.invokeFetch(finalUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...options?.headers },
+      headers: mergeHeaders({ 'Content-Type': 'application/json' }, options?.headers),
       body: JSON.stringify(body),
     });
   }
@@ -64,19 +95,27 @@ export abstract class BaseConnector {
   protected async sendPostForm(
     url: string,
     form: Record<string, string>,
-    options?: { headers?: Record<string, string>; query?: Record<string, string> },
+    options?: RequestOptions,
   ): Promise<Response> {
     const finalUrl = this.buildUrl(url, options?.query);
     return this.invokeFetch(finalUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...options?.headers },
+      headers: mergeHeaders(
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        options?.headers,
+      ),
       body: new URLSearchParams(form).toString(),
     });
   }
 
-  private buildUrl(url: string, query?: Record<string, string>): string {
+  private buildUrl(url: string, query?: QueryParams): string {
     if (!query) return url;
-    const qs = new URLSearchParams(query).toString();
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      if (typeof value === 'string') params.append(key, value);
+      else for (const item of value) params.append(key, item);
+    }
+    const qs = params.toString();
     if (qs.length === 0) return url;
     const separator = url.includes('?') ? '&' : '?';
     return `${url}${separator}${qs}`;

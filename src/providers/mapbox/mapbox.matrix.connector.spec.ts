@@ -151,25 +151,89 @@ describe('MapboxMatrixConnector', () => {
     expect(url).toContain('/mapbox/driving/');
   });
 
-  // annotations invariant: consumer cannot override
-  it('should force annotations=duration,distance even when consumer attempts to override', async () => {
+  // Live: directions-matrix/v1/mapbox/driving-traffic/… → 200, different durations.
+  it('should select the driving-traffic profile for trafficMode live', async () => {
+    mockFetch.mockResolvedValueOnce(buildMatrixResponse());
+    await connector.matrix({
+      origins: [{ lat: 40.8509, lng: -73.9701 }],
+      destinations: [{ lat: 40.8448, lng: -73.8648 }],
+      trafficMode: 'live',
+    });
+    const [url] = mockFetch.mock.calls[0]!;
+    expect(new URL(url as string).pathname).toMatch(
+      /^\/directions-matrix\/v1\/mapbox\/driving-traffic\//,
+    );
+  });
+
+  it.each<['walking' | 'cycling', string]>([
+    ['walking', '/mapbox/walking/'],
+    ['cycling', '/mapbox/cycling/'],
+  ])('should keep the %s profile under trafficMode live', async (travelMode, expected) => {
     mockFetch.mockResolvedValueOnce(buildMatrixResponse());
     await connector.matrix({
       origins: [{ lat: 0, lng: 0 }],
       destinations: [{ lat: 1, lng: 1 }],
-      _passthrough: { query: { annotations: 'duration' } },
+      travelMode,
+      trafficMode: 'live',
+    });
+    expect(mockFetch.mock.calls[0]![0] as string).toContain(expected);
+  });
+
+  // Live: Matrix with `exclude=toll` or `depart_at` → 422 "Request too large
+  // for custom parameters" (exclude is undocumented, depart_at a sign-up beta).
+  it('should reject avoidTolls with unsupported_option before any request', async () => {
+    await expect(
+      connector.matrix({
+        origins: [{ lat: 0, lng: 0 }],
+        destinations: [{ lat: 1, lng: 1 }],
+        avoidTolls: true,
+      }),
+    ).rejects.toMatchObject({ providerCode: 'unsupported_option', statusCode: null });
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('should reject departureTime with traffic as unsupported_field before any request', async () => {
+    await expect(
+      connector.matrix({
+        origins: [{ lat: 0, lng: 0 }],
+        destinations: [{ lat: 1, lng: 1 }],
+        departureTime: new Date('2026-09-29T13:00:00Z'),
+        trafficMode: 'traffic',
+      }),
+    ).rejects.toMatchObject({ providerCode: 'unsupported_field', statusCode: null });
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('should still let a beta account send depart_at through passthrough', async () => {
+    mockFetch.mockResolvedValueOnce(buildMatrixResponse());
+    await connector.matrix({
+      origins: [{ lat: 0, lng: 0 }],
+      destinations: [{ lat: 1, lng: 1 }],
+      _passthrough: { query: { depart_at: '2026-09-29T13:00:00Z' } },
+    });
+    const [url] = mockFetch.mock.calls[0]!;
+    expect(parseUrlParams(url as string).get('depart_at')).toBe('2026-09-29T13:00:00Z');
+  });
+
+  // annotations is a default like any other: a caller's list replaces it.
+  it('should let _passthrough.query.annotations replace the default list', async () => {
+    mockFetch.mockResolvedValueOnce(buildMatrixResponse());
+    await connector.matrix({
+      origins: [{ lat: 0, lng: 0 }],
+      destinations: [{ lat: 1, lng: 1 }],
+      _passthrough: { query: { annotations: 'distance,duration' } },
     });
     const [url] = mockFetch.mock.calls[0]!;
     const params = parseUrlParams(url as string);
-    expect(params.get('annotations')).toBe('duration,distance');
+    expect(params.getAll('annotations')).toEqual(['distance,duration']);
   });
 
-  it('should still apply other _passthrough.query params alongside the annotations invariant', async () => {
+  it('should keep the default annotations when passthrough sets only other params', async () => {
     mockFetch.mockResolvedValueOnce(buildMatrixResponse());
     await connector.matrix({
       origins: [{ lat: 0, lng: 0 }],
       destinations: [{ lat: 1, lng: 1 }],
-      _passthrough: { query: { fallback_speed: '60', annotations: 'duration' } },
+      _passthrough: { query: { fallback_speed: '60' } },
     });
     const [url] = mockFetch.mock.calls[0]!;
     const params = parseUrlParams(url as string);
@@ -289,7 +353,11 @@ describe('MapboxMatrixConnector', () => {
     it.each<[number, Record<string, unknown> | null, string]>([
       [401, null, 'auth_failed'],
       [403, null, 'auth_failed'],
-      [422, { message: 'No route', code: 'NoRoute' }, 'invalid_request'],
+      // A 422 is read by its body code, as on Mapbox routing.
+      [422, { message: 'No route', code: 'NoRoute' }, 'no_route'],
+      [422, { message: 'No segment', code: 'NoSegment' }, 'no_route'],
+      [422, { message: 'bad coordinate', code: 'InvalidInput' }, 'invalid_request'],
+      [422, { message: 'x' }, 'invalid_request'],
       [429, null, 'rate_limited'],
       [400, { message: 'bad request' }, 'invalid_request'],
       [500, null, 'provider_unavailable'],
@@ -349,7 +417,18 @@ describe('MapboxMatrixConnector', () => {
       thrown = err;
     }
     expect(thrown).toBeInstanceOf(ConnectorError);
-    expect((thrown as ConnectorError).providerCode).toBe('invalid_request');
+    // Matrix documents NoRoute on HTTP 200: a routing outcome, not a bad request.
+    expect((thrown as ConnectorError).providerCode).toBe('no_route');
+    expect((thrown as ConnectorError).statusCode).toBe(200);
+  });
+
+  it('maps a 200 InvalidInput envelope to invalid_request', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ code: 'InvalidInput' }), { status: 200 }),
+    );
+    await expect(
+      connector.matrix({ origins: [{ lat: 0, lng: 0 }], destinations: [{ lat: 1, lng: 1 }] }),
+    ).rejects.toMatchObject({ providerCode: 'invalid_request' });
   });
 
   // Retry-After surface (no structured retryAfterSeconds field per feedback memory)
@@ -382,11 +461,11 @@ describe('MapboxMatrixConnector', () => {
     ).toBeUndefined();
   });
 
-  // LOC-CP-1 (loc-CR #79/#99) — sparse/asymmetric/short matrix dimension guard
-  describe('matrix dimension guard (LOC-CP-1)', () => {
+  // A sparse/asymmetric/short matrix must never be read as a full grid.
+  describe('matrix dimension guard', () => {
     it('throws ConnectorError when a row is shorter than the destination count', async () => {
       // 2 origins × 2 destinations requested, but the second row has only 1 col.
-      // Pre-fix this silently zero-filled cell [1][1]; now it must throw.
+      // Reading cell [1][1] anyway would fabricate it, so the matrix is refused.
       mockFetch.mockResolvedValueOnce(
         buildMatrixResponse({
           durations: [

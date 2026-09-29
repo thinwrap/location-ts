@@ -98,8 +98,11 @@ export interface EsriODMatrixResponse {
       attributes: {
         OriginID: number;
         DestinationID: number;
-        Total_TravelTime: number; // minutes
-        Total_Kilometers: number; // kilometers
+        /** Minutes; present when the impedance is `TravelTime` (driving). */
+        Total_TravelTime?: number;
+        /** Minutes; present when the impedance is `WalkTime` (walking). */
+        Total_WalkTime?: number;
+        Total_Kilometers?: number; // kilometers
       };
     }>;
   };
@@ -122,8 +125,8 @@ export interface EsriGeocodeResponse {
     address: string;
     location: { x: number; y: number };
     /**
-     * ESRI bounding box (Web Mercator extent) returned for forward-geocode
-     * candidates when `outFields=*` is requested. Mapped to
+     * ESRI bounding box returned for every forward-geocode candidate (Esri
+     * returns `extent` by default, independent of `outFields`). Mapped to
      * the unified `viewport: { southwest, northeast }` shape.
      */
     extent?: {
@@ -174,7 +177,8 @@ export interface EsriServiceAreaResponse {
         ToBreak: number;
       };
       geometry: {
-        rings: number[][][]; // [[[lng,lat], ...]]
+        // [[[lng,lat], ...]] — exteriors clockwise, holes counter-clockwise, any order
+        rings: number[][][];
       };
     }>;
   };

@@ -37,8 +37,7 @@ export type {
   HereConfig,
   // The narrowed HERE input shapes. The module augmentation already types
   // `transportMode` at the call site, so these are only needed to NAME the
-  // vocabulary — declaring a variable, or a helper that takes one. The PHP, Go
-  // and Python siblings all export their equivalents; TypeScript did not.
+  // vocabulary — declaring a variable, or a helper that takes one.
   HereRoutingOptions,
   HereMatrixOptions,
   HereTransportMode,
@@ -47,3 +46,24 @@ export { EsriRoutingConnector, EsriMatrixConnector, EsriGeocodingConnector, Esri
 export type { EsriConfig } from './providers/esri';
 export { TomTomRoutingConnector, TomTomMatrixConnector, TomTomGeocodingConnector, TomTomIsochroneConnector } from './providers/tomtom';
 export type { TomTomConfig } from './providers/tomtom';
+
+// === Default vendor lists that `_passthrough` replaces ===
+// A passthrough value for a list-valued vendor parameter REPLACES the connector's
+// list, so these are published for a caller to spread and append to instead of
+// retyping them.
+export {
+  GOOGLE_ROUTES_FIELD_MASK,
+  GOOGLE_ROUTES_FIELD_MASK_DURATION_WITHOUT_TRAFFIC,
+  GOOGLE_ROUTES_FIELD_MASK_WAYPOINT_ORDER,
+  GOOGLE_MATRIX_FIELD_MASK,
+  GOOGLE_PLACE_DETAILS_FIELD_MASK,
+  GOOGLE_PLACE_DETAILS_FIELD_MASK_NAME,
+} from './providers/google';
+export { HERE_ROUTING_RETURN, HERE_MATRIX_ATTRIBUTES } from './providers/here';
+export { MAPBOX_MATRIX_ANNOTATIONS } from './providers/mapbox';
+export { OSRM_TABLE_ANNOTATIONS } from './providers/osrm';
+export {
+  ESRI_ROUTING_ACCUMULATE_ATTRIBUTES_DRIVING,
+  ESRI_ROUTING_ACCUMULATE_ATTRIBUTES_WALKING,
+  ESRI_MATRIX_ACCUMULATE_ATTRIBUTES,
+} from './providers/esri';

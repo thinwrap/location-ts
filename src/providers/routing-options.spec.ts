@@ -215,6 +215,10 @@ describe('trafficMode', () => {
     });
 
     expect(queryOf(0).get('mode')).toBe('fastest;car;traffic:disabled');
+    // The follow-up /v8/routes call must stay off traffic too, or the route is
+    // billed as HERE Time-Aware Routing after a traffic-free sequence.
+    expect(queryOf(1).get('departureTime')).toBe('any');
+    expect(queryOf(1).has('traffic[mode]')).toBe(false);
   });
 
   it('HERE findsequence2 enables traffic on trafficMode live', async () => {
@@ -241,12 +245,14 @@ describe('trafficMode', () => {
     });
 
     expect(queryOf(0).get('mode')).toBe('fastest;car;traffic:enabled');
+    // Live leaves /v8/routes on HERE's own default: no departureTime means "now".
+    expect(queryOf(1).has('departureTime')).toBe(false);
+    expect(queryOf(1).has('traffic[mode]')).toBe(false);
   });
 
-  // L7's free half: the toll modifier costs nothing, so it applies whether or
-  // not traffic was opted into. Before this, the optimizer ordered waypoints as
-  // if tolls were acceptable while the follow-up /routes call avoided them, so
-  // the ordering and the route disagreed.
+  // The toll modifier costs nothing, so it applies whether or not traffic was
+  // opted into; the optimizer must order waypoints over the same roads the
+  // follow-up /routes call will use.
   it('HERE findsequence2 applies the toll modifier unconditionally', async () => {
     mockFetch
       .mockResolvedValueOnce(
@@ -273,6 +279,42 @@ describe('trafficMode', () => {
     // `-3` (strictly avoid), and traffic still disabled — the free half applies
     // without dragging in the billable half.
     expect(queryOf(0).get('mode')).toBe('fastest;car;traffic:disabled;tollroad:-3');
+  });
+
+  // findsequence2 gets every avoid the /routes call applies, or highway- and
+  // ferry-avoiding routes are sequenced as if those roads were fine.
+  it.each([
+    [{ avoidHighways: true }, 'motorway:-3'],
+    [{ avoidFerries: true }, 'boatFerry:-3,railFerry:-3'],
+    [
+      { avoidTolls: true, avoidHighways: true, avoidFerries: true },
+      'tollroad:-3,motorway:-3,boatFerry:-3,railFerry:-3',
+    ],
+  ])('HERE findsequence2 sends the route features for %o', async (avoids, features) => {
+    mockFetch
+      .mockResolvedValueOnce(
+        resp({
+          results: [
+            {
+              waypoints: [
+                { id: 'start', sequence: 0 },
+                { id: 'destination1', sequence: 1 },
+                { id: 'end', sequence: 2 },
+              ],
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(resp(HERE_BODY));
+
+    await new HereRoutingConnector({ apiKey: 'k' }).route({
+      waypoints: [...TWO, { lat: 2, lng: 2 }],
+      optimize: true,
+      ...avoids,
+    });
+
+    // One comma-joined feature segment after the traffic segment.
+    expect(queryOf(0).get('mode')).toBe(`fastest;car;traffic:disabled;${features}`);
   });
 
   it('HERE omits the toll modifier when avoidTolls is not set', async () => {
@@ -426,8 +468,13 @@ describe('include: durationWithoutTraffic', () => {
       resp({
         routes: [
           {
+            // One leg per section: the first arrives at the request's via.
             sections: [
-              { polyline: 'BGwl_lgDo-6-T', summary: { length: 100, duration: 10, baseDuration: 9 } },
+              {
+                polyline: 'BGwl_lgDo-6-T',
+                summary: { length: 100, duration: 10, baseDuration: 9 },
+                arrival: { place: { type: 'place', waypoint: 0 } },
+              },
               { polyline: 'BGwl_lgDo-6-T', summary: { length: 100, duration: 10 } },
             ],
           },
@@ -435,7 +482,7 @@ describe('include: durationWithoutTraffic', () => {
       }),
     );
     const result = await new HereRoutingConnector({ apiKey: 'k' }).route({
-      waypoints: TWO,
+      waypoints: [...TWO.slice(0, 1), { lat: 0.5, lng: 0.5 }, ...TWO.slice(1)],
       include: ['durationWithoutTraffic'],
     });
     // Under-reporting a total is worse than omitting it.

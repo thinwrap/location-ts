@@ -7,9 +7,9 @@ export interface TomTomConfig {
 // types are re-exported from the package entry, so this file is always reachable;
 // `tomtom.types.ts` is imported by nothing in the emitted type graph.
 //
-// The base isochrone `travelMode` is `'driving' | 'walking'`, because only TomTom and
-// Mapbox have native bicycle support. Both widen it back to include `'cycling'`;
-// HERE and ESRI stay at base.
+// The type keeps `'cycling'` alongside the base `'driving' | 'walking'`, but TomTom's
+// calculateReachableRange forbids the `pedestrian` and `bicycle` modes, so the
+// connector rejects both walking and cycling with `unsupported_travel_mode` at runtime.
 
 declare module '../../types/isochrone.interface' {
   interface IsochroneOptionsMap {
