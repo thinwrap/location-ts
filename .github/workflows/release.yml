@@ -86,3 +86,38 @@ jobs:
 
       - name: Verify provenance attestation
         run: npm audit signatures
+
+  # Separate job so only it holds `contents: write`; the publish job
+  # keeps read-only repository access. Runs only after npm accepted the version.
+  github-release:
+    name: GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write     # required to create the GitHub Release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+
+      # The notes are the version's CHANGELOG section, so the release page and
+      # the CHANGELOG never disagree. Re-running the workflow is a no-op.
+      - name: Create GitHub Release from the CHANGELOG
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; skipping."
+            exit 0
+          fi
+          tr -d '\r' < CHANGELOG.md \
+            | awk -v h="## [${tag#v}]" 'index($0, h) == 1 {f = 1; next} f && /^## \[/ {exit} f' \
+            | sed -E '/^\[[^]]*\]: https?:\/\//d' > notes.md
+          if grep -q '[^[:space:]]' notes.md; then
+            gh release create "$tag" --title "$tag" --notes-file notes.md --verify-tag
+          else
+            echo "::warning::CHANGELOG.md has no section for ${tag#v}; using generated notes."
+            gh release create "$tag" --title "$tag" --generate-notes --verify-tag
+          fi
