@@ -2,11 +2,13 @@ name: Publish to npm
 
 # OIDC publish-to-npm with Sigstore provenance.
 #
-# Publish job is inlined (not delegated to an external reusable workflow) so
-# the full publish path is auditable in this repo — same design proven by
-# @thinwrap/notifications v1.0.1. Sigstore attests the workflow source; OIDC
-# trusted publishing means no NPM_TOKEN is consumed. The npm trusted publisher
-# for @thinwrap/location must reference THIS filename (release.yml).
+# The publish job is inlined (not delegated to an external reusable workflow)
+# so the full publish path is auditable in this repo. Sigstore attests the
+# workflow source; OIDC trusted publishing means no NPM_TOKEN is consumed. The
+# npm trusted publisher for @thinwrap/location must reference THIS filename
+# (release.yml) — renaming the file breaks publishing. Two-factor
+# authentication on the npm publishing account is a manual precondition of
+# tagging.
 #
 # Trigger: push of a `v*.*.*` tag. Branch protection does not cover tags, so
 # the job refuses to publish unless the tagged commit is on `main`.
@@ -32,6 +34,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0    # full history for the on-main ancestry check
+          # Nothing here pushes, and the repo is public, so the main-branch
+          # fetch below needs no token; don't leave one in .git/config for
+          # dependency lifecycle scripts to read.
+          persist-credentials: false
 
       # Tags bypass branch protection; without this, a tag on any commit
       # (for example on an unmerged branch) would publish to npm.
@@ -52,10 +58,11 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       # OIDC trusted publishing requires npm >= 11.5.1; Node 20 bundles npm 10.
-      # Pinned to 11.x because npm@latest is now 12.x, which requires Node >= 22.22
-      # and fails to run on this job's Node 20.
+      # Pinned to an exact 11.x (engines `^20.17.0 || >=22.9.0`) because
+      # npm@latest is 12.x, which needs Node >= 22.22, and a floating range
+      # would change the publishing tool under a signed build.
       - name: Upgrade npm for OIDC trusted publishing
-        run: npm install -g npm@11
+        run: npm install -g npm@11.21.0
 
       - name: Verify git tag matches package.json version
         run: |
@@ -66,7 +73,12 @@ jobs:
             exit 1
           fi
 
-      - run: npm ci --no-audit --no-fund --fetch-timeout=60000 --fetch-retries=3 --fetch-retry-maxtimeout=15000
+      # --ignore-scripts: this job holds `id-token: write`, so a dependency's
+      # install script must not run here. Nothing needs one: the package has no
+      # runtime deps, the build is plain tsc, and esbuild (via vitest and
+      # size-limit) resolves its platform binary from the optional dependency
+      # without its postinstall.
+      - run: npm ci --ignore-scripts --no-audit --no-fund --fetch-timeout=60000 --fetch-retries=3 --fetch-retry-maxtimeout=15000
         timeout-minutes: 8
 
       - run: npm run typecheck
@@ -78,8 +90,10 @@ jobs:
       - run: npm run build
 
       # Plain-Node import smoke of dist (CJS + ESM) — catches broken emits
-      # that bundler-resolution steps cannot (the notifications v1.0.0 bug).
+      # that bundler-resolution steps cannot.
       - run: npm run check:dist
+
+      - run: npm run size
 
       - name: Publish to npm with Sigstore provenance
         run: npm publish --provenance --access public
@@ -100,6 +114,8 @@ jobs:
         with:
           sparse-checkout: CHANGELOG.md
           sparse-checkout-cone-mode: false
+          # `gh` authenticates via GH_TOKEN; no git push, so no stored token.
+          persist-credentials: false
 
       # The notes are the version's CHANGELOG section, so the release page and
       # the CHANGELOG never disagree. Re-running the workflow is a no-op.

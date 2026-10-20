@@ -32,6 +32,7 @@ scripts/
   CONVENTIONS.md                        # this file
 .github/workflows/
   ci.yml                                # OS × Node matrix + tests + lint + bundle-size
+  lint-gates.yml                        # license, lifecycle scripts, README/.ai presence
   release.yml                           # OIDC publish on v* tag
 ```
 

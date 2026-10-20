@@ -1,0 +1,71 @@
+name: Lint Gates
+
+# Repo-level gates that don't depend on OS or Node version, so each runs once:
+#   - readme-lint:          README + .ai contributor triplet + agent stubs exist
+#   - license-check:        LICENSE present + MIT in package.json
+#   - no-lifecycle-scripts: package.json declares no install/publish hooks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  readme-lint:
+    name: readme lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify README + .ai triplet + stubs exist
+        run: |
+          set -e
+          test -f README.md
+          test -f .ai/guidelines.md
+          test -f .ai/ARCHITECTURE.md
+          test -f .ai/CONVENTIONS.md
+          test -f AGENTS.md
+          test -f CLAUDE.md
+          test -f GEMINI.md
+
+  license-check:
+    name: license check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify MIT license in package.json + LICENSE present
+        run: |
+          set -e
+          test -f LICENSE
+          node -e "process.exit(require('./package.json').license === 'MIT' ? 0 : 1)"
+
+  # A consumer's `npm install` runs a package's install hooks, and the publish
+  # hooks run inside the release job that holds `id-token: write`.
+  no-lifecycle-scripts:
+    name: no lifecycle scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify no install/publish lifecycle scripts
+        run: |
+          set -e
+          node -e "
+            const s = require('./package.json').scripts || {};
+            const forbidden = ['preinstall', 'install', 'postinstall', 'prepublish', 'prepare', 'prepublishOnly', 'prepack', 'postpack'];
+            const found = forbidden.filter(k => s[k]);
+            if (found.length) {
+              console.error('Forbidden lifecycle scripts present:', found);
+              process.exit(1);
+            }
+          "

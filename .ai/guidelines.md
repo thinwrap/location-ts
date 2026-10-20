@@ -56,6 +56,7 @@ npm run typecheck            # strict; enum / provider-union sync
 npm test                     # vitest — single file: npx vitest src/providers/<id>/<id>.routing.connector.spec.ts
 npm run lint
 npm run build && npm run check:dist   # dual CJS/ESM emit + import smoke
+npm run size                 # per-entry gzip budget + `npm run check:tree-shaking`
 ```
 
 CI also runs a Node 18/20/22/24/26 × Linux/macOS/Windows matrix, a bundle-size gate, and an offline
