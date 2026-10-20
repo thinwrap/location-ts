@@ -58,7 +58,7 @@ npm run lint
 npm run build && npm run check:dist   # dual CJS/ESM emit + import smoke
 ```
 
-CI also runs a Node 18/20/22 × Linux/macOS/Windows matrix, a bundle-size gate, and an offline
+CI also runs a Node 18/20/22/24/26 × Linux/macOS/Windows matrix, a bundle-size gate, and an offline
 import smoke that proves zero import-time egress.
 
 ## Invariants you must not break

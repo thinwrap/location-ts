@@ -1,6 +1,6 @@
 name: CI
 
-# TS CI matrix (Linux × macOS × Windows × Node 18/20/22) + lint gates.
+# TS CI matrix (Linux × macOS × Windows × Node 18/20/22/24/26) + lint gates.
 # Covers the cross-OS/Node test matrix, network-disabled smoke, and build
 # reproducibility. The `lint-gates` job runs in lockstep with the `test` matrix.
 
@@ -23,7 +23,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        node: [18, 20, 22]
+        node: [18, 20, 22, 24, 26]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
